@@ -19,6 +19,8 @@ This repository contains the core Rust implementation: the client, server, proto
 
 ```
 rvpn/
+  Cargo.toml         Workspace manifest
+  Cargo.lock         Dependency lockfile
   crates/
     rvpn-core/       Protocol, cryptography, packet handling
     rvpn-client/     CLI client binary (SOCKS5 and TUN modes)
@@ -56,19 +58,41 @@ cargo clippy
 Install [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) and [zig](https://ziglang.org/):
 
 ```bash
-./scripts/build-release.sh
-```
+# macOS (Apple Silicon)
+cargo zigbuild --release --target aarch64-apple-darwin
 
-Supported targets: macOS (arm64, x86_64, universal), Linux (x86_64, aarch64, armv7, musl), FreeBSD.
+# macOS (Intel)
+cargo zigbuild --release --target x86_64-apple-darwin
+
+# Linux x86_64
+cargo zigbuild --release --target x86_64-unknown-linux-gnu
+
+# Linux ARM64
+cargo zigbuild --release --target aarch64-unknown-linux-gnu
+
+# Linux ARMv7
+cargo zigbuild --release --target armv7-unknown-linux-gnueabihf
+
+# Linux musl (static)
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+```
 
 ### Mobile library
 
-**iOS/macOS:**
+The `rvpn-mobile` crate produces a static library (`librvpn_mobile.a`) for linking into native iOS, macOS, and Android apps. Build it with the appropriate feature flag:
+
 ```bash
-cd rvpn-ios && ./build_rust.sh
+# iOS
+cargo build --release --package rvpn-mobile --target aarch64-apple-ios --features ios-direct-tun
+
+# macOS
+cargo build --release --package rvpn-mobile --target aarch64-apple-darwin --features macos-direct-tun
+
+# Android
+cargo build --release --package rvpn-mobile --target aarch64-linux-android --features android-direct-tun
 ```
 
-**Android:** built via the Flutter/rust_bridge toolchain.
+The native app source code (Swift, Kotlin/Flutter) is not included in this repository.
 
 ## Usage
 
@@ -107,20 +131,13 @@ This starts a SOCKS5 proxy on `127.0.0.1:1080`. Configure your browser or system
 sudo cargo run --release --package rvpn-client -- --config client.toml --tun
 ```
 
-## Docker
-
-```bash
-cd rvpn
-docker-compose up -d
-```
-
 ## Releases
 
 Pre-built binaries for all platforms are published as GitHub releases on this repository. The native apps (macOS, iOS, Android) are distributed through their respective app stores.
 
-## Protocol
+## Documentation
 
-The protocol specification is in `PROTOCOL_V2_SPEC.md` in this repository. The whitepaper and detailed documentation are at [rvpn.org](https://rvpn.org).
+Full documentation and the whitepaper are at [rvpn.org](https://rvpn.org).
 
 ## Licensing
 
