@@ -1,0 +1,77 @@
+[package]
+name = "rvpn-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+description = "R-VPN server implementation"
+
+[[bin]]
+name = "rvpn-server"
+path = "src/main.rs"
+
+[dependencies]
+rvpn-core = { path = "../rvpn-core" }
+
+# Async
+tokio.workspace = true
+
+# WebSocket
+tokio-tungstenite.workspace = true
+
+# HTTP
+http.workspace = true
+
+# Crypto
+ring.workspace = true
+sha2.workspace = true
+
+# TLS
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+bincode = "1.3"
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Utilities
+bytes.workspace = true
+uuid.workspace = true
+base64.workspace = true
+sha1.workspace = true
+hex.workspace = true
+futures-util = "0.3"
+
+# Networking (for split tunneling)
+ip_network.workspace = true
+ip_network_table.workspace = true
+
+# TUN interface
+tun-rs = { workspace = true, features = ["async"] }
+
+[features]
+default = []
+integration-tests = []
+
+[dev-dependencies]
+tempfile.workspace = true
+rand.workspace = true
+tokio = { workspace = true, features = ["process", "time"] }
+serial_test = "3.0"

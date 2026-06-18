@@ -1,0 +1,119 @@
+[package]
+name = "rvpn-mobile"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+description = "R-VPN mobile FFI bindings"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+futures-util = "0.3"
+
+# WebSocket
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tungstenite = "0.21"
+
+# TLS
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-platform-verifier.workspace = true
+webpki-roots = "0.26"
+
+# Serialization for JSON config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Binary serialization
+bincode = "1.3"
+
+# Logging
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# State management
+once_cell = "1.19"
+parking_lot = "0.12"
+
+# C types
+libc = "0.2"
+
+# Base64 encoding
+base64.workspace = true
+
+# Curve conversion
+curve25519-dalek.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Utilities
+bytes.workspace = true
+rand.workspace = true
+url.workspace = true
+
+# Socket options for SO_REUSEADDR
+socket2 = "0.5"
+
+# IP network handling for split tunnel
+ipnetwork = "0.20"
+
+# Concurrent hashmap for flow creation locks
+dashmap = "5.5"
+
+# DNS server and client
+hickory-server = { version = "0.24", optional = true }
+hickory-resolver = { version = "0.24", optional = true }
+hickory-proto = { version = "0.24", optional = true }
+
+# R-VPN core library
+rvpn-core = { path = "../rvpn-core" }
+rvpn-client = { path = "../rvpn-client" }
+
+# iOS-specific dependencies
+[target.'cfg(target_os = "ios")'.dependencies]
+# Optional: Use tracing-oslog for iOS device logging (requires iOS SDK)
+# Enable with --features ios-logging when building for device
+tracing-oslog = { version = "0.2", optional = true }
+
+# Android-specific dependencies
+[target.'cfg(target_os = "android")'.dependencies]
+# Android logging via logcat
+android_log = "0.1"
+# Bridge tracing to log crate for Android logcat output
+tracing-log = "0.2"
+# JNI for proper string handling
+jni = "0.21"
+jni-sys = "0.3"
+
+[features]
+# Enable iOS logging via os_log (device only, not simulator)
+ios-logging = ["tracing-oslog"]
+# Enable DNS server support
+dns = ["hickory-server", "hickory-resolver", "hickory-proto"]
+# Enable iOS Direct TUN mode (uses ios_tun_ffi instead of legacy TunBridge)
+ios-direct-tun = []
+# Enable macOS Direct TUN mode (uses same ios_tun implementation as iOS)
+macos-direct-tun = []
+# Enable Android Direct TUN mode (uses android_tun_ffi instead of legacy TunBridge)
+android-direct-tun = []
+default = ["dns"]
+
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+# SOCKS5 proxy - disable on mobile as we handle it differently
+# fast-socks5 = "0.8"

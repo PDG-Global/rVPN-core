@@ -1,0 +1,105 @@
+[package]
+name = "rvpn-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+description = "R-VPN client implementation"
+
+[lib]
+name = "rvpn_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rvpn"
+path = "src/main.rs"
+
+[dependencies]
+rvpn-core = { path = "../rvpn-core" }
+
+# Crypto (for direct key handling)
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+ring.workspace = true
+subtle.workspace = true
+
+# Async
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+
+# WebSocket
+tokio-tungstenite.workspace = true
+tungstenite.workspace = true
+
+# TLS
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-platform-verifier.workspace = true
+webpki-roots = "0.26"
+boring.workspace = true
+tokio-boring.workspace = true
+
+# SOCKS5 Proxy
+fast-socks5.workspace = true
+
+# TUN
+tun-rs.workspace = true
+
+# Networking
+ip_network_table.workspace = true
+ip_network.workspace = true
+socket2 = "0.5"
+
+# Data structures
+radix_trie.workspace = true
+lru.workspace = true
+
+# HTTP client
+reqwest.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+toml.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# CLI
+clap.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Utilities
+bytes.workspace = true
+uuid.workspace = true
+base64.workspace = true
+hex.workspace = true
+sha1.workspace = true
+rand.workspace = true
+url.workspace = true
+futures-util.workspace = true
+lazy_static.workspace = true
+parking_lot.workspace = true
+async-trait = "0.1"
+dirs = "5.0"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+security-framework = "2"
+
+[dev-dependencies]
+tempfile.workspace = true
+rcgen = "0.13"
+tokio-tungstenite = { version = "0.21", features = [] }

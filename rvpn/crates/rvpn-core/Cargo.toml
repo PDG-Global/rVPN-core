@@ -1,0 +1,59 @@
+[package]
+name = "rvpn-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+description = "Core protocol and cryptography for R-VPN"
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# Crypto
+ring.workspace = true
+subtle.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+curve25519-dalek.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+aead.workspace = true
+chacha20poly1305.workspace = true
+aes-gcm.workspace = true
+zeroize.workspace = true
+
+# Data structures
+lru.workspace = true
+ip_network.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+serde_bytes = "0.11"
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Utilities
+bytes.workspace = true
+base64.workspace = true
+hex.workspace = true
+rand.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+tempfile.workspace = true
