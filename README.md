@@ -137,7 +137,7 @@ Pre-built binaries for all platforms are published as GitHub releases on this re
 
 ## Documentation
 
-Full documentation and the whitepaper are at [rvpn.org](https://rvpn.org).
+Full documentation is at [docs.rvpn.org](https://docs.rvpn.org). The whitepaper is at [rvpn.org](https://rvpn.org).
 
 ## Licensing
 
