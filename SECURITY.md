@@ -4,8 +4,8 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.2.x   | :white_check_mark: |
-| 0.1.x   | :x:                |
+| 1.x     | Yes |
+| 0.x     | No |
 
 ## Reporting a Vulnerability
 
@@ -36,12 +36,23 @@ If you need to encrypt your communication, you can use our PGP key:
 ```
 -----BEGIN PGP PUBLIC KEY BLOCK-----
 
-[Replace with actual PGP key]
-
+mDMEajPYPRYJKwYBBAHaRw8BAQdAZlcJdhqt+Q9UoXyIfNZ21I9ZeADchLbPRLNs
+NN1F66C0IlItVlBOIFNlY3VyaXR5IDxzZWN1cml0eUBydnBuLm9yZz6ImQQTFgoA
+QRYhBNL887wF6Xe+lu0HSy3qajUvl4owBQJqM9g9AhsjBQkDwmcABQsJCAcCAiIC
+BhUKCQgLAgQWAgMBAh4HAheAAAoJEC3qajUvl4ow1f8BAIhlpULYgvnDOpcbKe1Q
+p3IPUGXhBuiYg5Ni8X8YqH7bAQDBdu56hvVr/2ypIZUG6gJXIUP5DaUXByt2NCd3
+5s7PBrgzBGoz2D0WCSsGAQQB2kcPAQEHQAzu4eSQcn1RllkN7LejDW69ck45pqI0
+G41X/blNhGu3iPUEGBYKACYWIQTS/PO8Bel3vpbtB0st6mo1L5eKMAUCajPYPQIb
+IgUJA8JnAACBCRAt6mo1L5eKMHYgBBkWCgAdFiEEAuuQNoXwlbZZbXbaoM2tnfou
+ttIFAmoz2D0ACgkQoM2tnfouttJF2gD/QiFKPodva2RxqW+bv4vAvlPjB219eZ9X
+AyBxCoH/HDYA/0a2bnNSEqBO5QP7b+Hy1DPiVL3Mcgq8X/Osjxi4WOEHtiQBAP5T
+GvXWFWRF6E6Acmw79bjcBUDZcQUEjgKgK/AaROOeAQDlBjtSCiNN65jr6dz7GDtW
+OYoD5YvGwwjR8mV4w9BQCw==
+=9d2L
 -----END PGP PUBLIC KEY BLOCK-----
 ```
 
-Fingerprint: `[Replace with actual fingerprint]`
+Fingerprint: `D2FCF3BC05E977BE96ED074B2DEA6A352F978A30`
 
 ## Security Response Process
 
@@ -111,17 +122,17 @@ We follow responsible disclosure practices:
 
 R-VPN is designed to protect against:
 
-- ✅ Passive network eavesdropping
-- ✅ Active MITM attacks (with proper key verification)
-- ✅ Compromised relay servers (cannot decrypt traffic)
-- ✅ Forward secrecy attacks (keys rotate automatically)
+- Passive network eavesdropping
+- Active MITM attacks (with proper key verification)
+- Compromised relay servers (cannot decrypt traffic)
+- Forward secrecy attacks (keys rotate automatically)
 
 R-VPN does NOT protect against:
 
-- ❌ Endpoint compromise (your device or the target server)
-- ❌ Traffic analysis by sophisticated adversaries
-- ❌ Compromise of your identity private key
-- ❌ Social engineering attacks
+- Endpoint compromise (your device or the target server)
+- Traffic analysis by sophisticated adversaries
+- Compromise of your identity private key
+- Social engineering attacks
 
 ## Security Audit History
 
@@ -140,7 +151,7 @@ We thank the following security researchers who have responsibly disclosed vulne
 ## Contact
 
 - **Security issues**: security@rvpn.org
-- **General questions**: https://github.com/creativebastard/rvpn/discussions
+- **General questions**: https://github.com/PDG-Global/rVPN-core/discussions
 - **Website**: https://rvpn.org
 
 ---
