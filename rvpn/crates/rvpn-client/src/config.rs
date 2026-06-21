@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::TlsFingerprint;
+#[cfg(not(target_os = "android"))]
+use crate::tls_boring::TlsFingerprint;
+#[cfg(target_os = "android")]
+use crate::tls_fingerprint_stub::TlsFingerprint;
 
 /// Main client configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
