@@ -41,8 +41,6 @@ tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 rustls-platform-verifier.workspace = true
 webpki-roots = "0.26"
-boring.workspace = true
-tokio-boring.workspace = true
 
 # SOCKS5 Proxy
 fast-socks5.workspace = true
@@ -98,6 +96,12 @@ dirs = "5.0"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = "2"
+
+# BoringSSL — not available on Android (NDK linker can't resolve static lib symbols).
+# Android uses rustls instead.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+boring.workspace = true
+tokio-boring.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

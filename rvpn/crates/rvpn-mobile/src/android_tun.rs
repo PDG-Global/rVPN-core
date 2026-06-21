@@ -26,9 +26,10 @@ use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::time::timeout;
 use bytes::BytesMut;
-use tokio_tungstenite::{client_async, tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio::net::TcpStream;
 use tungstenite::handshake::client::generate_key;
-use rvpn_client::tls_boring::{connect_chrome_like, ChromeTlsStream, TlsFingerprint};
+use rvpn_client::TlsFingerprint;
 
 // Use logcat macros for Android logging
 macro_rules! tun_log {
@@ -64,8 +65,8 @@ use rvpn_core::protocol::padding::{pad_packet, unpad_packet};
 use crate::ffi::TunConfig;
 
 /// WebSocket writer type
-type WsSink = SplitSink<WebSocketStream<ChromeTlsStream>, Message>;
-type WsStream = futures_util::stream::SplitStream<WebSocketStream<ChromeTlsStream>>;
+type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+type WsStream = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 /// Outgoing packet batching limits.
 ///
@@ -177,7 +178,7 @@ impl AndroidTunClient {
 
         // Parse TLS fingerprint (default to Chrome for stealth)
         let tls_fingerprint = config.tls_fingerprint.as_deref()
-            .and_then(rvpn_client::tls_boring::fingerprint_from_str)
+            .and_then(rvpn_client::fingerprint_from_str)
             .unwrap_or(TlsFingerprint::Chrome);
 
         // Create channels for Android TUN communication
@@ -290,19 +291,26 @@ impl AndroidTunClient {
 
         tun_log!("[AndroidTun] Connecting to {}", url);
 
-        // Establish TLS connection with Chrome fingerprint via boring.
-        let tls_stream = timeout(
+        // Use rustls with bundled webpki-roots (same approach as iOS).
+        // BoringSSL's static linking is broken on Android NDK (X509_free
+        // and 150+ symbols left undefined in the .so). rustls works
+        // reliably with no native C dependency.
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
+
+        // Connect TCP to the server.
+        let tcp_addr = format!("{}:{}", self.server_host, self.server_port);
+        let tcp_stream = timeout(
             std::time::Duration::from_secs(5),
-            connect_chrome_like(
-                &self.server_host,
-                self.server_port,
-                self.tls_fingerprint,
-                None,
-            )
+            tokio::net::TcpStream::connect(&tcp_addr)
         )
         .await
-        .context("TLS connect timeout (5s)")?
-        .context("Failed to establish Chrome-fingerprinted TLS connection")?;
+        .context("TCP connect timeout (5s)")?
+        .context("Failed to connect TCP stream")?;
 
         // Build Chrome-like WebSocket upgrade request with 15 headers.
         let ws_key = generate_key();
@@ -331,11 +339,16 @@ impl AndroidTunClient {
             .context("Failed to build WebSocket upgrade request")?;
 
         let (ws_stream, _) = timeout(
-            std::time::Duration::from_secs(3),
-            client_async(request, tls_stream)
+            std::time::Duration::from_secs(5),
+            tokio_tungstenite::client_async_tls_with_config(
+                request,
+                tcp_stream,
+                None,
+                Some(connector),
+            )
         )
         .await
-        .context("WebSocket handshake timeout (3s)")?
+        .context("WebSocket handshake timeout (5s)")?
         .context("WebSocket handshake failed")?;
 
         tun_log!("[AndroidTun] WebSocket connected (TLS verified)");

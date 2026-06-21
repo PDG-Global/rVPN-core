@@ -12,7 +12,8 @@ use futures::SinkExt;
 use futures::StreamExt;
 use futures_util::stream::SplitSink;
 use std::sync::Arc;
-use tokio_tungstenite::{client_async, tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio::net::TcpStream;
 use tracing::{debug, info};
 use tungstenite::handshake::client::generate_key;
 
@@ -20,11 +21,11 @@ use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
 use rvpn_core::protocol::HandshakeMessage;
 
-use rvpn_client::tls_boring::{connect_chrome_like, ChromeTlsStream, TlsFingerprint};
+use rvpn_client::TlsFingerprint;
 
 /// WebSocket writer type
-type WsSink = SplitSink<WebSocketStream<ChromeTlsStream>, Message>;
-type WsStream = futures_util::stream::SplitStream<WebSocketStream<ChromeTlsStream>>;
+type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+type WsStream = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 /// Configuration for connecting to VPN server
 #[derive(Clone)]
@@ -85,16 +86,20 @@ pub async fn create_flow_connection(
     info!("[FlowConnector] Creating new connection for {}:{} (flow_id: {})",
           target_host, target_port, flow_id);
 
-    // Step 1: Connect to WebSocket with Chrome fingerprint
+    // Step 1: Connect via rustls (same approach as iOS/Android TUN)
     let url = format!("wss://{}:{}{}", config.server_host, config.server_port, config.server_path);
-    let tls_stream = connect_chrome_like(
-        &config.server_host,
-        config.server_port,
-        config.tls_fingerprint,
-        None,
-    )
-    .await
-    .context("Failed to establish Chrome-fingerprinted TLS connection")?;
+
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
+
+    let tcp_addr = format!("{}:{}", config.server_host, config.server_port);
+    let tcp_stream = tokio::net::TcpStream::connect(&tcp_addr)
+        .await
+        .context("Failed to connect TCP stream")?;
 
     let ws_key = generate_key();
     let authority = format!("{}:{}", config.server_host, config.server_port);
@@ -121,9 +126,14 @@ pub async fn create_flow_connection(
         .body(())
         .context("Failed to build WebSocket upgrade request")?;
 
-    let (ws_stream, _) = client_async(request, tls_stream)
-        .await
-        .context("WebSocket upgrade failed")?;
+    let (ws_stream, _) = tokio_tungstenite::client_async_tls_with_config(
+        request,
+        tcp_stream,
+        None,
+        Some(connector),
+    )
+    .await
+    .context("WebSocket upgrade failed")?;
 
     debug!("[FlowConnector] WebSocket connected for flow {}", flow_id);
 

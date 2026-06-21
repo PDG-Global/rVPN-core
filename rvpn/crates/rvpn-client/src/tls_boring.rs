@@ -13,9 +13,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result};
+#[cfg(not(target_os = "android"))]
 use boring::ssl::{SslConnector, SslMethod, SslVersion};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+#[cfg(not(target_os = "android"))]
 use tokio_boring::SslStream;
 use tracing::debug;
 use std::time::Duration;
@@ -24,6 +26,7 @@ use std::time::Duration;
 ///
 /// Detects dead connections (e.g. NAT evictions, middlebox drops) in ~90s
 /// instead of relying on the OS default (~2h on Linux/macOS).
+#[cfg(not(target_os = "android"))]
 fn enable_tcp_keepalive(tcp: TcpStream) -> Result<TcpStream> {
     let std_tcp = tcp.into_std()
         .context("Failed to convert tokio TcpStream to std")?;
@@ -62,16 +65,19 @@ pub enum TlsFingerprint {
 ///
 /// This is returned after the TLS handshake is complete.
 /// The caller can then use this to send the WebSocket HTTP upgrade request.
+#[cfg(not(target_os = "android"))]
 pub struct ChromeTlsStream {
     inner: SslStream<TcpStream>,
 }
 
+#[cfg(not(target_os = "android"))]
 impl ChromeTlsStream {
     pub fn new(stream: SslStream<TcpStream>) -> Self {
         Self { inner: stream }
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl AsyncRead for ChromeTlsStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -82,6 +88,7 @@ impl AsyncRead for ChromeTlsStream {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl AsyncWrite for ChromeTlsStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -106,6 +113,7 @@ impl AsyncWrite for ChromeTlsStream {
 /// into BoringSSL's certificate store, eliminating any dependency on the system
 /// trust store or trustd.
 #[cfg(target_os = "ios")]
+#[cfg(not(target_os = "android"))]
 fn set_ios_cert_verify(builder: &mut boring::ssl::SslConnectorBuilder, _hostname: &str) {
     use boring::x509::store::X509StoreBuilder;
     use boring::x509::X509;
@@ -132,6 +140,7 @@ fn set_ios_cert_verify(builder: &mut boring::ssl::SslConnectorBuilder, _hostname
 /// - ALPN with http/1.1 (required for tungstenite WebSocket; h2 causes HttparseError)
 /// - BoringSSL's default TLS 1.3 ciphers already match Chrome's preference order
 #[allow(unused_variables)]
+#[cfg(not(target_os = "android"))]
 fn build_chrome_connector(host: &str, sni_hostname: Option<&str>) -> Result<SslConnector> {
     let method = SslMethod::tls();
     let mut builder = SslConnector::builder(method)
@@ -188,6 +197,7 @@ fn build_chrome_connector(host: &str, sni_hostname: Option<&str>) -> Result<SslC
 /// * `port` - The port to connect to
 /// * `fingerprint` - The TLS fingerprint to use
 /// * `sni_hostname` - Optional SNI hostname override (uses `host` if None)
+#[cfg(not(target_os = "android"))]
 pub async fn connect_chrome_like(
     host: &str,
     port: u16,
@@ -271,6 +281,7 @@ async fn connect_standard(tcp: TcpStream, host: &str, sni_hostname: Option<&str>
 
 /// Connect with specific TLS fingerprint (legacy function for compatibility)
 #[allow(dead_code)]
+#[cfg(not(target_os = "android"))]
 pub async fn connect_with_fingerprint(
     host: &str,
     port: u16,

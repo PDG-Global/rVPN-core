@@ -18,10 +18,10 @@ use futures::StreamExt;
 use futures_util::stream::SplitSink;
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
-use tokio_tungstenite::{client_async, tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 use tungstenite::handshake::client::generate_key;
-use rvpn_client::tls_boring::{connect_chrome_like, ChromeTlsStream};
 
 use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
@@ -357,21 +357,22 @@ impl DohClient {
         let url = format!("wss://{}:{}{}", config.server_host, config.server_port, dns_path);
         info!("[DohClient] Connecting to {} (via IP {})", url, server_ip);
 
-        // Establish TLS connection with Chrome fingerprint via boring.
-        // We connect to the pre-resolved IP for TCP, but use the original
-        // hostname for TLS SNI to avoid DNS circular dependency during reconnect.
-        let tls_stream = timeout(
+        // Connect via rustls (same approach as TUN mode).
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
+
+        let tcp_addr = std::net::SocketAddr::new(server_ip, config.server_port);
+        let tcp_stream = timeout(
             Duration::from_secs(5),
-            connect_chrome_like(
-                &server_ip.to_string(),
-                config.server_port,
-                config.tls_fingerprint,
-                Some(&config.server_host),
-            )
+            tokio::net::TcpStream::connect(tcp_addr)
         )
         .await
-        .context("DNS TLS connect timeout (5s)")?
-        .context("Failed to establish Chrome-fingerprinted TLS connection for DNS")?;
+        .context("DNS TCP connect timeout (5s)")?
+        .context("Failed to connect TCP stream for DNS")?;
 
         // Build Chrome-like WebSocket upgrade request with 15 headers.
         let ws_key = generate_key();
@@ -401,7 +402,12 @@ impl DohClient {
 
         let (ws_stream, _) = timeout(
             Duration::from_secs(3),
-            client_async(request, tls_stream)
+            tokio_tungstenite::client_async_tls_with_config(
+                request,
+                tcp_stream,
+                None,
+                Some(connector),
+            )
         )
         .await
         .context("DNS WebSocket handshake timeout (3s)")?
@@ -535,8 +541,8 @@ impl DohClient {
 
 /// Perform X3DH handshake with the server
 async fn perform_handshake(
-    ws_reader: &mut futures_util::stream::SplitStream<WebSocketStream<ChromeTlsStream>>,
-    ws_writer: &mut SplitSink<WebSocketStream<ChromeTlsStream>, Message>,
+    ws_reader: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    ws_writer: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     identity_key: &Arc<IdentityKey>,
     server_bundle: &X3DHPublicBundle,
 ) -> Result<DoubleRatchet> {

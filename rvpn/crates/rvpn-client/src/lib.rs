@@ -19,18 +19,34 @@ pub mod split_tunnel;
 #[allow(dead_code)]
 pub mod stats;
 
+// Desktop-only modules — not compiled on Android (BoringSSL not available).
+#[cfg(not(target_os = "android"))]
 pub mod socks5;
+#[cfg(not(target_os = "android"))]
 pub mod socks5_tunnel;
+#[cfg(not(target_os = "android"))]
 pub mod stream_relay;
+// tls_boring contains BoringSSL bindings (not available on Android).
+// On Android, a minimal stub provides just the TlsFingerprint enum.
+#[cfg(not(target_os = "android"))]
 pub mod tls_boring;
+#[cfg(target_os = "android")]
+pub mod tls_fingerprint_stub;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub mod tun;
+#[cfg(not(target_os = "android"))]
 pub mod tunnel;
 pub mod websocket;
+#[cfg(not(target_os = "android"))]
 pub mod proxy_common;
+#[cfg(not(target_os = "android"))]
 pub mod http_proxy;
 
 // Re-export commonly used types
 pub use config::{ClientConfig, ServerIdentityConfig};
+#[cfg(not(target_os = "android"))]
 pub use tls_boring::{TlsFingerprint, fingerprint_from_str};
+#[cfg(target_os = "android")]
+pub use tls_fingerprint_stub::{TlsFingerprint, fingerprint_from_str};
+#[cfg(not(target_os = "android"))]
 pub use socks5_tunnel::Socks5Tunnel;

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::tls_boring::TlsFingerprint;
+use crate::TlsFingerprint;
 
 /// Main client configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

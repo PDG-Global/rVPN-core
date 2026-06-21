@@ -17,6 +17,7 @@ use tracing::trace;
 
 pub use tungstenite::Message;
 
+#[cfg(not(target_os = "android"))]
 use crate::tls_boring::{ChromeTlsStream, TlsFingerprint, connect_chrome_like};
 
 /// WebSocket reader type (receives messages)
@@ -55,6 +56,7 @@ impl WebSocketWriter {
 /// cannot handle compressed WebSocket frames — if the server negotiates compression, the
 /// connection breaks with `Protocol(ResetWithoutClosingHandshake)`. Chrome sends this
 /// extension because it has native deflate support; we don't.
+#[cfg(not(target_os = "android"))]
 pub async fn connect_websocket(
     host: &str,
     port: u16,
