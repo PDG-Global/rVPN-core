@@ -1583,6 +1583,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1679,6 +1688,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -2498,7 +2516,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rvpn-client"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2554,7 +2572,7 @@ dependencies = [
 
 [[package]]
 name = "rvpn-core"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -2589,7 +2607,7 @@ dependencies = [
 
 [[package]]
 name = "rvpn-mobile"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "android_log",
  "anyhow",
@@ -2610,6 +2628,7 @@ dependencies = [
  "jni-sys",
  "libc",
  "log 0.4.29",
+ "mimalloc",
  "once_cell",
  "parking_lot",
  "rand 0.8.5",
@@ -2636,7 +2655,7 @@ dependencies = [
 
 [[package]]
 name = "rvpn-server"
-version = "1.2.3"
+version = "1.2.4"
 dependencies = [
  "anyhow",
  "base64 0.21.7",

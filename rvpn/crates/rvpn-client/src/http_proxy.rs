@@ -149,7 +149,7 @@ async fn handle_connection(
             Err(e) => return Err(e.into()),
         }
 
-        let request_line = request_line.trim_end_matches(|c| c == '\r' || c == '\n');
+        let request_line = request_line.trim_end_matches(['\r', '\n']);
         if request_line.is_empty() {
             return Ok(());
         }
@@ -180,24 +180,24 @@ async fn handle_connection(
                 Err(e) => return Err(e.into()),
             }
 
-            let trimmed = header_buf.trim_end_matches(|c| c == '\r' || c == '\n');
+            let trimmed = header_buf.trim_end_matches(['\r', '\n']);
             if trimmed.is_empty() {
                 break;
             }
 
             let lower = trimmed.to_lowercase();
             if lower.starts_with("content-length:") {
-                if let Some(val) = trimmed.splitn(2, ':').nth(1) {
+                if let Some(val) = trimmed.split_once(':').map(|x| x.1) {
                     content_length = val.trim().parse().unwrap_or(0);
                 }
             }
             if lower.starts_with("proxy-authorization:") {
-                if let Some(val) = trimmed.splitn(2, ':').nth(1) {
+                if let Some(val) = trimmed.split_once(':').map(|x| x.1) {
                     proxy_auth_value = val.trim().to_string();
                 }
             }
             if lower.starts_with("host:") {
-                if let Some(val) = trimmed.splitn(2, ':').nth(1) {
+                if let Some(val) = trimmed.split_once(':').map(|x| x.1) {
                     host_from_header = val.trim().to_string();
                 }
             }
@@ -276,8 +276,7 @@ async fn handle_http_forward(
     proxy: &ProxyHandle,
 ) -> Result<bool> {
     // Extract host, port, path from URI or Host header
-    let (target_host, target_port, path) = if uri.starts_with("http://") {
-        let without_scheme = &uri[7..];
+    let (target_host, target_port, path) = if let Some(without_scheme) = uri.strip_prefix("http://") {
         let (authority, path) = without_scheme
             .split_once('/')
             .map(|(a, p)| (a, format!("/{}", p)))
@@ -469,14 +468,14 @@ async fn relay_http_response(
         target_buf.read_line(&mut header).await?;
         client.write_all(header.as_bytes()).await?;
 
-        let trimmed = header.trim_end_matches(|c| c == '\r' || c == '\n');
+        let trimmed = header.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
         }
 
         let lower = trimmed.to_lowercase();
         if lower.starts_with("content-length:") {
-            if let Some(val) = trimmed.splitn(2, ':').nth(1) {
+            if let Some(val) = trimmed.split_once(':').map(|x| x.1) {
                 content_length = val.trim().parse().ok();
             }
         }

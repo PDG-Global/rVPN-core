@@ -345,8 +345,5 @@ pub fn start_client(
 
 /// Check if a process is still running
 pub fn is_running(child: &mut Child) -> bool {
-    match child.try_wait() {
-        Ok(None) => true,
-        _ => false,
-    }
+    matches!(child.try_wait(), Ok(None))
 }

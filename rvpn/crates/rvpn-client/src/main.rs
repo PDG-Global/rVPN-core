@@ -370,7 +370,7 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
             config.tls_fingerprint,
             config.sni_hostname.as_deref(),
             &config.identity_key_file,
-            config.prekey_bundle.as_ref(),
+            config.prekey_bundle.as_deref(),
             &config.server_identity,
         )
         .await
@@ -388,7 +388,7 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
                     return Err(anyhow::anyhow!("Failed to connect after {} attempts: {}", MAX_RECONNECT_ATTEMPTS, e));
                 }
                 let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5) as u32)),
+                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
                     MAX_RECONNECT_DELAY_MS,
                 );
                 warn!("Retrying in {} ms (attempt {}/{})", delay_ms, reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
@@ -424,14 +424,14 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
 
         // Create TUN device with server-assigned IP
         let tun_device = match TunDevice::create_with_ip(&tun_config, &ip_cidr)
-            .with_context(|| format!("Failed to create TUN device"))
+            .with_context(|| "Failed to create TUN device")
         {
             Ok(d) => d,
             Err(e) => {
                 error!("Failed to create TUN device: {}", e);
                 reconnect_attempts += 1;
                 let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5) as u32)),
+                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
                     MAX_RECONNECT_DELAY_MS,
                 );
                 warn!("Retrying TUN device creation in {} ms", delay_ms);
@@ -477,7 +477,7 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
                 }
 
                 let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5) as u32)),
+                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
                     MAX_RECONNECT_DELAY_MS,
                 );
                 warn!("Tunnel disconnected, reconnecting in {} ms (attempt {}/{})", delay_ms, reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
@@ -742,9 +742,9 @@ async fn show_status(entries: usize) -> Result<()> {
                 let history_vec: Vec<_> = history.entries().iter().rev().take(entries).collect();
                 for entry in history_vec {
                     println!(
-                        "║  {} - {} msg/s                           ║",
+                        "║  {} - {:.1} msg/s                           ║",
                         entry.formatted_time(),
-                        format!("{:.1}", entry.snapshot.messages_received_per_sec)
+                        entry.snapshot.messages_received_per_sec
                     );
                 }
             }

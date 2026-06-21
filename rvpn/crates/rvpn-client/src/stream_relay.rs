@@ -168,7 +168,7 @@ impl StreamRelay {
                                 identity_key: server_bundle.identity_key, // Use expected from prekey bundle
                                 identity_x25519_key: server_bundle.identity_x25519_key,
                                 signed_prekey: server_bundle.signed_prekey,
-                                prekey_signature: server_bundle.prekey_signature.clone(),
+                                prekey_signature: server_bundle.prekey_signature,
                                 one_time_prekey: None,
                             };
                             
@@ -414,14 +414,14 @@ impl StreamRelay {
                         };
 
                         // Decrypt with ratchet (0x01 = ProxyData payload type)
-                        let decrypted = match {
+                        let decrypted = {
                             let mut ratchet_guard = ratchet_clone2.lock().await;
-                            ratchet_guard.decrypt(&message, &[0x01])
-                        } {
-                            Ok(pt) => pt,
-                            Err(e) => {
-                                warn!("Decryption failed: {:?}", e);
-                                continue;
+                            match ratchet_guard.decrypt(&message, &[0x01]) {
+                                Ok(pt) => pt,
+                                Err(e) => {
+                                    warn!("Decryption failed: {:?}", e);
+                                    continue;
+                                }
                             }
                         };
 
@@ -501,7 +501,7 @@ impl StreamRelay {
         }
 
         // Abort any remaining tasks (if we exited due to an error, others may still be running)
-        while let Some(_) = tasks.join_next().await {}
+        while tasks.join_next().await.is_some() {}
 
         // Graceful shutdown: give TCP socket time to flush
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -513,8 +513,6 @@ impl StreamRelay {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_length_prefix_format() {
         // Verify length encoding (used in the protocol for target address)

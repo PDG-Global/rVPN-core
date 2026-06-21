@@ -256,11 +256,11 @@ impl SplitTunnel {
         let data = self.data.read().await;
 
         // Check ad/tracker domains first (highest priority)
-        if self.config.block_ads {
-            if Self::matches_domain(host, &data.block_domains) || matches_ad_domain(host) {
-                debug!("Host {} matches ad/tracker domain list - blocking", host);
-                return RoutingDecision::Block;
-            }
+        if self.config.block_ads
+            && (Self::matches_domain(host, &data.block_domains) || matches_ad_domain(host))
+        {
+            debug!("Host {} matches ad/tracker domain list - blocking", host);
+            return RoutingDecision::Block;
         }
 
         // Check tunnel domains first (highest priority)
@@ -284,21 +284,21 @@ impl SplitTunnel {
 
         // Check built-in China domains if CN is in bypass countries
         // SECURITY: Validate resolved IPs are in China before bypassing to prevent DNS rebinding
-        if self.config.builtin_bypass_countries.contains(&"CN".to_string()) {
-            if matches_china_domain(host) {
-                debug!("Host {} matches built-in China domain list, validating IPs", host);
-                if let Some(ip_addrs) = self.resolve_host_to_ips(host).await {
-                    if self.ips_match_country(&ip_addrs, "CN") {
-                        debug!("Host {} resolved IPs are in China, bypassing", host);
-                        return RoutingDecision::Bypass;
-                    }
-                    debug!("Host {} resolved IPs not in China, routing through tunnel", host);
-                    return RoutingDecision::Tunnel;
+        if self.config.builtin_bypass_countries.contains(&"CN".to_string())
+            && matches_china_domain(host)
+        {
+            debug!("Host {} matches built-in China domain list, validating IPs", host);
+            if let Some(ip_addrs) = self.resolve_host_to_ips(host).await {
+                if self.ips_match_country(&ip_addrs, "CN") {
+                    debug!("Host {} resolved IPs are in China, bypassing", host);
+                    return RoutingDecision::Bypass;
                 }
-                // DNS resolution failed, don't bypass - route through tunnel instead
-                debug!("Host {} DNS resolution failed, routing through tunnel", host);
+                debug!("Host {} resolved IPs not in China, routing through tunnel", host);
                 return RoutingDecision::Tunnel;
             }
+            // DNS resolution failed, don't bypass - route through tunnel instead
+            debug!("Host {} DNS resolution failed, routing through tunnel", host);
+            return RoutingDecision::Tunnel;
         }
 
         // Default to tunnel if no match

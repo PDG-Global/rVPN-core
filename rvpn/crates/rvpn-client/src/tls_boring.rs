@@ -101,71 +101,28 @@ impl AsyncWrite for ChromeTlsStream {
 }
 
 /// On iOS the Network Extension sandbox blocks all filesystem access to /etc/ssl/,
-/// so boring/OpenSSL's set_default_verify_paths() finds no CA roots and every TLS
-/// handshake fails with a cert verification error.
-///
-/// Instead we install a custom verify callback that delegates to Apple's
-/// SecTrustEvaluateWithError (via the security-framework crate). This uses the
-/// iOS system trust store (which includes Let's Encrypt, DigiCert, etc.) and works
-/// with any valid cert from any trusted CA — no cert bundling required.
+/// and the trustd XPC service is unreliable from within the extension process.
+/// We bundle Mozilla's CA root certificates as a PEM file and load them directly
+/// into BoringSSL's certificate store, eliminating any dependency on the system
+/// trust store or trustd.
 #[cfg(target_os = "ios")]
-fn set_ios_cert_verify(builder: &mut boring::ssl::SslConnectorBuilder, hostname: &str) {
-    use security_framework::certificate::SecCertificate;
-    use security_framework::policy::SecPolicy;
-    use security_framework::secure_transport::SslProtocolSide;
-    use security_framework::trust::SecTrust;
+fn set_ios_cert_verify(builder: &mut boring::ssl::SslConnectorBuilder, _hostname: &str) {
+    use boring::x509::store::X509StoreBuilder;
+    use boring::x509::X509;
 
-    let hostname = hostname.to_string();
-    builder.set_verify_callback(
-        boring::ssl::SslVerifyMode::PEER,
-        move |_preverify_ok, ctx| {
-            // Get the full chain presented by the server
-            let chain = match ctx.chain() {
-                Some(c) => c,
-                None => {
-                    debug!("TLS verify: no certificate chain");
-                    return false;
-                }
-            };
+    // Bundle includes 128 Mozilla CA root certificates
+    static CA_BUNDLE: &str = include_str!("ca-bundle.pem");
 
-            // Convert each OpenSSL X509 cert to DER bytes then into a SecCertificate
-            let sec_certs: Vec<SecCertificate> = chain
-                .iter()
-                .filter_map(|cert| {
-                    let der = cert.to_der().ok()?;
-                    SecCertificate::from_der(&der).ok()
-                })
-                .collect();
+    let certs = X509::stack_from_pem(CA_BUNDLE.as_bytes())
+        .expect("Failed to parse bundled CA certificates");
 
-            if sec_certs.is_empty() {
-                debug!("TLS verify: could not parse any certs from chain");
-                return false;
-            }
+    let mut store = X509StoreBuilder::new().expect("Failed to create X509 store");
+    for cert in certs {
+        store.add_cert(cert).ok();
+    }
 
-            // SSL policy for server auth against the target hostname
-            let policy = SecPolicy::create_ssl(SslProtocolSide::SERVER, Some(&hostname));
-
-            let trust = match SecTrust::create_with_certificates(&sec_certs, &[policy]) {
-                Ok(t) => t,
-                Err(e) => {
-                    debug!("TLS verify: SecTrust creation failed: {:?}", e);
-                    return false;
-                }
-            };
-
-            // Evaluate using the iOS system trust store
-            match trust.evaluate_with_error() {
-                Ok(_) => {
-                    debug!("TLS verify: iOS SecTrust evaluation passed");
-                    true
-                }
-                Err(e) => {
-                    debug!("TLS verify: iOS SecTrust evaluation failed: {:?}", e);
-                    false
-                }
-            }
-        },
-    );
+    builder.set_verify_cert_store(store.build()).ok();
+    builder.set_verify(boring::ssl::SslVerifyMode::PEER);
 }
 
 /// Build a TLS connector that mimics Chrome

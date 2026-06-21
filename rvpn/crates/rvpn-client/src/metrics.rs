@@ -1744,7 +1744,7 @@ mod tests {
         assert_eq!(hist.count(), 160);
         // p50 should be around 500-1000us range
         let p50 = hist.percentile(50.0);
-        assert!(p50 >= 100 && p50 <= 2000, "p50 should be between 100-2000us, got {}", p50);
+        assert!((100..=2000).contains(&p50), "p50 should be between 100-2000us, got {}", p50);
         // p99 should be in the higher buckets
         let p99 = hist.percentile(99.0);
         assert!(p99 >= 1000, "p99 should be >= 1000us, got {}", p99);

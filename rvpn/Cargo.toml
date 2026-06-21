@@ -3,7 +3,7 @@ members = ["crates/rvpn-core", "crates/rvpn-client", "crates/rvpn-server", "crat
 resolver = "2"
 
 [workspace.package]
-version = "1.2.3"
+version = "1.2.4"
 edition = "2021"
 authors = ["PDG Global Limited"]
 license = "AGPLv2"

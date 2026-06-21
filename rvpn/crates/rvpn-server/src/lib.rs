@@ -149,7 +149,6 @@ mod tun_writer {
             &self,
             client_id: String,
         ) -> Pin<Box<dyn std::future::Future<Output = Result<IpAddr>> + Send + '_>> {
-            let client_id = client_id;
             Box::pin(async move {
                 let ts = self;
                 ts.allocate_ip(&client_id).await

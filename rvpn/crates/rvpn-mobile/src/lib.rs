@@ -10,6 +10,18 @@
 //! - All network I/O runs in-process within the Tokio runtime
 //! - Compatible with iOS Network Extension sandbox
 
+// Use mimalloc as the global allocator.
+//
+// iOS Network Extensions have a strict 50 MB memory limit. Under high
+// packet throughput (3000+ allocs/sec for video streaming), the system
+// allocator (libmalloc) fragments and never returns freed pages to the OS,
+// causing RSS to grow until jetsam kills the process.
+//
+// mimalloc is designed for high-throughput, low-fragmentation workloads
+// and aggressively returns freed memory to the OS.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod api;
 pub mod ffi;
 pub mod flow_connector;

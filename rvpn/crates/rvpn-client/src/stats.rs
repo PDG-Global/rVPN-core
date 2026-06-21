@@ -6,7 +6,7 @@
 use crate::metrics::{MetricsSnapshot, global_metrics};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -171,37 +171,37 @@ impl StatsHistory {
     }
 
     /// Get stats file path in given data directory
-    fn stats_file_path_in(data_dir: &PathBuf) -> PathBuf {
+    fn stats_file_path_in(data_dir: &Path) -> PathBuf {
         data_dir.join(STATS_FILE_NAME)
     }
 
     /// Save stats to disk in given data directory
-    pub async fn save_to(&self, data_dir: &PathBuf) -> anyhow::Result<()> {
+    pub async fn save_to(&self, data_dir: &Path) -> anyhow::Result<()> {
         let path = Self::stats_file_path_in(data_dir);
-        
+
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        
+
         let json = serde_json::to_string_pretty(self)?;
         tokio::fs::write(&path, json).await?;
-        
+
         debug!("Stats saved to {:?}", path);
         Ok(())
     }
 
     /// Load stats from disk in given data directory
-    pub async fn load_from(data_dir: &PathBuf) -> anyhow::Result<Self> {
+    pub async fn load_from(data_dir: &Path) -> anyhow::Result<Self> {
         let path = Self::stats_file_path_in(data_dir);
-        
+
         if !path.exists() {
             return Ok(Self::new());
         }
-        
+
         let json = tokio::fs::read_to_string(&path).await?;
         let history: Self = serde_json::from_str(&json)?;
-        
+
         info!("Loaded {} stats entries from {:?}", history.len(), path);
         Ok(history)
     }
@@ -570,9 +570,5 @@ pub fn global_stats_manager() -> Option<Arc<StatsManager>> {
 /// Start stats collection with the global manager
 #[allow(dead_code)]
 pub async fn start_global_stats_collection() -> Option<tokio::task::JoinHandle<()>> {
-    if let Some(manager) = global_stats_manager() {
-        Some(manager.start_collection())
-    } else {
-        None
-    }
+    global_stats_manager().map(|manager| manager.start_collection())
 }

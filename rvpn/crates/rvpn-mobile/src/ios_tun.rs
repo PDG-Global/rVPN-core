@@ -24,11 +24,11 @@ use futures::StreamExt;
 use futures_util::stream::SplitSink;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::time::timeout;
-use bytes::BytesMut;
-use tokio_tungstenite::{client_async, tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio::net::TcpStream;
 use tracing::{debug, error, info, trace, warn};
 use tungstenite::handshake::client::generate_key;
-use rvpn_client::tls_boring::{connect_chrome_like, ChromeTlsStream, TlsFingerprint};
+use bytes::BytesMut;
 
 use ed25519_dalek::Verifier;
 use rvpn_core::crypto::ratchet::RatchetMessage;
@@ -39,9 +39,26 @@ use rvpn_core::protocol::padding::{pad_packet, unpad_packet};
 
 use crate::ffi::TunConfig;
 
+/// Release freed heap memory back to the OS.
+///
+/// Rust's system allocator (libmalloc on iOS) does not automatically return
+/// freed memory to the OS. Under high packet throughput (~3000 allocs/sec),
+/// the process RSS grows until it hits iOS's 50 MB NetworkExtension limit
+/// and is killed by jetsam. Calling this periodically releases the freed
+/// pages, keeping RSS bounded.
+///
+/// Returns the number of bytes released.
+fn trim_memory() -> usize {
+    extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    // NULL zone = default zone; 0 goal = release as much as possible.
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) }
+}
+
 /// WebSocket writer type
-type WsSink = SplitSink<WebSocketStream<ChromeTlsStream>, Message>;
-type WsStream = futures_util::stream::SplitStream<WebSocketStream<ChromeTlsStream>>;
+type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+type WsStream = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 /// Outgoing packet batching limits.
 ///
@@ -135,6 +152,11 @@ pub struct IosTunClient {
     mtu: Arc<Mutex<u16>>,
     /// State callback for Swift notifications
     state_callback: Arc<RwLock<StateCallback>>,
+    /// Last time any traffic was received from the server (Unix seconds).
+    /// Updated on every WebSocket frame, including encrypted data and WS
+    /// control frames, so Swift can distinguish a healthy idle tunnel from
+    /// a suspended/dead one.
+    last_rx_time: Arc<AtomicU64>,
     /// Start/reconnect loop running flag (prevents duplicate loops)
     is_started: AtomicBool,
     /// Reconnection enabled flag
@@ -147,8 +169,6 @@ pub struct IosTunClient {
     reconnect_max_delay_ms: AtomicU64,
     /// Last time a reconnect was requested via network change (debounces rapid calls)
     last_reconnect_request: std::sync::Mutex<std::time::Instant>,
-    /// TLS fingerprint to use for stealth connections
-    tls_fingerprint: TlsFingerprint,
 }
 
 impl IosTunClient {
@@ -184,18 +204,13 @@ impl IosTunClient {
         let server_bundle: X3DHPublicBundle =
             serde_json::from_str(&bundle_json).context("Failed to parse prekey bundle JSON")?;
 
-        // Parse TLS fingerprint (default to Chrome for stealth)
-        let tls_fingerprint = config.tls_fingerprint.as_deref()
-            .and_then(rvpn_client::tls_boring::fingerprint_from_str)
-            .unwrap_or(TlsFingerprint::Chrome);
-
-        // Create channels for Swift TUN communication
-        // 1000 packets * ~1500 bytes avg = ~1.5MB buffer, well within iOS Network
-        // Extension memory limits and reduces packet drops under load.
-        // to_swift_receiver is used by Swift to receive packets from server (via recv_packet_from_server)
-        let (to_swift_sender, to_swift_receiver) = mpsc::channel::<Vec<u8>>(1000);
+        // Create channels for Swift TUN communication.
+        // iOS uses smaller channels to stay within the 50 MB NE memory limit.
+        // macOS keeps larger channels for throughput (no tight memory limit).
+        let chan_cap = if cfg!(feature = "ios-direct-tun") { 200 } else { 1000 };
+        let (to_swift_sender, to_swift_receiver) = mpsc::channel::<Vec<u8>>(chan_cap);
         // from_swift_receiver is used by Swift to send packets to server (via send_packet_to_server)
-        let (from_swift_sender, from_swift_receiver) = mpsc::channel::<Vec<u8>>(1000);
+        let (from_swift_sender, from_swift_receiver) = mpsc::channel::<Vec<u8>>(chan_cap);
 
         // Create shutdown channel
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -207,13 +222,24 @@ impl IosTunClient {
         // Set initial state
         let state = Arc::new(AtomicI32::new(TunClientState::Init as i32));
 
-        // Create runtime
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .thread_name("rvpn-ios-tun")
-            .build()
-            .context("Failed to create Tokio runtime")?;
+        // Create runtime.
+        // iOS: single worker + 512 KB stack to fit within 50 MB NE limit.
+        // macOS: 2 workers + default stack (no memory constraint).
+        let runtime = if cfg!(feature = "ios-direct-tun") {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_stack_size(512 * 1024)
+                .enable_all()
+                .thread_name("rvpn-tun")
+                .build()
+        } else {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .thread_name("rvpn-tun")
+                .build()
+        }
+        .context("Failed to create Tokio runtime")?;
 
         Ok(Self {
             runtime: Arc::new(runtime),
@@ -237,13 +263,18 @@ impl IosTunClient {
             dns_servers: Arc::new(Mutex::new(Vec::new())),
             mtu: Arc::new(Mutex::new(1420)),
             state_callback: Arc::new(RwLock::new(None)),
+            last_rx_time: Arc::new(AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )),
             is_started: AtomicBool::new(false),
             reconnect_enabled: AtomicBool::new(false), // Disabled by default, enable via setter
             reconnect_max_attempts: AtomicU32::new(0),
             last_reconnect_request: std::sync::Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(60)),
             reconnect_initial_delay_ms: AtomicU64::new(1000),
             reconnect_max_delay_ms: AtomicU64::new(5000),
-            tls_fingerprint,
         })
     }
 
@@ -323,25 +354,34 @@ impl IosTunClient {
 
         info!("[IosTun] Connecting to {}", url);
 
-        // Establish TLS connection with Chrome fingerprint via boring.
-        // We connect to the pre-resolved IP for TCP, but use the original
-        // hostname for TLS SNI to avoid DNS circular dependency during reconnect.
-        let tls_stream = timeout(
+        // Use rustls with bundled webpki-roots for certificate verification.
+        // This works reliably in the iOS Network Extension sandbox because it
+        // doesn't depend on /etc/ssl/ or trustd XPC.
+        // (BoringSSL's connect_chrome_like() blocks a Tokio worker thread and
+        // its certificate verification via trustd is unreliable in the sandbox.)
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
+
+        // Connect TCP to the pre-resolved IP to avoid DNS circular dependency.
+        // The WebSocket request still uses the original hostname for TLS SNI.
+        let tcp_addr = std::net::SocketAddr::new(self.server_ip, self.server_port);
+        let tcp_stream = timeout(
             std::time::Duration::from_secs(5),
-            connect_chrome_like(
-                &self.server_ip.to_string(),
-                self.server_port,
-                self.tls_fingerprint,
-                Some(&self.server_host),
-            )
+            tokio::net::TcpStream::connect(tcp_addr)
         )
         .await
-        .context("TLS connect timeout (5s)")?
-        .context("Failed to establish Chrome-fingerprinted TLS connection")?;
+        .context("TCP connect timeout (5s)")?
+        .context("Failed to connect TCP stream")?;
 
-        // Check again after TLS connect (stop may have been requested during the 5s timeout)
+        // Check again after TCP connect (stop may have been requested during the 5s timeout)
         if !self.reconnect_enabled.load(Ordering::Relaxed) {
-            return Err(anyhow::anyhow!("Connection cancelled by stop after TLS connect"));
+            return Err(anyhow::anyhow!("Connection cancelled by stop after TCP connect"));
         }
 
         // Build Chrome-like WebSocket upgrade request with 15 headers.
@@ -370,12 +410,18 @@ impl IosTunClient {
             .body(())
             .context("Failed to build WebSocket upgrade request")?;
 
+        // Perform WebSocket handshake over TLS (rustls handles TLS + SNI).
         let (ws_stream, _) = timeout(
-            std::time::Duration::from_secs(3),
-            client_async(request, tls_stream)
+            std::time::Duration::from_secs(5),
+            tokio_tungstenite::client_async_tls_with_config(
+                request,
+                tcp_stream,
+                None, // tungstenite config
+                Some(connector),
+            )
         )
         .await
-        .context("WebSocket handshake timeout (3s)")?
+        .context("WebSocket handshake timeout (5s)")?
         .context("WebSocket handshake failed")?;
 
         info!("[IosTun] WebSocket connected (TLS verified)");
@@ -779,9 +825,10 @@ impl IosTunClient {
                         info!("[IosTun] Server->Swift relay: shutdown received, breaking");
                         break;
                     }
-                    msg = timeout(std::time::Duration::from_secs(60), ws_read.next()) => {
+                    msg = timeout(std::time::Duration::from_secs(300), ws_read.next()) => {
                         match msg {
                             Ok(Some(Ok(Message::Binary(data)))) => {
+                                self.update_last_rx_time();
                                 packet_count += 1;
                                 if packet_count <= 5 || packet_count % 100 == 0 {
                                     info!("[IosTun] Server->Swift: received {} bytes Binary (packet #{})", data.len(), packet_count);
@@ -851,6 +898,7 @@ impl IosTunClient {
                                 }
                             }
                             Ok(Some(Ok(Message::Close(frame)))) => {
+                                self.update_last_rx_time();
                                 info!("[IosTun] Server->Swift: received Close frame ({:?}), sending shutdown and breaking", frame);
                                 let _ = shutdown_tx.send(());
                                 break;
@@ -866,17 +914,20 @@ impl IosTunClient {
                                 break;
                             }
                             Err(_) => {
-                                error!("[IosTun] Server->Swift: WebSocket read timeout (60s), sending shutdown and breaking");
+                                error!("[IosTun] Server->Swift: WebSocket read timeout (300s), sending shutdown and breaking");
                                 let _ = shutdown_tx.send(());
                                 break;
                             }
                             Ok(Some(Ok(Message::Ping(_)))) => {
+                                self.update_last_rx_time();
                                 debug!("[IosTun] Server->Swift: received Ping");
                             }
                             Ok(Some(Ok(Message::Pong(_)))) => {
+                                self.update_last_rx_time();
                                 debug!("[IosTun] Server->Swift: received Pong");
                             }
                             Ok(Some(Ok(other))) => {
+                                self.update_last_rx_time();
                                 info!("[IosTun] Server->Swift: received unexpected message type: {:?}", other);
                             }
                         }
@@ -896,8 +947,33 @@ impl IosTunClient {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 // Skip the immediate first tick.
                 interval.tick().await;
+                // Track wall-clock time to detect iOS process suspension.
+                // CLOCK_MONOTONIC pauses during suspension, so the interval
+                // fires immediately on resume but wall time has advanced.
+                let mut last_wall = std::time::Instant::now();
                 loop {
                     interval.tick().await;
+
+                    // Detect process suspension: if wall clock advanced >30s
+                    // since last keepalive, iOS froze us and the server's
+                    // 60-second timeout already expired. Force reconnect.
+                    let now = std::time::Instant::now();
+                    let elapsed = now.duration_since(last_wall);
+                    last_wall = now;
+                    if elapsed > std::time::Duration::from_secs(30) {
+                        error!("[IosTun] Keepalive: process was suspended for {:.0}s, connection dead. Reconnecting.", elapsed.as_secs_f64());
+                        let _ = shutdown_tx.send(());
+                        break;
+                    }
+
+                    // Release freed heap memory back to iOS.
+                    // Under high traffic, Rust's allocator accumulates freed
+                    // but unreturned pages. Without this, the extension's RSS
+                    // grows until jetsam kills it at 50 MB.
+                    let freed = trim_memory();
+                    if freed > 0 {
+                        debug!("[IosTun] Keepalive: released {} KB back to OS", freed / 1024);
+                    }
 
                     let encrypted = {
                         let mut ratchet_guard = ratchet.lock().await;
@@ -917,6 +993,17 @@ impl IosTunClient {
                         let _ = shutdown_tx.send(());
                         break;
                     }
+                    // Also send a WebSocket-level ping. The server sends WS pings
+                    // every 30s but they may not reach us through NAT/firewall.
+                    // Our own WS ping ensures the server's read path stays active
+                    // even if its outbound pings are dropped.
+                    if let Err(e) = ws_guard.send(Message::Ping(vec![].into())).await {
+                        error!("[IosTun] Keepalive: WS Ping failed: {}", e);
+                        drop(ws_guard);
+                        let _ = shutdown_tx.send(());
+                        break;
+                    }
+                    drop(ws_guard);
                     trace!("[IosTun] Keepalive: Ping sent");
                 }
             }
@@ -1047,6 +1134,20 @@ impl IosTunClient {
         self.config.block_ads
     }
 
+    /// Update the last-received timestamp to the current wall-clock time.
+    fn update_last_rx_time(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.last_rx_time.store(now, Ordering::Relaxed);
+    }
+
+    /// Get the last time any traffic was received from the server, in Unix seconds.
+    pub fn last_rx_time(&self) -> u64 {
+        self.last_rx_time.load(Ordering::Relaxed)
+    }
+
     /// Get identity key reference
     pub(crate) fn identity_key(&self) -> &IdentityKey {
         &self.identity_key
@@ -1077,11 +1178,6 @@ impl IosTunClient {
         self.server_ip
     }
 
-    /// Get TLS fingerprint
-    pub fn tls_fingerprint(&self) -> TlsFingerprint {
-        self.tls_fingerprint
-    }
-
     /// Send a packet to the server (call this from Swift)
     /// Swift calls this to send packets to be relayed to the server
     pub async fn send_packet_to_server(&self, packet: Vec<u8>) -> Result<()> {
@@ -1093,7 +1189,10 @@ impl IosTunClient {
 
     /// Non-blocking send for FFI hot path (avoids block_on deadlock)
     /// Returns TrySendError if the channel is full or disconnected
-    pub fn try_send_packet(&self, packet: Vec<u8>) -> Result<(), tokio::sync::mpsc::error::TrySendError<Vec<u8>>> {
+    pub fn try_send_packet(
+        &self,
+        packet: Vec<u8>,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<Vec<u8>>> {
         self.from_swift_sender.try_send(packet)
     }
 

@@ -90,10 +90,7 @@ pub fn http_request_through_proxy(
 
 /// Check if proxy is accepting connections
 pub fn is_proxy_ready(proxy_addr: &str) -> bool {
-    match TcpStream::connect(proxy_addr) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    TcpStream::connect(proxy_addr).is_ok()
 }
 
 /// Wait for proxy to be ready
@@ -145,7 +142,7 @@ pub fn parse_status_code(response: &str) -> Option<u16> {
 /// Check if response indicates success (2xx status)
 pub fn is_success_response(response: &str) -> bool {
     match parse_status_code(response) {
-        Some(code) => code >= 200 && code < 300,
+        Some(code) => (200..300).contains(&code),
         None => false,
     }
 }

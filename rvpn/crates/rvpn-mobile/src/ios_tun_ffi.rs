@@ -474,7 +474,7 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::R
         server_host: server_host.clone(),
         server_port,
         server_path: dns_path.clone(),
-        tls_fingerprint: client.tls_fingerprint(),
+        tls_fingerprint: rvpn_client::tls_boring::TlsFingerprint::Chrome,
         identity_key: Arc::new(client.identity_key().clone()),
         server_bundle: client.server_bundle().clone(),
     };
@@ -590,13 +590,23 @@ pub unsafe extern "C" fn rvpn_tun_create(config_json: *const c_char) -> c_int {
         return SUCCESS;
     }
 
-    // Create Tokio runtime
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .thread_name("rvpn-ios-tun")
-        .build()
-    {
+    // Create Tokio runtime for FFI getter functions.
+    // iOS: 256 KB stack to save memory. macOS: default stack.
+    let runtime = if cfg!(feature = "ios-direct-tun") {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(256 * 1024)
+            .enable_all()
+            .thread_name("rvpn-ffi")
+            .build()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("rvpn-ffi")
+            .build()
+    };
+    let runtime = match runtime {
         Ok(rt) => rt,
         Err(e) => {
             error!("[IOS_TUN_FFI] Failed to create Tokio runtime: {}", e);
@@ -939,6 +949,22 @@ pub extern "C" fn rvpn_tun_wait_for_packet(timeout_ms: u64) -> c_int {
     };
 
     client.wait_for_packet(timeout_ms)
+}
+
+/// Get the last time any traffic was received from the server.
+///
+/// Returns the Unix timestamp (seconds) of the most recently received
+/// WebSocket frame, including encrypted data and WS control frames.
+/// Swift uses this to detect a suspended/dead connection without
+/// mistakenly killing an idle but healthy tunnel.
+#[no_mangle]
+pub extern "C" fn rvpn_tun_get_last_rx_time() -> u64 {
+    let client = match TUN_CLIENT.lock().unwrap().as_ref() {
+        Some(c) => c.clone(),
+        None => return 0,
+    };
+
+    client.last_rx_time()
 }
 
 /// Stop the TUN client

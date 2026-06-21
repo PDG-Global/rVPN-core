@@ -52,7 +52,7 @@ async fn test_websocket_binary_roundtrip() -> Result<()> {
 
     for payload in &test_payloads {
         write
-            .send(tungstenite::Message::Binary(payload.clone().into()))
+            .send(tungstenite::Message::Binary(payload.clone()))
             .await?;
         let msg = timeout(Duration::from_secs(5), read.next())
             .await
@@ -230,11 +230,10 @@ async fn test_concurrent_websocket_connections() -> Result<()> {
                         use futures::{SinkExt, StreamExt};
                         let (mut write, mut read) = ws_stream.split();
                         while let Some(Ok(msg)) = read.next().await {
-                            if msg.is_text() || msg.is_binary() {
-                                if write.send(msg).await.is_err() {
+                            if (msg.is_text() || msg.is_binary())
+                                && write.send(msg).await.is_err() {
                                     break;
                                 }
-                            }
                         }
                     }
                 });
@@ -251,7 +250,7 @@ async fn test_concurrent_websocket_connections() -> Result<()> {
             let (ws_stream, _) = tokio_tungstenite::connect_async(&url).await?;
             let (mut write, mut read) = ws_stream.split();
             let msg = format!("client-{}", i);
-            write.send(tungstenite::Message::Text(msg.clone().into())).await?;
+            write.send(tungstenite::Message::Text(msg.clone())).await?;
             let echo = timeout(Duration::from_secs(2), read.next())
                 .await
                 .expect("Should receive echo")
@@ -412,7 +411,7 @@ async fn test_tls_websocket_with_chrome_headers() -> Result<()> {
 
     // Send binary data through the Chrome-header TLS WebSocket
     let test_data = vec![0xAB; 4096];
-    write.send(tungstenite::Message::Binary(test_data.clone().into())).await?;
+    write.send(tungstenite::Message::Binary(test_data.clone())).await?;
 
     let msg = timeout(Duration::from_secs(5), read.next())
         .await

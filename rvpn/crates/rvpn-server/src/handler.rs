@@ -74,11 +74,11 @@ fn should_block_address(addr: &IpAddr, allowed_cidr: Option<&str>) -> bool {
                 return true;
             }
             // Private (ULA): fc00::/7
-            if ipv6.is_unique_local() {
+            if (ipv6.segments()[0] & 0xfe00) == 0xfc00 {
                 return true;
             }
             // Link-local: fe80::/10
-            if ipv6.is_unicast_link_local() {
+            if (ipv6.segments()[0] & 0xffc0) == 0xfe80 {
                 return true;
             }
             // Multicast: ff00::/8
@@ -982,8 +982,8 @@ impl VpnHandler {
             Ok(())
         });
 
-        // Wait for any task to complete; all remaining tasks are auto-aborted
-        while let Some(result) = tasks.join_next().await {
+        // Wait for the first task to complete; all remaining tasks are then aborted.
+        if let Some(result) = tasks.join_next().await {
             match result {
                 Ok(Ok(())) => {
                     debug!("Relay sub-task completed normally");
@@ -996,9 +996,7 @@ impl VpnHandler {
                     debug!("Relay sub-task aborted: {:?}", je);
                 }
             }
-            // After the first task completes, abort all remaining tasks
             tasks.abort_all();
-            break;
         }
 
         // Graceful shutdown: give TLS time to send close_notify
@@ -1188,8 +1186,8 @@ impl VpnHandler {
             Ok(())
         });
 
-        // Wait for any task to complete; all remaining tasks are auto-aborted
-        while let Some(result) = tasks.join_next().await {
+        // Wait for the first task to complete; all remaining tasks are then aborted.
+        if let Some(result) = tasks.join_next().await {
             match result {
                 Ok(Ok(())) => {
                     debug!("UDP relay sub-task completed normally");
@@ -1202,7 +1200,6 @@ impl VpnHandler {
                 }
             }
             tasks.abort_all();
-            break;
         }
 
         Ok(())
@@ -1551,6 +1548,10 @@ enum MuxMessage {
 
 type FlowMap = Arc<Mutex<HashMap<u32, Arc<Mutex<OwnedWriteHalf>>>>>;
 
+/// Pending per-flow data buffered before a flow is established.
+/// Maps flow ID to a queue of (payload, sequence_number, age).
+type PendingFlows = tokio::sync::Mutex<std::collections::HashMap<u32, Vec<(Vec<u8>, u64, Duration)>>>;
+
 /// Pre-created TCP connections ready for immediate use.
 /// Key: "target:port", Value: queue of fresh TcpStreams.
 /// Avoids repeated DNS resolution + TCP connect to the same CDN hosts.
@@ -1698,8 +1699,8 @@ where
 
         // 3. Run WebSocket reader and writer concurrently
         let flows = self.flows.clone();
-        let pending_flows: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<u32, Vec<(Vec<u8>, u64, Duration)>>>> =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let pending_flows: Arc<PendingFlows> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let peer_addr = self.peer_addr;
         let tx = self.tx.clone();
         let dns_cache = self.dns_cache.clone();
@@ -1751,25 +1752,36 @@ where
             warn!("Cannot register client - allocated_ip_for_tun is None!");
         }
 
-        // Task to receive TUN response packets, encrypt, and send via WebSocket
+        // Task to receive TUN response packets, encrypt, and send via WebSocket.
+        //
+        // IMPORTANT: Do NOT hold the ratchet lock during the WebSocket send.
+        // If the send blocks (TCP backpressure from client), holding the ratchet
+        // lock prevents ws_receiver from decrypting incoming packets, which
+        // freezes the entire session. Encrypt first (with ratchet lock), then
+        // release it, then send (with ws_write lock only).
         let tun_response_task = async move {
             while let Some(packet) = tun_response_rx.recv().await {
-                let mut ratchet_guard = ratchet_for_tun.lock().await;
-                let mut ws_write_guard = ws_write_for_tun.lock().await;
-
-                // Encrypt the packet using Data payload type (0x01)
-                match Self::encrypt_data_frame(&mut *ratchet_guard, &packet) {
-                    Ok(encrypted) => {
-                        if let Err(e) = ws_write_guard.send(Message::Binary(encrypted)).await {
-                            error!("Failed to send TUN response via WebSocket: {}", e);
+                // Step 1: Encrypt — hold ratchet lock only during this fast operation
+                let encrypted = {
+                    let mut ratchet_guard = ratchet_for_tun.lock().await;
+                    match Self::encrypt_data_frame(&mut ratchet_guard, &packet) {
+                        Ok(enc) => enc,
+                        Err(e) => {
+                            error!("Failed to encrypt TUN response: {}", e);
                             break;
-                        } else {
-                            debug!("Sent encrypted TUN response ({} bytes packet)", packet.len());
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to encrypt TUN response: {}", e);
+                };
+                // ratchet_guard dropped here — ws_receiver / ws_sender can encrypt/decrypt
+
+                // Step 2: Send — hold ws_write lock only
+                {
+                    let mut ws_write_guard = ws_write_for_tun.lock().await;
+                    if let Err(e) = ws_write_guard.send(Message::Binary(encrypted)).await {
+                        error!("Failed to send TUN response via WebSocket: {}", e);
                         break;
+                    } else {
+                        debug!("Sent encrypted TUN response ({} bytes packet)", packet.len());
                     }
                 }
             }
@@ -1852,6 +1864,13 @@ where
             }
         };
 
+        // Track last time we received any traffic from the client. TUN clients
+        // send keepalives every 15s; if we see nothing for 90s the client is
+        // likely dead (suspended process, dropped NAT mapping, etc.).
+        let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let last_activity_for_receiver = last_activity.clone();
+        let last_activity_for_ping = last_activity.clone();
+
         // Task to receive from WebSocket and process.
         // The ratchet lock is held only during decrypt (fast), then released
         // before dispatching to flows. This prevents a slow target TCP write
@@ -1865,11 +1884,25 @@ where
             let session_start = Instant::now();
             let frame_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let frame_counter_clone = frame_counter.clone();
+            let last_activity = last_activity_for_receiver;
 
             async move {
-                while let Some(msg) = ws_read.next().await {
+                let idle_timeout = Duration::from_secs(90);
+                loop {
+                    let remaining = idle_timeout
+                        .saturating_sub(last_activity.lock().unwrap().elapsed());
+                    if remaining.is_zero() {
+                        warn!(
+                            "TUN client {} idle timeout (no traffic for {}s), closing",
+                            peer_addr,
+                            idle_timeout.as_secs()
+                        );
+                        break;
+                    }
+                    let msg = tokio::time::timeout(remaining, ws_read.next()).await;
                     match msg {
-                        Ok(Message::Binary(data)) => {
+                        Ok(Some(Ok(Message::Binary(data)))) => {
+                            *last_activity.lock().unwrap() = Instant::now();
                             let frame_num = frame_counter_clone
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                 + 1;
@@ -1880,7 +1913,7 @@ where
                                 let mut ratchet_guard = ratchet.lock().await;
                                 Self::decrypt_and_parse_frame(
                                     &data,
-                                    &mut *ratchet_guard,
+                                    &mut ratchet_guard,
                                     frame_num,
                                     peer_addr,
                                     elapsed,
@@ -1921,13 +1954,25 @@ where
                                 }
                             }
                         }
-                        Ok(Message::Ping(_)) => {
-                            // Pong handled automatically
+                        Ok(Some(Ok(Message::Ping(_)))) => {
+                            *last_activity.lock().unwrap() = Instant::now();
                         }
-                        Ok(Message::Close(_)) | Err(_) => {
+                        Ok(Some(Ok(Message::Pong(_)))) => {
+                            *last_activity.lock().unwrap() = Instant::now();
+                        }
+                        Ok(Some(Ok(Message::Close(_)))) |
+                        Ok(None) |
+                        Ok(Some(Err(_))) => {
                             break;
                         }
-                        _ => {}
+                        Ok(Some(Ok(_))) => {
+                            *last_activity.lock().unwrap() = Instant::now();
+                        }
+                        Err(_) => {
+                            // Timeout already checked at the top of the loop;
+                            // this arm handles timeout while waiting for a frame.
+                            break;
+                        }
                     }
                 }
             }
@@ -1940,8 +1985,15 @@ where
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
+                // If the client has been idle for most of the timeout, skip the
+                // ping and let the receiver time out cleanly instead of sending
+                // on a potentially dead socket.
+                if last_activity_for_ping.lock().unwrap().elapsed() > Duration::from_secs(75) {
+                    warn!("Skipping ping for {}: client idle too long", peer_addr);
+                    break;
+                }
                 let mut guard = ws_write_for_ping.lock().await;
-                if let Err(e) = guard.send(Message::Ping(vec![].into())).await {
+                if let Err(e) = guard.send(Message::Ping(vec![])).await {
                     trace!("Ping send failed for {}: {}", peer_addr, e);
                     break;
                 }
@@ -2099,6 +2151,7 @@ where
     /// This is called for EVERY frame received from the client
     /// Added frame_number and elapsed parameters for ordering verification
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     async fn process_incoming_frame_static(
         data: &[u8],
         flows: &FlowMap,
@@ -2109,7 +2162,7 @@ where
         dns_cache: &DnsCache,
         tun_server: Option<&Arc<dyn TunWriter>>,
         tun_config: &TunNetworkConfig,
-        pending_flows: &tokio::sync::Mutex<std::collections::HashMap<u32, Vec<(Vec<u8>, u64, Duration)>>>,
+        pending_flows: &PendingFlows,
         frame_number: u64,
         elapsed: Duration,
     ) -> Result<()> {
@@ -2290,7 +2343,7 @@ where
                     frame_number
                 );
                 // NOTE: Do NOT unregister client here - session stays alive for bidirectional TUN traffic
-                return Ok(());
+                Ok(())
             } else {
                 // TCP mode: try to auto-create flow from the packet data
                 // This supports mobile clients that send data without explicit CreateFlow
@@ -2721,6 +2774,7 @@ where
     }
 
     /// Handle control message (flow_id = 0)
+    #[allow(clippy::too_many_arguments)]
     async fn handle_control(
         data: &[u8],
         flows: &FlowMap,
@@ -2730,7 +2784,7 @@ where
         tun_config: &TunNetworkConfig,
         // Buffer for data frames that arrived before their CreateFlow was processed.
         // Keyed by flow_id, value is a list of (data, frame_number, elapsed) tuples.
-        pending_flows: &tokio::sync::Mutex<std::collections::HashMap<u32, Vec<(Vec<u8>, u64, Duration)>>>,
+        pending_flows: &PendingFlows,
         tcp_pool: &TcpPool,
     ) -> Result<()> {
         let message: ControlMessage = bincode::deserialize(data)
@@ -3083,6 +3137,7 @@ where
 
     /// Dispatch a decrypted frame to the appropriate handler.
     /// May block on TCP write for data frames, but the ratchet lock is NOT held.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_decrypted_frame(
         flow_id: u32,
         payload: &[u8],
@@ -3094,7 +3149,7 @@ where
         dns_cache: &DnsCache,
         _tun_server: Option<&Arc<dyn TunWriter>>,
         tun_config: &TunNetworkConfig,
-        pending_flows: &tokio::sync::Mutex<std::collections::HashMap<u32, Vec<(Vec<u8>, u64, Duration)>>>,
+        pending_flows: &PendingFlows,
         tcp_pool: &TcpPool,
         frame_number: u64,
         elapsed: Duration,

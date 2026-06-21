@@ -40,7 +40,7 @@ async fn test_websocket_connection() -> anyhow::Result<()> {
     let result = tokio_tungstenite::connect_async(format!("ws://{}", addr)).await;
 
     // Cleanup
-    let _ = server.abort();
+    server.abort();
 
     assert!(result.is_ok(), "Should be able to connect to server");
 

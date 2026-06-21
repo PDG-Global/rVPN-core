@@ -400,7 +400,7 @@ async fn handle_http_port(
     // Extract Host header from request
     let host = request.lines()
         .find(|line| line.to_lowercase().starts_with("host:"))
-        .and_then(|line| line.splitn(2, ':').nth(1))
+        .and_then(|line| line.split_once(':').map(|x| x.1))
         .map(|h| h.trim())
         .unwrap_or("localhost");
     
@@ -426,6 +426,7 @@ async fn handle_http_port(
 }
 
 /// Handle a single TCP connection
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
@@ -645,9 +646,7 @@ fn prekey_bundle(config: &ServerConfig, identity_path: Option<PathBuf>, output_p
 
     let identity_path = identity_path.unwrap_or_else(|| PathBuf::from(&config.identity_key_file));
     let output_path = output_path.unwrap_or_else(|| {
-        config.prekey_bundle_file
-            .as_ref()
-            .map(|p| p.clone())
+        config.prekey_bundle_file.clone()
             .unwrap_or_else(|| PathBuf::from("prekey-bundle.json"))
     });
 
@@ -665,11 +664,11 @@ fn prekey_bundle(config: &ServerConfig, identity_path: Option<PathBuf>, output_p
     }
 
     let json = serde_json::to_string_pretty(&BundleJson {
-        identity_key: BASE64.encode(&bundle.identity_key),
-        identity_x25519_key: BASE64.encode(&bundle.identity_x25519_key),
-        signed_prekey: BASE64.encode(&bundle.signed_prekey),
-        prekey_signature: BASE64.encode(&bundle.prekey_signature),
-        one_time_prekey: bundle.one_time_prekey.map(|k| BASE64.encode(&k)),
+        identity_key: BASE64.encode(bundle.identity_key),
+        identity_x25519_key: BASE64.encode(bundle.identity_x25519_key),
+        signed_prekey: BASE64.encode(bundle.signed_prekey),
+        prekey_signature: BASE64.encode(bundle.prekey_signature),
+        one_time_prekey: bundle.one_time_prekey.map(|k| BASE64.encode(k)),
     })?;
 
     std::fs::write(&output_path, json)?;
@@ -685,7 +684,7 @@ fn prekey_bundle(config: &ServerConfig, identity_path: Option<PathBuf>, output_p
     }
     
     let private_json = serde_json::to_string_pretty(&PrivateKeyJson {
-        signed_prekey_private: BASE64.encode(&private_key),
+        signed_prekey_private: BASE64.encode(private_key),
     })?;
     
     std::fs::write(&private_output_path, private_json)?;

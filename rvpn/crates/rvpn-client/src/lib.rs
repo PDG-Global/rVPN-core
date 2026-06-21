@@ -13,7 +13,6 @@ pub mod dns;
 pub mod dns_cache;
 #[allow(dead_code)]
 pub mod identity_verification;
-#[allow(dead_code)]
 pub mod metrics;
 #[allow(dead_code)]
 pub mod split_tunnel;

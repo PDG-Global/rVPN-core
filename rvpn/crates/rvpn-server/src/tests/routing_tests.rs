@@ -65,7 +65,7 @@ async fn test_blocked_domains() -> anyhow::Result<()> {
 async fn test_combined_routing() -> anyhow::Result<()> {
     let mut engine = RoutingEngine::new();
     let _ = engine.add_china_ip("220.0.0.0/8");
-    let _ = engine.add_china_domain(".cn");
+    engine.add_china_domain(".cn");
 
     // Domain match should take precedence
     // google.com.cn should be direct (matches .cn)

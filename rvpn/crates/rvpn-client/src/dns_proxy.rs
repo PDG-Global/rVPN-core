@@ -61,6 +61,8 @@ pub struct DnsProxy {
 }
 
 impl DnsProxy {
+    /// Create a new DNS proxy.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         listen_addr: SocketAddr,
         server_host: String,

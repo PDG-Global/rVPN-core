@@ -8,7 +8,7 @@
 //! - flow_id = 0 for TUN data
 //! - The entire frame (including header) is encrypted with Double Ratchet
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -64,14 +64,15 @@ impl VpnTunnel {
     ///
     /// # Returns
     /// Arc<RwLock<VpnTunnel>> which can be used to send/receive data
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         host: &str,
         port: u16,
         path: &str,
         fingerprint: TlsFingerprint,
         sni_hostname: Option<&str>,
-        identity_key_file: &PathBuf,
-        prekey_bundle_file: Option<&PathBuf>,
+        identity_key_file: &Path,
+        prekey_bundle_file: Option<&Path>,
         server_identity_config: &ServerIdentityConfig,
     ) -> Result<Arc<RwLock<VpnTunnel>>> {
         info!("Connecting VPN tunnel to {}:{}{}", host, port, path);
@@ -266,7 +267,7 @@ impl VpnTunnel {
                             identity_key: server_identity_key,
                             identity_x25519_key: server_identity_x25519_key,
                             signed_prekey: server_signed_prekey,
-                            prekey_signature: prekey_signature,
+                            prekey_signature,
                             one_time_prekey: None,
                         };
 
@@ -284,7 +285,7 @@ impl VpnTunnel {
                             identity_key: server_identity_key,
                             identity_x25519_key: server_bundle.identity_x25519_key,
                             signed_prekey: server_signed_prekey,
-                            prekey_signature: prekey_signature,
+                            prekey_signature,
                             one_time_prekey: None,
                         };
 
@@ -396,87 +397,72 @@ impl VpnTunnel {
                     };
 
                     // Decrypt with ratchet using payload-type-specific AAD
-                    let plaintext = match {
+                    let plaintext = {
                         let mut ratchet_guard = ratchet.lock().await;
-                        ratchet_guard.decrypt(&message, &aad)
-                    } {
-                        Ok(pt) => pt,
-                        Err(e) => {
-                            warn!("Decryption failed: {:?}", e);
-                            continue;
+                        match ratchet_guard.decrypt(&message, &aad) {
+                            Ok(pt) => pt,
+                            Err(e) => {
+                                warn!("Decryption failed: {:?}", e);
+                                continue;
+                            }
                         }
                     };
 
                     // Handle based on payload type
-                    match payload_type {
-                        0x0D => {
-                            // VirtualIp assignment message
-                            // Server sends padded VirtualIp JSON, need to unpad first
-                            match rvpn_core::protocol::padding::unpad_packet(&plaintext) {
-                                Ok(unpadded) => {
-                                    match serde_json::from_slice::<rvpn_core::protocol::VirtualIp>(&unpadded) {
-                                        Ok(virtual_ip) => {
-                                            info!("Received VirtualIp assignment: ipv4={:?}, dns={:?}, mtu={}",
-                                                  virtual_ip.ipv4, virtual_ip.dns_servers, virtual_ip.mtu);
-                                            // Send to the connect function via channel (only first time)
-                                            if !virtual_ip_sent {
-                                                if let Err(e) = virtual_ip_tx.send(virtual_ip).await {
-                                                    warn!("Failed to send VirtualIp to connect: {}", e);
-                                                } else {
-                                                    virtual_ip_sent = true;
-                                                }
+                    if payload_type == 0x0D {
+                        // VirtualIp assignment message
+                        // Server sends padded VirtualIp JSON, need to unpad first
+                        match rvpn_core::protocol::padding::unpad_packet(&plaintext) {
+                            Ok(unpadded) => {
+                                match serde_json::from_slice::<rvpn_core::protocol::VirtualIp>(&unpadded) {
+                                    Ok(virtual_ip) => {
+                                        info!("Received VirtualIp assignment: ipv4={:?}, dns={:?}, mtu={}",
+                                              virtual_ip.ipv4, virtual_ip.dns_servers, virtual_ip.mtu);
+                                        // Send to the connect function via channel (only first time)
+                                        if !virtual_ip_sent {
+                                            if let Err(e) = virtual_ip_tx.send(virtual_ip).await {
+                                                warn!("Failed to send VirtualIp to connect: {}", e);
+                                            } else {
+                                                virtual_ip_sent = true;
                                             }
                                         }
-                                        Err(e) => {
-                                            warn!("Failed to deserialize VirtualIp: {}", e);
-                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to deserialize VirtualIp: {}", e);
                                     }
                                 }
-                                Err(e) => {
-                                    warn!("Failed to unpad VirtualIp frame: {}", e);
-                                }
                             }
-                            continue;
+                            Err(e) => {
+                                warn!("Failed to unpad VirtualIp frame: {}", e);
+                            }
                         }
-                        _ => {}
+                        continue;
                     }
 
-                    // Multiplexed mode: unpad then parse frame header
-                    let unpadded = match rvpn_core::protocol::padding::unpad_packet(&plaintext) {
+                    // Default: Data payload (0x01)
+                    // Unpad the decrypted data
+                    let data = match rvpn_core::protocol::padding::unpad_packet(&plaintext) {
                         Ok(data) => data,
                         Err(e) => {
-                            warn!("Failed to unpad multiplexed frame: {}", e);
+                            warn!("Failed to unpad data frame: {}", e);
                             continue;
                         }
                     };
 
-                    trace!("RECV_MUX: unpadded {} bytes, decoding frame", unpadded.len());
-
-                    let frame = match MultiplexedFrame::decode(&unpadded) {
-                        Ok(frame) => {
-                            trace!("RECV_MUX: decoded flow_id={}, payload_len={}", frame.flow_id, frame.payload.len());
-                            frame
-                        }
+                    // Parse the multiplexed frame
+                    let frame = match MultiplexedFrame::decode(&data) {
+                        Ok(frame) => frame,
                         Err(e) => {
-                            warn!("RECV_MUX: Failed to decode multiplexed frame: {}. Raw data first 20 bytes: {:?}",
-                                  e, &unpadded.get(..20.min(unpadded.len())));
+                            warn!("Failed to decode multiplexed frame: {}", e);
                             continue;
                         }
                     };
 
-                    let flow_id = frame.flow_id;
-                    let payload_len = frame.payload.len();
-
-                    if recv_mux_tx.send(frame).is_err() {
-                        debug!("Multiplexed frame receiver closed, stopping receive loop");
+                    // Send frame to TUN device
+                    if let Err(e) = recv_mux_tx.send(frame) {
+                        warn!("Failed to send frame to TUN device: {}", e);
                         break;
                     }
-
-                    trace!(
-                        "Received {} bytes from tunnel (flow_id={})",
-                        payload_len,
-                        flow_id
-                    );
                 }
                 Some(Message::Close(_)) => {
                     info!("WebSocket closed by server");
@@ -618,12 +604,9 @@ impl VpnTunnel {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_vpn_tunnel_creation() {
         // This is a placeholder test
         // Real tests would require a mock server
-        assert!(true);
     }
 }

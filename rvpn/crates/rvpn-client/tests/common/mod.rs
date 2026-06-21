@@ -1,5 +1,7 @@
 //! Shared test infrastructure for rvpn-client integration tests.
 
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use anyhow::Result;
 use tokio::net::TcpListener;
@@ -29,8 +31,10 @@ pub async fn start_plain_ws_server() -> Result<(std::net::SocketAddr, oneshot::S
                         use futures::{SinkExt, StreamExt};
                         let (mut write, mut read) = ws_stream.split();
                         while let Some(Ok(msg)) = read.next().await {
-                            if msg.is_text() || msg.is_binary() {
-                                if write.send(msg).await.is_err() { break; }
+                            if (msg.is_text() || msg.is_binary())
+                                && write.send(msg).await.is_err()
+                            {
+                                break;
                             }
                         }
                     }
@@ -53,12 +57,8 @@ pub async fn start_tls_ws_server() -> Result<(std::net::SocketAddr, oneshot::Sen
     let key = boring::pkey::PKey::private_key_from_der(&key_der)?;
     acc.set_private_key(&key)?;
     acc.check_private_key()?;
-    acc.set_alpn_select_callback(|_ssl, protocols| {
-        if protocols.windows(8).any(|w| w == b"\x08http/1.1") {
-            Ok(b"http/1.1")
-        } else {
-            Ok(b"http/1.1")
-        }
+    acc.set_alpn_select_callback(|_ssl, _protocols| {
+        Ok(b"http/1.1")
     });
     let acceptor = acc.build();
 
@@ -77,8 +77,10 @@ pub async fn start_tls_ws_server() -> Result<(std::net::SocketAddr, oneshot::Sen
                                 use futures::{SinkExt, StreamExt};
                                 let (mut write, mut read) = ws_stream.split();
                                 while let Some(Ok(msg)) = read.next().await {
-                                    if msg.is_text() || msg.is_binary() {
-                                        if write.send(msg).await.is_err() { break; }
+                                    if (msg.is_text() || msg.is_binary())
+                                        && write.send(msg).await.is_err()
+                                    {
+                                        break;
                                     }
                                 }
                             }

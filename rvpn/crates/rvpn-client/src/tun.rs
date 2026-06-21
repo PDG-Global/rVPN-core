@@ -285,7 +285,7 @@ impl TunDevice {
             trace!("recv_from_tunnel: received frame flow_id={}, payload_len={}", frame.flow_id, frame.payload.len());
 
             if frame.flow_id == DATA_FLOW_ID {
-                return Ok(Bytes::from(frame.payload));
+                return Ok(frame.payload);
             }
 
             // Control frame (flow_id=0) - Pong keepalive responses, etc.

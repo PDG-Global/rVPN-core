@@ -1,7 +1,5 @@
 //! Tests for R-VPN server
 
-#![cfg(test)]
-
 mod server_tests;
 mod routing_tests;
 

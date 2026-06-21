@@ -139,7 +139,7 @@ where
         // Random initial delay to avoid burst at connection start
         tokio::time::sleep(Duration::from_millis(rng.gen_range(5000..=8000))).await;
         loop {
-            if ping_sender.send(Message::Ping(vec![].into())).is_err() {
+            if ping_sender.send(Message::Ping(vec![])).is_err() {
                 tracing::debug!("Ping sender closed, stopping ping task");
                 break;
             }

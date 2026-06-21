@@ -83,7 +83,7 @@ impl IpPool {
                 gateway_ip.octets()[0],
                 gateway_ip.octets()[1],
                 gateway_ip.octets()[2],
-                (gateway_ip.octets()[3] + i as u8) & 0xFF,
+                gateway_ip.octets()[3] + i as u8,
             ));
             available.push(ip);
         }
@@ -139,7 +139,7 @@ impl IpPool {
         }
         // If not in allocated, it was never ours to release - this indicates a bug elsewhere
         warn!("Attempted to release IP {} that was not allocated!", ip);
-        return false;
+        false
     }
 
     /// Reclaim expired leases and return IPs to available pool.

@@ -208,7 +208,7 @@ impl DnsServer {
             return Ok(());
         }
 
-        let queries: Vec<&Query> = request.queries().into_iter().collect();
+        let queries: Vec<&Query> = request.queries().iter().collect();
         if queries.is_empty() {
             debug!("Ignoring query with no questions");
             return Ok(());
@@ -467,7 +467,7 @@ impl DnsServer {
                 }
                 if !ips.is_empty() && min_ttl != u32::MAX {
                     let ttl = std::time::Duration::from_secs(min_ttl.min(14400) as u64);
-                    self.dns_resolver.store_with_ttl(&domain, ips, ttl).await;
+                    self.dns_resolver.store_with_ttl(domain, ips, ttl).await;
                 }
                 response
             }

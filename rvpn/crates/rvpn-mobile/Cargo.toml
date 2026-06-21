@@ -13,6 +13,11 @@ description = "R-VPN mobile FFI bindings"
 crate-type = ["staticlib", "cdylib", "lib"]
 
 [dependencies]
+# Memory allocator — prevents jetsam kills under high packet churn.
+# The system allocator (libmalloc) fragments under 3000+ allocs/sec and
+# never returns freed pages, causing RSS to grow to the 50 MB NE limit.
+mimalloc = { version = "0.1", default-features = false }
+
 # Async runtime
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
 tokio-util = { version = "0.7", features = ["codec"] }
