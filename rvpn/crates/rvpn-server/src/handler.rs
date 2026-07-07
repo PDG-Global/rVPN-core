@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use ip_network::IpNetwork;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -176,6 +177,28 @@ struct DnsEntry {
 
 /// DNS resolver with caching
 type DnsCache = std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, DnsEntry>>>;
+
+/// Hard cap on DNS cache size. Without this, an attacker could flood the server
+/// with unique hostnames to grow the map unboundedly. Entries are TTL-based
+/// (5-minute default), so a legitimate workload rarely approaches this.
+const DNS_CACHE_MAX_ENTRIES: usize = 10_000;
+
+/// Prune expired DNS entries and cap the map size. Called before every insert
+/// so the cache never grows past MAX_ENTRIES. Cheap: single HashMap scan on
+/// DNS-miss path only (cache hits skip this).
+fn prune_dns_cache(cache: &mut std::collections::HashMap<String, DnsEntry>) {
+    cache.retain(|_, entry| entry.cached_at.elapsed() < entry.ttl);
+    if cache.len() >= DNS_CACHE_MAX_ENTRIES {
+        // Evict oldest to make room. Rare path; scanning all keys is fine.
+        if let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, e)| e.cached_at)
+            .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest_key);
+        }
+    }
+}
 
 /// Simplified VPN handler - Brook-style architecture with X3DH + Double Ratchet
 pub struct VpnHandler {
@@ -837,6 +860,7 @@ impl VpnHandler {
         };
 
         let mut cache = self.dns_cache.lock().await;
+        prune_dns_cache(&mut cache);
         cache.insert(format!("{}:{}", host, port), entry);
 
         Ok(addrs)
@@ -2581,6 +2605,7 @@ where
         };
 
         let mut cache = dns_cache.lock().await;
+        prune_dns_cache(&mut cache);
         cache.insert(target.to_string(), entry);
 
         Ok(addrs)
@@ -3078,7 +3103,7 @@ where
         frame_number: u64,
         peer_addr: SocketAddr,
         _elapsed: Duration,
-    ) -> Result<Vec<(u32, Vec<u8>, u8)>> {
+    ) -> Result<Vec<(u32, Bytes, u8)>> {
         let message = RatchetMessage::from_bytes(data)
             .map_err(|e| anyhow::anyhow!("Failed to deserialize RatchetMessage: {}", e))?;
 
@@ -3122,9 +3147,13 @@ where
             );
         }
 
-        let parsed: Vec<(u32, Vec<u8>, u8)> = frames
+        // Reuse each frame's Bytes buffer directly instead of copying its
+        // contents into a fresh Vec. `MultiplexedFrame::payload` is already
+        // Bytes, and downstream consumers only need &[u8], which Bytes
+        // provides via Deref.
+        let parsed: Vec<(u32, Bytes, u8)> = frames
             .into_iter()
-            .map(|f| (f.flow_id, f.payload.to_vec(), aad_byte))
+            .map(|f| (f.flow_id, f.payload, aad_byte))
             .collect();
 
         tracing::trace!(

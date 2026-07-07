@@ -22,6 +22,8 @@ use tokio_boring::SslStream;
 use tracing::debug;
 use std::time::Duration;
 
+use crate::tls_fingerprint::TlsFingerprint;
+
 /// Enable TCP keepalive on a socket.
 ///
 /// Detects dead connections (e.g. NAT evictions, middlebox drops) in ~90s
@@ -46,20 +48,9 @@ fn enable_tcp_keepalive(tcp: TcpStream) -> Result<TcpStream> {
         .context("Failed to convert std TcpStream back to tokio")
 }
 
-/// TLS fingerprint types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[derive(serde::Serialize, serde::Deserialize)]
-pub enum TlsFingerprint {
-    /// Chrome 120+ fingerprint (most common)
-    #[default]
-    Chrome,
-    /// Firefox fingerprint
-    Firefox,
-    /// Safari fingerprint
-    Safari,
-    /// No fingerprinting
-    None,
-}
+/// TLS fingerprint types are defined in [`crate::tls_fingerprint`] and
+/// re-exported from the crate root. `connect_chrome_like` accepts the enum
+/// here for back-compat with existing call sites.
 
 /// A TLS connection that mimics Chrome's fingerprint
 ///
@@ -294,27 +285,11 @@ pub async fn connect_with_fingerprint(
 }
 
 /// Parse fingerprint from string
-pub fn fingerprint_from_str(s: &str) -> Option<TlsFingerprint> {
-    match s.to_lowercase().as_str() {
-        "chrome" | "chrome120" => Some(TlsFingerprint::Chrome),
-        "firefox" | "firefox120" => Some(TlsFingerprint::Firefox),
-        "safari" | "safari17" => Some(TlsFingerprint::Safari),
-        "none" | "standard" => Some(TlsFingerprint::None),
-        _ => None,
-    }
-}
+pub use crate::tls_fingerprint::fingerprint_from_str;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_fingerprint_parsing() {
-        assert_eq!(fingerprint_from_str("chrome"), Some(TlsFingerprint::Chrome));
-        assert_eq!(fingerprint_from_str("Chrome"), Some(TlsFingerprint::Chrome));
-        assert_eq!(fingerprint_from_str("none"), Some(TlsFingerprint::None));
-        assert_eq!(fingerprint_from_str("invalid"), None);
-    }
 
     #[test]
     fn test_chrome_connector_builds() {

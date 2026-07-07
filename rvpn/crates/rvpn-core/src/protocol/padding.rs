@@ -132,11 +132,11 @@ pub fn pad_packet(data: &[u8]) -> Result<Vec<u8>, PaddingError> {
     // Copy original data
     result.extend_from_slice(data);
 
-    // Add random padding
+    // Add random padding directly into the result buffer
     if padding_len > 0 {
-        let mut padding = vec![0u8; padding_len];
-        rand::rngs::StdRng::from_entropy().fill_bytes(&mut padding);
-        result.extend_from_slice(&padding);
+        let old_len = result.len();
+        result.resize(old_len + padding_len, 0);
+        rand::rngs::StdRng::from_entropy().fill_bytes(&mut result[old_len..]);
     }
 
     // Encode padding length in last 2 bytes
@@ -173,6 +173,25 @@ pub fn unpad_packet(data: &[u8]) -> Result<Vec<u8>, PaddingError> {
 
     // Return data without padding and length encoding
     Ok(data[..data.len() - 2 - padding_len].to_vec())
+}
+
+/// Remove padding from a packet, returning a zero-copy slice.
+///
+/// Same as `unpad_packet` but returns a `&[u8]` slice into the original
+/// data instead of allocating a new `Vec`. The caller must keep the
+/// original data alive for the lifetime of the returned slice.
+pub fn unpad_packet_slice(data: &[u8]) -> Result<&[u8], PaddingError> {
+    if data.len() < 2 {
+        return Err(PaddingError::DataTooShort);
+    }
+
+    let padding_len = u16::from_be_bytes([data[data.len() - 2], data[data.len() - 1]]) as usize;
+
+    if padding_len > data.len() - 2 {
+        return Err(PaddingError::InvalidPaddingLength);
+    }
+
+    Ok(&data[..data.len() - 2 - padding_len])
 }
 
 /// Generate a dummy padding packet

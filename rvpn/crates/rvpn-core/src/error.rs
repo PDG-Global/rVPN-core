@@ -43,12 +43,18 @@ pub enum Error {
     /// Ratchet error
     #[error("ratchet error: {0}")]
     Ratchet(String),
-}
 
-impl From<ring::error::Unspecified> for Error {
-    fn from(e: ring::error::Unspecified) -> Self {
-        Error::Crypto(e.to_string())
-    }
+    /// Server identity pin mismatch — the pin captured from the handshake
+    /// does not match the pin stored in the client's config. Fields are the
+    /// canonical `ik:1:<base32>` strings so the app layer can render them
+    /// side-by-side in the mismatch dialog without re-encoding.
+    #[error("server identity mismatch: expected {expected}, got {actual}")]
+    ServerIdentityMismatch {
+        /// The pin the client had stored for this server.
+        expected: String,
+        /// The pin derived from the handshake we just received.
+        actual: String,
+    },
 }
 
 impl From<ed25519_dalek::SignatureError> for Error {

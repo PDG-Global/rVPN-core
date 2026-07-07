@@ -66,14 +66,17 @@ type JClass = *const u8;
 #[cfg(not(target_os = "android"))]
 type JString = *const u8;
 
-use crate::dns_server::DnsServer;
-use crate::doh_client::DohClient;
 use crate::ffi::TunConfig;
-use crate::flow_connector::FlowConnectorConfig;
 use crate::android_tun::AndroidTunClient;
+#[cfg(feature = "dns")]
+use crate::dns_server::DnsServer;
+#[cfg(feature = "dns")]
+use crate::doh_client::DohClient;
+#[cfg(feature = "dns")]
+use crate::flow_connector::FlowConnectorConfig;
 use base64::Engine;
-use rvpn_client::split_tunnel::SplitTunnel;
-use rvpn_client::dns_cache::DnsResolver;
+use rvpn_split_tunnel::SplitTunnel;
+use rvpn_split_tunnel::DnsResolver;
 use rvpn_core::crypto::IdentityKey;
 
 // ============================================================================
@@ -186,8 +189,23 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnGetLastErrorS
 }
 
 #[no_mangle]
-pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnNetworkChanged(_has_internet: c_int) -> c_int {
-    logcat_info!("[Android_TUN_FFI] rvpnNetworkChanged(has_internet={}) called", _has_internet);
+pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnNetworkChanged(
+    _env: *mut jni_sys::JNIEnv,
+    _class: jclass,
+    has_internet: c_int,
+) -> c_int {
+    logcat_info!("[Android_TUN_FFI] rvpnNetworkChanged(has_internet={}) called", has_internet);
+
+    // Only request a reconnect when internet is available. On the loss
+    // side, letting the read/keepalive timeouts fire naturally is fine —
+    // request_reconnect() during a real outage would just waste attempts.
+    // When we regain internet (or switch WiFi↔5G/roam networks) we want
+    // the tunnel to drop its half-dead socket and start fresh.
+    if has_internet == 1 {
+        if let Some(client) = TUN_CLIENT.lock().clone() {
+            client.request_reconnect();
+        }
+    }
     SUCCESS
 }
 
@@ -199,6 +217,10 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnPing() -> c_int {
 
 // Error codes
 const SUCCESS: c_int = 0;
+/// TOFU pin mismatch (see ios_tun_ffi.rs for the same code). The Kotlin
+/// side splits `rvpnLastError()` on `expected=...` / `actual=...` to
+/// populate the mismatch dialog.
+const ERROR_IDENTITY_MISMATCH: c_int = -20;
 #[allow(dead_code)]
 const ERROR_NULL_POINTER: c_int = -1;
 const ERROR_NOT_INITIALIZED: c_int = -1;
@@ -241,6 +263,8 @@ struct MobileConfig {
     builtin_bypass_countries: Vec<String>,
     #[serde(default)]
     block_ads: Option<bool>,
+    #[serde(default)]
+    country_ips_file: Option<String>,
 }
 
 fn default_dns_bind_addr() -> String {
@@ -385,7 +409,11 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnStart(
         block_ads: mobile_config.block_ads.unwrap_or(false),
         dns_bind_addr: mobile_config.dns_bind_addr,
         enable_dns_proxy: mobile_config.enable_dns_proxy.unwrap_or(false),
-        tls_fingerprint: mobile_config.server_fingerprint,
+        // See ios_tun_ffi.rs — legacy `server_fingerprint` now routes into
+        // the TOFU pin slot, not the stealth ClientHello selector.
+        stealth_fingerprint: None,
+        server_identity_pin: mobile_config.server_fingerprint,
+        country_ips_file: mobile_config.country_ips_file,
     };
 
     let tun_json = match serde_json::to_string(&tun_config) {
@@ -425,6 +453,7 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnStop() -> c_int {
 // DNS Proxy for Direct TUN Mode
 // ============================================================================
 
+#[cfg(feature = "dns")]
 async fn start_dns_proxy_for_direct_tun(client: &Arc<AndroidTunClient>) -> anyhow::Result<()> {
     use std::sync::Arc;
 
@@ -460,7 +489,7 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<AndroidTunClient>) -> anyho
 
     logcat_info!("[Android_TUN_FFI] DoH client started, connecting to {}/dns", base_path);
 
-    let split_tunnel_config = rvpn_client::split_tunnel::SplitTunnelConfig {
+    let split_tunnel_config = rvpn_split_tunnel::SplitTunnelConfig {
         enabled: true,
         builtin_bypass_countries: client.get_builtin_bypass_countries().to_vec(),
         bypass_networks: client.get_bypass_networks().to_vec(),
@@ -488,6 +517,12 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<AndroidTunClient>) -> anyho
     logcat_info!("[Android_TUN_FFI] DNS server created, starting on {}", client.get_dns_bind_addr());
 
     dns_server.run().await
+}
+
+#[cfg(not(feature = "dns"))]
+async fn start_dns_proxy_for_direct_tun(_client: &Arc<AndroidTunClient>) -> anyhow::Result<()> {
+    logcat_info!("[Android_TUN_FFI] DNS proxy not available (dns feature disabled)");
+    Ok(())
 }
 
 // ============================================================================
@@ -607,6 +642,23 @@ fn create_tun_client_impl(json_str: &str) -> c_int {
             Arc::new(c)
         }
         Ok(Err(e)) => {
+            // Detect TOFU pin mismatch so we can hand Kotlin the two pins
+            // via a parseable last-error prefix instead of embedding them
+            // in prose. See ios_tun_ffi.rs for the same shape.
+            if let Some(rvpn_core::Error::ServerIdentityMismatch { expected, actual }) =
+                e.downcast_ref::<rvpn_core::Error>()
+            {
+                logcat_error!(
+                    "AndroidTunClient::new refused: server identity mismatch expected={} actual={}",
+                    expected,
+                    actual
+                );
+                set_last_error(&format!(
+                    "IDENTITY_MISMATCH expected={} actual={}",
+                    expected, actual
+                ));
+                return ERROR_IDENTITY_MISMATCH;
+            }
             logcat_error!("AndroidTunClient::new failed: {}", e);
             set_last_error(&format!("Failed to create TUN client: {}", e));
             return ERROR_INVALID_CONFIG;
@@ -681,14 +733,13 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunStart() -> c_int 
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    logcat_info!("[Android_TUN_FFI] About to spawn connect task");
-    runtime.spawn(async move {
-        logcat_info!("[Android_TUN_FFI] Starting TUN client connection...");
-        if let Err(e) = client.connect().await {
-            logcat_error!("[Android_TUN_FFI] Connection failed: {}", e);
-        }
-    });
-    logcat_info!("[Android_TUN_FFI] TUN client start initiated");
+    // Enable the auto-reconnect loop and hand off to `client.start()`. The
+    // loop spawns its own task and handles exponential backoff, so we don't
+    // call `connect()` directly here — that would bypass the reconnect logic
+    // and leave us stuck on the first WebSocket death.
+    client.set_reconnect_enabled(true);
+    client.start();
+    logcat_info!("[Android_TUN_FFI] TUN client reconnect loop started");
     SUCCESS
 }
 
@@ -729,6 +780,30 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunGetIp(
         Some(ip_str) => env.new_string(&ip_str).unwrap_or_default().as_raw(),
         None => env.new_string("").unwrap_or_default().as_raw(),
     }
+}
+
+/// Return the canonical TOFU pin (`ik:1:<base32>`) of the server this
+/// tunnel connected to. Read by Kotlin immediately after the tunnel
+/// reaches `Connected` on a profile with no pin stored yet — the app
+/// persists the return value into the profile so subsequent connects
+/// enforce it.
+///
+/// Returns an empty JNI string when no client exists yet (mirrors
+/// `rvpnTunGetIp`).
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunGetServerIdentity(
+    env_ptr: *mut jni_sys::JNIEnv,
+    _class: jclass,
+) -> jobject {
+    let env = make_env(env_ptr);
+    let client = match TUN_CLIENT.lock().clone() {
+        Some(c) => c.clone(),
+        None => return env.new_string("").unwrap_or_default().as_raw(),
+    };
+    env.new_string(client.server_identity_pin())
+        .unwrap_or_default()
+        .as_raw()
 }
 
 /// Write the tunnel IP into a pre-allocated buffer (alternative buffer-based API).
@@ -940,7 +1015,7 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnGetBypassIpsF
 
     let mut all_cidrs: Vec<String> = Vec::new();
     for country_code in &country_codes {
-        if let Some(cidrs) = rvpn_client::split_tunnel::get_country_ips(country_code) {
+        if let Some(cidrs) = rvpn_split_tunnel::get_country_ips(country_code) {
             for cidr in cidrs {
                 all_cidrs.push(cidr.to_string());
             }
@@ -994,7 +1069,7 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnGetBypassIpsF
     let mut all_cidrs: Vec<String> = Vec::new();
 
     for country_code in &country_codes {
-        if let Some(cidrs) = rvpn_client::split_tunnel::get_country_ips(country_code) {
+        if let Some(cidrs) = rvpn_split_tunnel::get_country_ips(country_code) {
             for cidr in cidrs {
                 all_cidrs.push(cidr.to_string());
             }
@@ -1040,7 +1115,7 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnGetBypassDoma
 
     let mut all_domains: Vec<String> = Vec::new();
     for country_code in &country_codes {
-        if let Some(domains) = rvpn_client::split_tunnel::get_country_domains(country_code) {
+        if let Some(domains) = rvpn_split_tunnel::get_country_domains(country_code) {
             for domain in domains {
                 all_domains.push(domain.to_string());
             }
@@ -1095,7 +1170,7 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnGetBypassDoma
     let mut all_domains: Vec<String> = Vec::new();
 
     for country_code in &country_codes {
-        if let Some(domains) = rvpn_client::split_tunnel::get_country_domains(country_code) {
+        if let Some(domains) = rvpn_split_tunnel::get_country_domains(country_code) {
             for domain in domains {
                 all_domains.push(domain.to_string());
             }

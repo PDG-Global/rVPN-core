@@ -137,6 +137,192 @@ impl DoubleRatchet {
         self.dh_pair.as_ref().map(|k| k.public_key.to_bytes())
     }
 
+    /// Encrypt plaintext, writing ciphertext into the provided buffer.
+    ///
+    /// Reuses the caller's buffer to avoid per-message heap allocation.
+    /// Returns the nonce and header (caller builds RatchetMessage).
+    pub fn encrypt_to(
+        &mut self,
+        plaintext: &[u8],
+        associated_data: &[u8],
+        ciphertext_out: &mut Vec<u8>,
+    ) -> crate::Result<([u8; NONCE_SIZE], MessageHeader)> {
+        let chain_key = self.sending_chain_key
+            .ok_or_else(|| crate::Error::EncryptionFailed("No sending chain".to_string()))?;
+
+        let (message_key, next_chain_key) = kdf_ck(&chain_key);
+        let cipher = Cipher::new(&message_key);
+
+        let payload_type = associated_data.first().copied().unwrap_or(0);
+        let aad = &[payload_type];
+
+        let nonce = super::cipher::generate_nonce();
+
+        ciphertext_out.clear();
+        ciphertext_out.extend_from_slice(plaintext);
+        cipher.encrypt_in_place(&nonce, aad, ciphertext_out)
+            .map_err(|e| crate::Error::EncryptionFailed(e.to_string()))?;
+
+        let header = MessageHeader {
+            dh_public: self.dh_pair.as_ref().map(|k| k.public_key.to_bytes()),
+            message_number: self.send_message_number,
+            previous_chain_length: self.previous_chain_length,
+            payload_type,
+        };
+
+        self.sending_chain_key = Some(next_chain_key);
+        self.send_message_number += 1;
+
+        Ok((nonce, header))
+    }
+
+    /// Decrypt a message, writing plaintext into the provided buffer.
+    ///
+    /// Reuses the caller's buffer to avoid per-message heap allocation.
+    /// Returns the number of plaintext bytes written.
+    pub fn decrypt_to(
+        &mut self,
+        message: &RatchetMessage,
+        _associated_data: &[u8],
+        plaintext_out: &mut Vec<u8>,
+    ) -> crate::Result<usize> {
+        if message.ciphertext.len() > MAX_MESSAGE_SIZE {
+            return Err(crate::Error::DecryptionFailed(
+                format!("Message too large: {} bytes (max {})", message.ciphertext.len(), MAX_MESSAGE_SIZE)
+            ));
+        }
+
+        let target_number = message.header.message_number;
+        let current_number = self.recv_message_number;
+        let associated_data = &[message.header.payload_type];
+
+        let header_bytes = message.header.to_bytes();
+        let key = (header_bytes.clone(), target_number);
+
+        if self.skipped_keys.contains(&key) {
+            let message_key = self.skipped_keys.pop(&key).unwrap();
+            let cipher = Cipher::new(&message_key);
+            let result = cipher.decrypt(&message.nonce, associated_data, &message.ciphertext)?;
+            plaintext_out.clear();
+            plaintext_out.extend_from_slice(&result);
+            return Ok(result.len());
+        }
+
+        if target_number < current_number {
+            return Err(crate::Error::DecryptionFailed(
+                format!("Message too old: target={}, current={}", target_number, current_number)
+            ));
+        }
+
+        if let (Some(remote_dh), Some(current_remote)) = (message.header.dh_public, self.remote_dh_key) {
+            if current_remote != remote_dh {
+                self.skip_message_keys(message.header.previous_chain_length)?;
+                self.dh_ratchet_step(&remote_dh);
+            }
+        } else if message.header.dh_public.is_some() && self.remote_dh_key.is_none() {
+            self.remote_dh_key = message.header.dh_public;
+        }
+
+        if target_number > current_number {
+            self.skip_message_keys(target_number)?;
+        }
+
+        let chain_key = self.receiving_chain_key
+            .ok_or_else(|| crate::Error::DecryptionFailed("No receiving chain".to_string()))?;
+
+        let (message_key, next_chain_key) = kdf_ck(&chain_key);
+        let cipher = Cipher::new(&message_key);
+        let result = cipher.decrypt(&message.nonce, associated_data, &message.ciphertext);
+
+        match result {
+            Ok(plaintext) => {
+                self.receiving_chain_key = Some(next_chain_key);
+                self.recv_message_number = target_number + 1;
+                plaintext_out.clear();
+                plaintext_out.extend_from_slice(&plaintext);
+                Ok(plaintext.len())
+            }
+            Err(e) => Err(crate::Error::DecryptionFailed(e.to_string()))
+        }
+    }
+
+    /// Decrypt from a zero-copy `RatchetMessageRef`, writing plaintext into the
+    /// provided buffer.  Identical to `decrypt_to` but avoids the per-message
+    /// `Vec<u8>` allocation that `RatchetMessage::from_bytes` performs.
+    ///
+    /// Returns the number of plaintext bytes written.
+    pub fn decrypt_to_ref(
+        &mut self,
+        message: &RatchetMessageRef<'_>,
+        _associated_data: &[u8],
+        plaintext_out: &mut Vec<u8>,
+    ) -> crate::Result<usize> {
+        if message.ciphertext.len() > MAX_MESSAGE_SIZE {
+            return Err(crate::Error::DecryptionFailed(
+                format!("Message too large: {} bytes (max {})", message.ciphertext.len(), MAX_MESSAGE_SIZE)
+            ));
+        }
+
+        let target_number = message.header.message_number;
+        let current_number = self.recv_message_number;
+        let associated_data = &[message.header.payload_type];
+
+        // Only construct the skipped-key lookup key (which allocates a Vec for
+        // the header bytes) when there are actually skipped keys stored. On the
+        // steady-state in-order path this map is empty, so this avoids a
+        // per-frame allocation.
+        if !self.skipped_keys.is_empty() {
+            let key = (message.header.to_bytes(), target_number);
+            if self.skipped_keys.contains(&key) {
+                let message_key = self.skipped_keys.pop(&key).unwrap();
+                let cipher = Cipher::new(&message_key);
+                plaintext_out.clear();
+                plaintext_out.extend_from_slice(message.ciphertext);
+                cipher.decrypt_in_place(&message.nonce, associated_data, plaintext_out)?;
+                return Ok(plaintext_out.len());
+            }
+        }
+
+        if target_number < current_number {
+            return Err(crate::Error::DecryptionFailed(
+                format!("Message too old: target={}, current={}", target_number, current_number)
+            ));
+        }
+
+        if let (Some(remote_dh), Some(current_remote)) = (message.header.dh_public, self.remote_dh_key) {
+            if current_remote != remote_dh {
+                self.skip_message_keys(message.header.previous_chain_length)?;
+                self.dh_ratchet_step(&remote_dh);
+            }
+        } else if message.header.dh_public.is_some() && self.remote_dh_key.is_none() {
+            self.remote_dh_key = message.header.dh_public;
+        }
+
+        if target_number > current_number {
+            self.skip_message_keys(target_number)?;
+        }
+
+        let chain_key = self.receiving_chain_key
+            .ok_or_else(|| crate::Error::DecryptionFailed("No receiving chain".to_string()))?;
+
+        let (message_key, next_chain_key) = kdf_ck(&chain_key);
+        let cipher = Cipher::new(&message_key);
+
+        // Decrypt directly into the reusable `plaintext_out` buffer: copy the
+        // ciphertext in, then decrypt in place. This avoids the owned-Vec
+        // allocation that `Cipher::decrypt` would make on every inbound frame.
+        plaintext_out.clear();
+        plaintext_out.extend_from_slice(message.ciphertext);
+        match cipher.decrypt_in_place(&message.nonce, associated_data, plaintext_out) {
+            Ok(plaintext_len) => {
+                self.receiving_chain_key = Some(next_chain_key);
+                self.recv_message_number = target_number + 1;
+                Ok(plaintext_len)
+            }
+            Err(e) => Err(crate::Error::DecryptionFailed(e.to_string()))
+        }
+    }
+
     /// Encrypt a message
     /// 
     /// Advances the sending chain key and returns an encrypted message.
@@ -750,6 +936,89 @@ impl RatchetMessage {
     }
 }
 
+/// Zero-copy view into a serialized `RatchetMessage`.
+///
+/// Borrows the ciphertext from the input buffer instead of allocating a new
+/// `Vec<u8>` for every message.  The iOS tunnel's hot decrypt path calls this
+/// once per incoming WebSocket frame, so avoiding the allocation matters.
+pub struct RatchetMessageRef<'a> {
+    /// Parsed message header
+    pub header: MessageHeader,
+    /// AEAD nonce
+    pub nonce: [u8; NONCE_SIZE],
+    /// Ciphertext borrowed from the input buffer (zero-copy)
+    pub ciphertext: &'a [u8],
+}
+
+impl<'a> RatchetMessageRef<'a> {
+    /// Parse a `RatchetMessage` from bincode wire bytes without allocating.
+    ///
+    /// Manually decodes the bincode-1 format so that the ciphertext field
+    /// borrows directly from `data` instead of copying into a new `Vec`.
+    ///
+    /// The layout must match what `bincode::serialize` / `RatchetMessage::to_bytes`
+    /// produces — verified by the round-trip test in the test module.
+    pub fn from_bytes(data: &'a [u8]) -> anyhow::Result<Self> {
+        use std::io::Read;
+
+        let mut cursor = std::io::Cursor::new(data);
+
+        // --- MessageHeader ---
+
+        // dh_public: Option<[u8; 32]> — 1-byte tag + optional 32 bytes
+        let has_dh = {
+            let mut b = [0u8; 1];
+            cursor.read_exact(&mut b)?;
+            b[0]
+        };
+        let dh_public = if has_dh == 1 {
+            let mut key = [0u8; 32];
+            cursor.read_exact(&mut key)?;
+            Some(key)
+        } else {
+            None
+        };
+
+        // message_number: u32 LE (4 bytes in bincode 1.x default config)
+        let mut buf4 = [0u8; 4];
+        cursor.read_exact(&mut buf4)?;
+        let message_number = u32::from_le_bytes(buf4);
+
+        // previous_chain_length: u32 LE
+        cursor.read_exact(&mut buf4)?;
+        let previous_chain_length = u32::from_le_bytes(buf4);
+
+        // payload_type: u8
+        let mut buf1 = [0u8; 1];
+        cursor.read_exact(&mut buf1)?;
+        let payload_type = buf1[0];
+
+        let header = MessageHeader { dh_public, message_number, previous_chain_length, payload_type };
+
+        // --- nonce: [u8; 12] ---
+        let mut nonce = [0u8; NONCE_SIZE];
+        cursor.read_exact(&mut nonce)?;
+
+        // --- ciphertext: Vec<u8> = u64 LE length + raw bytes ---
+        let mut buf8 = [0u8; 8];
+        cursor.read_exact(&mut buf8)?;
+        let ct_len = u64::from_le_bytes(buf8) as usize;
+
+        let pos = cursor.position() as usize;
+        let end = pos.checked_add(ct_len)
+            .ok_or_else(|| anyhow::anyhow!("RatchetMessage ciphertext length overflow"))?;
+        if end > data.len() {
+            return Err(anyhow::anyhow!(
+                "RatchetMessage truncated: need {} bytes for ciphertext at offset {}, have {} total",
+                ct_len, pos, data.len()
+            ));
+        }
+        let ciphertext = &data[pos..end];
+
+        Ok(RatchetMessageRef { header, nonce, ciphertext })
+    }
+}
+
 /// KDF for initial chain key derivation from shared secret (HKDF)
 fn kdf_init(shared_secret: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let derived = super::hkdf_derive(&[], shared_secret, b"R-VPN-v1 DoubleRatchet Init", 64);
@@ -812,6 +1081,71 @@ fn x25519_public_key(bytes: &[u8; 32]) -> x25519_dalek::PublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ratchet_message_ref_roundtrip() {
+        // Verify RatchetMessageRef::from_bytes parses the same data that
+        // bincode::serialize (used by RatchetMessage::to_bytes) produces.
+        let msg = RatchetMessage {
+            header: MessageHeader {
+                dh_public: Some([0xABu8; 32]),
+                message_number: 42,
+                previous_chain_length: 7,
+                payload_type: 0x05,
+            },
+            nonce: [0xCCu8; NONCE_SIZE],
+            ciphertext: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        };
+
+        let wire = msg.to_bytes().unwrap();
+        let parsed = RatchetMessageRef::from_bytes(&wire).unwrap();
+
+        assert_eq!(parsed.header.dh_public, msg.header.dh_public);
+        assert_eq!(parsed.header.message_number, msg.header.message_number);
+        assert_eq!(parsed.header.previous_chain_length, msg.header.previous_chain_length);
+        assert_eq!(parsed.header.payload_type, msg.header.payload_type);
+        assert_eq!(parsed.nonce, msg.nonce);
+        assert_eq!(parsed.ciphertext, &msg.ciphertext[..]);
+
+        // Also test with None dh_public (smaller header)
+        let msg2 = RatchetMessage {
+            header: MessageHeader {
+                dh_public: None,
+                message_number: 0,
+                previous_chain_length: 0,
+                payload_type: 0,
+            },
+            nonce: [0u8; NONCE_SIZE],
+            ciphertext: vec![],
+        };
+        let wire2 = msg2.to_bytes().unwrap();
+        let parsed2 = RatchetMessageRef::from_bytes(&wire2).unwrap();
+        assert_eq!(parsed2.header.dh_public, None);
+        assert_eq!(parsed2.ciphertext, &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_decrypt_to_ref_matches_decrypt_to() {
+        let shared_secret = [0x42u8; 32];
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
+        let mut bob = DoubleRatchet::init_bob(shared_secret);
+
+        let plaintext = b"Hello, zero-copy!";
+        let msg = alice.encrypt(plaintext, &[0x05]).expect("encrypt failed");
+        let wire = msg.to_bytes().unwrap();
+
+        // Decrypt via owned path
+        let mut bob_owned = DoubleRatchet::init_bob(shared_secret);
+        let plain_owned = bob_owned.decrypt(&msg, &[0x05]).unwrap();
+
+        // Decrypt via ref path
+        let ref_msg = RatchetMessageRef::from_bytes(&wire).unwrap();
+        let mut plain_ref = Vec::new();
+        let ref_len = bob.decrypt_to_ref(&ref_msg, &[0x05], &mut plain_ref).unwrap();
+
+        assert_eq!(&plain_owned[..], &plain_ref[..ref_len]);
+        assert_eq!(&plain_ref[..ref_len], plaintext);
+    }
 
     #[test]
     fn test_double_ratchet_basic() {

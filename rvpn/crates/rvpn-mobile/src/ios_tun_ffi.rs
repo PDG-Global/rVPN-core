@@ -12,27 +12,25 @@ use std::sync::Mutex;
 
 use tracing::{error, info, warn};
 
-use crate::dns_server::DnsServer;
-use crate::doh_client::DohClient;
 use crate::ffi::TunConfig;
-use crate::flow_connector::FlowConnectorConfig;
 use crate::ios_tun::IosTunClient;
 use base64::Engine;
-use rvpn_client::split_tunnel::SplitTunnel;
-use rvpn_client::dns_cache::DnsResolver;
 use rvpn_core::crypto::IdentityKey;
 
 // Global singleton for the TUN client (iOS only runs one VPN at a time)
 static TUN_CLIENT: Mutex<Option<Arc<IosTunClient>>> = Mutex::new(None);
 
-// Global runtime handle for spawning tasks
-static TUN_RUNTIME: Mutex<Option<Arc<tokio::runtime::Runtime>>> = Mutex::new(None);
+// Tokio runtime that drives the TUN client's tasks.
+//
+// Owned here (NOT inside `IosTunClient`) because `Runtime::drop` calls
+// `BlockingPool::shutdown` synchronously, which panics if invoked from
+// within an async context. Holding the runtime in this static guarantees
+// it is only ever dropped from `rvpn_tun_destroy` — which is called by
+// Swift's stop thread, i.e. off any tokio worker.
+static TUN_RUNTIME: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
 
 // Global last error message
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
-
-// Global DNS proxy abort handle (for cleanup on stop)
-static DNS_PROXY_HANDLE: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 
 // Atomic flag to prevent duplicate client creation during iOS double-startTunnel race
 static TUN_CLIENT_CREATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -52,7 +50,7 @@ pub extern "C" fn rvpn_initialize() -> c_int {
 
 /// Initialize tracing subscriber (idempotent)
 fn init_tracing() {
-    use tracing_subscriber::{prelude::*, EnvFilter};
+    use tracing_subscriber::prelude::*;
 
     if TRACING_INITIALIZED
         .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
@@ -61,8 +59,8 @@ fn init_tracing() {
         return; // Already initialized
     }
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    // Simple max-level filter — no EnvFilter/regex dependency
+    let filter = tracing_subscriber::filter::LevelFilter::ERROR;
 
     tracing_subscriber::registry()
         .with(OsLogLayer)
@@ -78,7 +76,7 @@ pub fn set_last_error(msg: &str) {
 
 /// Get the last error message
 /// - Returns: Error message C string, or nil if no error
-/// Caller must free with rvpn_free_string()
+///   Caller must free with rvpn_free_string()
 #[no_mangle]
 pub extern "C" fn rvpn_last_error() -> *mut c_char {
     let guard = LAST_ERROR.lock().unwrap();
@@ -144,12 +142,6 @@ pub extern "C" fn rvpn_network_changed(has_internet: c_int) -> c_int {
 /// 1 = connected, 0 = not connected or not initialized
 #[no_mangle]
 pub extern "C" fn rvpn_tun_check_connectivity() -> c_int {
-    // Verify runtime exists before checking client state
-    let _ = match TUN_RUNTIME.lock().unwrap().as_ref() {
-        Some(_) => {},
-        None => return 0,
-    };
-
     let client = match TUN_CLIENT.lock().unwrap().as_ref() {
         Some(c) => c.clone(),
         None => return 0,
@@ -223,9 +215,8 @@ where
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let cb = match LOG_CALLBACK.lock().unwrap() {
-            guard => *guard,
-        };
+        let guard = LOG_CALLBACK.lock().unwrap();
+        let cb = *guard;
         let Some(cb) = cb else { return };
 
         let level = match *event.metadata().level() {
@@ -258,7 +249,7 @@ impl tracing::field::Visit for LogVisitor {
             self.0 = format!("{:?}", value).trim_matches('"').to_string();
         } else {
             if !self.0.is_empty() {
-                self.0.push_str(" ");
+                self.0.push(' ');
             }
             self.0.push_str(&format!("{}={:?}", field.name(), value));
         }
@@ -301,6 +292,8 @@ struct MobileConfig {
     builtin_bypass_countries: Vec<String>,
     #[serde(default)]
     block_ads: Option<bool>,
+    #[serde(default)]
+    country_ips_file: Option<String>,
 }
 
 fn default_dns_bind_addr() -> String {
@@ -317,6 +310,9 @@ fn default_dns_bind_addr() -> String {
 ///
 /// # Returns
 /// 0 on success, -1 on error
+///
+/// # Safety
+/// The `config_json` pointer must be a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn rvpn_start(config_json: *const c_char) -> c_int {
     info!("[IOS_TUN_FFI] rvpn_start() called");
@@ -357,7 +353,15 @@ pub unsafe extern "C" fn rvpn_start(config_json: *const c_char) -> c_int {
         return ERROR_INVALID_CONFIG;
     }
 
-    // Build TunConfig for rvpn_tun_create
+    // Build TunConfig for rvpn_tun_create.
+    //
+    // The legacy MobileConfig had a single `server_fingerprint` slot that
+    // this shim used to fill `TunConfig.tls_fingerprint` (the stealth
+    // ClientHello selector). That silently parsed a TOFU pin as a browser
+    // name — the pin was dropped and enforcement never happened. Route it
+    // into `server_identity_pin` instead. Stealth mimicry stays at Chrome
+    // by default; expose it via `stealth_fingerprint` in a future
+    // MobileConfig field if a caller ever needs to change it here.
     let tun_config = TunConfig {
         server_address: mobile_config.server_address,
         identity_key_path: mobile_config.identity_key_path,
@@ -372,7 +376,9 @@ pub unsafe extern "C" fn rvpn_start(config_json: *const c_char) -> c_int {
         block_ads: mobile_config.block_ads.unwrap_or(false),
         dns_bind_addr: mobile_config.dns_bind_addr,
         enable_dns_proxy: mobile_config.enable_dns_proxy.unwrap_or(false),
-        tls_fingerprint: mobile_config.server_fingerprint,
+        stealth_fingerprint: None,
+        server_identity_pin: mobile_config.server_fingerprint,
+        country_ips_file: mobile_config.country_ips_file,
     };
 
     // Serialize to JSON
@@ -430,88 +436,16 @@ const ERROR_ALREADY_RUNNING: c_int = -1;
 const ERROR_INVALID_CONFIG: c_int = -1;
 const ERROR_QUEUE_FULL: c_int = -2;
 const ERROR_NO_DATA: c_int = -3;
+/// TOFU pin mismatch. The last-error string is formatted as
+/// `IDENTITY_MISMATCH expected=<ik:1:...> actual=<ik:1:...>` so the Swift
+/// side can split on `expected=` / `actual=` and render both pins in the
+/// mismatch dialog without re-parsing this signalling from a free-form
+/// message.
+const ERROR_IDENTITY_MISMATCH: c_int = -20;
 
 // ============================================================================
 // DNS Proxy for Direct TUN Mode
 // ============================================================================
-
-/// Start the local DNS proxy for Direct TUN mode
-///
-/// This function:
-/// 1. Creates a DoH client connected to {server_path}/dns
-/// 2. Creates a SplitTunnel with builtin_bypass_countries and block_ads
-/// 3. Creates and runs a DnsServer on the configured bind address
-///
-/// The DNS server will:
-/// - Bypass Chinese domains (via local resolver)
-/// - Tunnel other domains via DoH/WebSocket to server
-/// - Block ads when block_ads is enabled
-async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::Result<()> {
-    use std::sync::Arc;
-
-    info!(
-        "[IOS_TUN_FFI] Starting DNS proxy on {} (enable_dns_proxy={})",
-        client.get_dns_bind_addr(),
-        client.is_dns_proxy_enabled()
-    );
-
-    if !client.is_dns_proxy_enabled() {
-        info!("[IOS_TUN_FFI] DNS proxy disabled in config, skipping");
-        return Ok(());
-    }
-
-    // Get server info from client
-    let server_host = client.server_host().to_string();
-    let server_port = client.server_port();
-    let base_path = client.server_path();
-
-    // Derive DNS WebSocket path from the base path
-    // e.g., "/api/v1/ws/tun" → "/api/v1/ws/dns", "/api/v1/ws" → "/api/v1/ws/dns"
-    let dns_path = format!("{}/dns", base_path.trim_end_matches("/tun").trim_end_matches('/'));
-
-    // Create FlowConnectorConfig for DoH client
-    let flow_config = FlowConnectorConfig {
-        server_host: server_host.clone(),
-        server_port,
-        server_path: dns_path.clone(),
-        tls_fingerprint: rvpn_client::tls_boring::TlsFingerprint::Chrome,
-        identity_key: Arc::new(client.identity_key().clone()),
-        server_bundle: client.server_bundle().clone(),
-    };
-
-    // Create and start the DoH client
-    let doh_client = Arc::new(DohClient::new(flow_config, dns_path));
-    doh_client.clone().start_cleanup_task();
-    doh_client.start().await?;
-
-    info!("[IOS_TUN_FFI] DoH client started, connecting to {}/dns", base_path);
-
-    // Create SplitTunnel config from client config
-    let split_tunnel_config = rvpn_client::split_tunnel::SplitTunnelConfig {
-        enabled: true,
-        builtin_bypass_countries: client.get_builtin_bypass_countries().to_vec(),
-        bypass_networks: Vec::new(), // Not used for DNS
-        block_ads: client.is_block_ads_enabled(),
-        ..Default::default()
-    };
-
-    // Create SplitTunnel
-    let dns_resolver = std::sync::Arc::new(DnsResolver::new(true, 14400, 1000, false, true, vec![]));
-    dns_resolver.start_cleanup_task();
-    let split_tunnel = SplitTunnel::new(split_tunnel_config, dns_resolver).await?;
-
-    // Create DNS server with SplitTunnel and DoH client
-    let dns_server = Arc::new(DnsServer::with_doh(
-        split_tunnel,
-        doh_client,
-        client.get_dns_bind_addr().to_string(),
-    ));
-
-    info!("[IOS_TUN_FFI] DNS server created, starting on {}", client.get_dns_bind_addr());
-
-    // Run the DNS server (runs indefinitely)
-    dns_server.run().await
-}
 
 /// Create a new TUN client from JSON configuration
 ///
@@ -590,55 +524,87 @@ pub unsafe extern "C" fn rvpn_tun_create(config_json: *const c_char) -> c_int {
         return SUCCESS;
     }
 
-    // Create Tokio runtime for FFI getter functions.
-    // iOS: 256 KB stack to save memory. macOS: default stack.
+    // Build the tokio runtime here (was previously inside IosTunClient::new).
+    // Owning the Runtime in the FFI static — separate from IosTunClient —
+    // prevents `Runtime::drop` from running on a tokio worker thread when
+    // the last `Arc<IosTunClient>` ref drops.
+    //
+    // iOS: single worker + 48 KB stack to fit within 50 MB NE limit.
+    // macOS: 2 workers + default stack (no memory constraint).
+    // current_thread does NOT run spawn() tasks — multi_thread with >=1
+    // worker is required.
     let runtime = if cfg!(feature = "ios-direct-tun") {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
-            .thread_stack_size(256 * 1024)
+            .thread_stack_size(48 * 1024)
             .enable_all()
-            .thread_name("rvpn-ffi")
+            .thread_name("rvpn-tun")
             .build()
     } else {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            .worker_threads(2)
             .enable_all()
-            .thread_name("rvpn-ffi")
+            .thread_name("rvpn-tun")
             .build()
     };
     let runtime = match runtime {
         Ok(rt) => rt,
         Err(e) => {
-            error!("[IOS_TUN_FFI] Failed to create Tokio runtime: {}", e);
+            error!("[IOS_TUN_FFI] Failed to create tokio runtime: {}", e);
             TUN_CLIENT_CREATING.store(false, std::sync::atomic::Ordering::SeqCst);
             return ERROR_INVALID_CONFIG;
         }
     };
+    let handle = runtime.handle().clone();
 
-    // Create the IosTunClient
-    let client = match IosTunClient::new(&config) {
+    // Create the IosTunClient with a Handle (Runtime stays in TUN_RUNTIME)
+    let client = match IosTunClient::new(&config, handle) {
         Ok(c) => Arc::new(c),
         Err(e) => {
+            // Downcast to see if this is the pin-mismatch case. The
+            // last-error string uses a stable, parseable prefix so the
+            // Swift/Kotlin side can split on `expected=...` / `actual=...`
+            // and render both pins in the mismatch dialog without pattern-
+            // matching English error prose.
+            if let Some(rvpn_core::Error::ServerIdentityMismatch { expected, actual }) =
+                e.downcast_ref::<rvpn_core::Error>()
+            {
+                set_last_error(&format!(
+                    "IDENTITY_MISMATCH expected={} actual={}",
+                    expected, actual
+                ));
+                error!(
+                    "[IOS_TUN_FFI] Server identity mismatch: expected {} got {}",
+                    expected, actual
+                );
+                drop(runtime);
+                TUN_CLIENT_CREATING.store(false, std::sync::atomic::Ordering::SeqCst);
+                return ERROR_IDENTITY_MISMATCH;
+            }
             error!("[IOS_TUN_FFI] Failed to create IosTunClient: {}", e);
+            // Drop the Runtime we just built (FFI thread — safe).
+            drop(runtime);
             TUN_CLIENT_CREATING.store(false, std::sync::atomic::Ordering::SeqCst);
             return ERROR_INVALID_CONFIG;
         }
     };
 
-    // Store client and runtime atomically under the TUN_CLIENT lock.
+    // Store runtime + client. Order matters on shutdown (client first, then
+    // runtime — see rvpn_tun_destroy). On startup, order is less critical
+    // as long as both are visible before any FFI accessor sees the client.
     // The TUN_CLIENT_CREATING flag ensures only one thread reaches this point.
     {
-        let mut guard = TUN_CLIENT.lock().unwrap();
-        if guard.is_some() {
+        let mut client_guard = TUN_CLIENT.lock().unwrap();
+        if client_guard.is_some() {
             warn!("[IOS_TUN_FFI] TUN client already exists (double-check after creation)");
+            // Drop the runtime we built for this call — the existing client
+            // already has its own via the previous TUN_RUNTIME.
+            drop(runtime);
             TUN_CLIENT_CREATING.store(false, std::sync::atomic::Ordering::SeqCst);
             return SUCCESS;
         }
-        *guard = Some(client);
-    }
-    {
-        let mut guard = TUN_RUNTIME.lock().unwrap();
-        *guard = Some(Arc::new(runtime));
+        *TUN_RUNTIME.lock().unwrap() = Some(runtime);
+        *client_guard = Some(client);
     }
 
     TUN_CLIENT_CREATING.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -662,40 +628,6 @@ pub extern "C" fn rvpn_tun_start() -> c_int {
             return ERROR_NOT_INITIALIZED;
         }
     };
-
-    // Get the runtime
-    let runtime = match TUN_RUNTIME.lock().unwrap().as_ref() {
-        Some(rt) => rt.clone(),
-        None => {
-            error!("[IOS_TUN_FFI] Runtime not initialized");
-            return ERROR_NOT_INITIALIZED;
-        }
-    };
-
-    // Start DNS proxy if enabled
-    if client.is_dns_proxy_enabled() {
-        // Abort any existing DNS proxy task before starting a new one
-        {
-            let mut guard = DNS_PROXY_HANDLE.lock().unwrap();
-            if let Some(handle) = guard.take() {
-                handle.abort();
-                info!("[IOS_TUN_FFI] Aborted previous DNS proxy task");
-            }
-        }
-
-        let dns_client = client.clone();
-        let handle = runtime.spawn(async move {
-            info!("[IOS_TUN_FFI] Starting DNS proxy task...");
-            if let Err(e) = start_dns_proxy_for_direct_tun(&dns_client).await {
-                error!("[IOS_TUN_FFI] DNS proxy error: {}", e);
-            }
-        });
-        {
-            let mut guard = DNS_PROXY_HANDLE.lock().unwrap();
-            *guard = Some(handle);
-        }
-        info!("[IOS_TUN_FFI] DNS proxy task spawned");
-    }
 
     // Enable reconnection and start the client
     client.set_reconnect_enabled(true);
@@ -729,26 +661,14 @@ pub extern "C" fn rvpn_tun_get_state() -> c_int {
 /// Caller must free with rvpn_free_string()
 #[no_mangle]
 pub extern "C" fn rvpn_tun_get_ip() -> *mut c_char {
-    let runtime = match TUN_RUNTIME.lock().unwrap().as_ref() {
-        Some(rt) => rt.clone(),
-        None => return std::ptr::null_mut(),
-    };
-
-    let client = match TUN_CLIENT.lock().unwrap().as_ref() {
-        Some(c) => c.clone(),
-        None => return std::ptr::null_mut(),
-    };
-
-    // Use block_on to get the async result
-    let ip = runtime.block_on(async {
-        client.get_tunnel_ip().await
-    });
-
-    match ip {
-        Some(ip_str) => {
-            match CString::new(ip_str) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
+    match TUN_CLIENT.lock().unwrap().as_ref() {
+        Some(client) => {
+            match client.get_tunnel_ip() {
+                Some(ip_str) => match CString::new(ip_str) {
+                    Ok(c_str) => c_str.into_raw(),
+                    Err(_) => std::ptr::null_mut(),
+                },
+                None => std::ptr::null_mut(),
             }
         }
         None => std::ptr::null_mut(),
@@ -762,26 +682,14 @@ pub extern "C" fn rvpn_tun_get_ip() -> *mut c_char {
 /// Caller must free with rvpn_free_string()
 #[no_mangle]
 pub extern "C" fn rvpn_tun_get_gateway_ip() -> *mut c_char {
-    let runtime = match TUN_RUNTIME.lock().unwrap().as_ref() {
-        Some(rt) => rt.clone(),
-        None => return std::ptr::null_mut(),
-    };
-
-    let client = match TUN_CLIENT.lock().unwrap().as_ref() {
-        Some(c) => c.clone(),
-        None => return std::ptr::null_mut(),
-    };
-
-    // Use block_on to get the async result
-    let ip = runtime.block_on(async {
-        client.get_gateway_ip().await
-    });
-
-    match ip {
-        Some(ip_str) => {
-            match CString::new(ip_str) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
+    match TUN_CLIENT.lock().unwrap().as_ref() {
+        Some(client) => {
+            match client.get_gateway_ip() {
+                Some(ip_str) => match CString::new(ip_str) {
+                    Ok(c_str) => c_str.into_raw(),
+                    Err(_) => std::ptr::null_mut(),
+                },
+                None => std::ptr::null_mut(),
             }
         }
         None => std::ptr::null_mut(),
@@ -794,22 +702,10 @@ pub extern "C" fn rvpn_tun_get_gateway_ip() -> *mut c_char {
 /// MTU value (e.g., 1420) or 0 if not assigned
 #[no_mangle]
 pub extern "C" fn rvpn_tun_get_mtu() -> c_int {
-    let runtime = match TUN_RUNTIME.lock().unwrap().as_ref() {
-        Some(rt) => rt.clone(),
-        None => return 0,
-    };
-
-    let client = match TUN_CLIENT.lock().unwrap().as_ref() {
-        Some(c) => c.clone(),
-        None => return 0,
-    };
-
-    // Use block_on to get the async result
-    let mtu = runtime.block_on(async {
-        client.get_mtu().await
-    });
-
-    mtu as c_int
+    match TUN_CLIENT.lock().unwrap().as_ref() {
+        Some(client) => client.get_mtu() as c_int,
+        None => 0,
+    }
 }
 
 /// Get the pre-resolved VPN server IP address
@@ -830,6 +726,34 @@ pub extern "C" fn rvpn_tun_get_server_ip() -> *mut c_char {
 
     let ip_str = client.server_ip().to_string();
     match CString::new(ip_str) {
+        Ok(c_str) => c_str.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Return the canonical TOFU pin (`ik:1:<base32>`) of the server this
+/// tunnel connected to. Read by Swift immediately after the tunnel
+/// reaches `Connected` state on a profile with no pin stored yet — the
+/// app persists the return value into `VpnProfile.serverFingerprint` so
+/// subsequent connections enforce it.
+///
+/// # Returns
+/// Non-empty C string on success. Null pointer if no client exists
+/// (rvpn_tun_create was never called). Empty C string is returned in
+/// the theoretical case where the client exists but has no pin — this
+/// should not happen in practice; every constructed IosTunClient has a
+/// pin computed at construction from its prekey bundle.
+///
+/// Caller must free the returned pointer with `rvpn_free_string`.
+#[no_mangle]
+pub extern "C" fn rvpn_tun_get_server_identity() -> *mut c_char {
+    let client = match TUN_CLIENT.lock().unwrap().as_ref() {
+        Some(c) => c.clone(),
+        None => return std::ptr::null_mut(),
+    };
+
+    let pin = client.server_identity_pin().to_string();
+    match CString::new(pin) {
         Ok(c_str) => c_str.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
@@ -864,14 +788,19 @@ pub unsafe extern "C" fn rvpn_tun_write_packet(
         return ERROR_INVALID_CONFIG;
     }
 
-    // Copy data to Vec<u8>
-    let packet = std::slice::from_raw_parts(data, len).to_vec();
-
     // Get the client - clone Arc so borrow doesn't outlive the lock
     let client = match TUN_CLIENT.lock().unwrap().as_ref().cloned() {
         Some(c) => c,
         None => return ERROR_NOT_INITIALIZED,
     };
+
+    // Take a buffer from the pool instead of allocating a new Vec each time.
+    let mut packet = {
+        let pool_handle = client.packet_pool();
+        let mut pool = pool_handle.blocking_lock();
+        pool.take()
+    };
+    packet.extend_from_slice(std::slice::from_raw_parts(data, len));
 
     // Non-blocking send - avoids block_on() deadlock on the hot packet write path
     match client.try_send_packet(packet) {
@@ -881,6 +810,55 @@ pub unsafe extern "C" fn rvpn_tun_write_packet(
             ERROR_QUEUE_FULL
         }
     }
+}
+
+/// Write a batch of packets to TUN (Swift → Rust → Server).
+///
+/// `data` contains multiple packets with u16-LE length prefixes:
+///   [len0: u16 LE] [packet0 bytes] [len1: u16 LE] [packet1 bytes] ...
+///
+/// # Safety
+/// `data` must point to `len` valid bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rvpn_tun_write_packet_batch(
+    data: *const u8,
+    len: usize,
+) -> c_int {
+    if data.is_null() {
+        return ERROR_NULL_POINTER;
+    }
+    if len < 2 {
+        return ERROR_INVALID_CONFIG;
+    }
+
+    let buf = std::slice::from_raw_parts(data, len);
+    let client = match TUN_CLIENT.lock().unwrap().as_ref().cloned() {
+        Some(c) => c,
+        None => return ERROR_NOT_INITIALIZED,
+    };
+
+    let mut offset = 0;
+    let mut sent = 0;
+    while offset + 2 <= buf.len() {
+        let pkt_len = u16::from_le_bytes([buf[offset], buf[offset + 1]]) as usize;
+        offset += 2;
+        if offset + pkt_len > buf.len() || pkt_len == 0 || pkt_len > 65535 {
+            break;
+        }
+        // Take a buffer from the pool instead of allocating a new Vec each time.
+        let mut packet = {
+            let pool_handle = client.packet_pool();
+            let mut pool = pool_handle.blocking_lock();
+            pool.take()
+        };
+        packet.extend_from_slice(&buf[offset..offset + pkt_len]);
+        offset += pkt_len;
+        if client.try_send_packet(packet).is_ok() {
+            sent += 1;
+        }
+    }
+
+    if sent > 0 { SUCCESS } else { ERROR_QUEUE_FULL }
 }
 
 /// Read packet from TUN (Server → Rust → Swift)
@@ -951,6 +929,39 @@ pub extern "C" fn rvpn_tun_wait_for_packet(timeout_ms: u64) -> c_int {
     client.wait_for_packet(timeout_ms)
 }
 
+/// Get the current resident set size (RSS) in bytes.
+///
+/// Uses Mach task_info to query the actual physical memory used by the process.
+/// Returns 0 on failure.
+#[cfg(feature = "diagnostics")]
+#[no_mangle]
+pub extern "C" fn rvpn_tun_get_rss_bytes() -> u64 {
+    crate::ios_tun::get_rss_bytes()
+}
+
+/// Non-diagnostics stub: Swift's `RustVPNCore.getRssBytes()` links to this
+/// symbol unconditionally. Without the feature gated in, Rust doesn't emit
+/// `get_rss_bytes` — so we expose an unconditional wrapper that reads the
+/// same Mach `task_info` and returns 0 on failure. Costs a couple of
+/// microseconds per call.
+#[cfg(not(feature = "diagnostics"))]
+#[no_mangle]
+pub extern "C" fn rvpn_tun_get_rss_bytes() -> u64 {
+    const MACH_TASK_BASIC_INFO: u32 = 20;
+    const INFO_COUNT: u32 = 12;
+    let mut buf = [0i32; 12];
+    let mut count = INFO_COUNT;
+    #[allow(deprecated)]
+    let task = unsafe { libc::mach_task_self() };
+    let kr = unsafe { libc::task_info(task, MACH_TASK_BASIC_INFO, buf.as_mut_ptr(), &mut count) };
+    if kr != 0 {
+        return 0;
+    }
+    let lo = buf[2] as u32 as u64;
+    let hi = buf[3] as u32 as u64;
+    (hi << 32) | lo
+}
+
 /// Get the last time any traffic was received from the server.
 ///
 /// Returns the Unix timestamp (seconds) of the most recently received
@@ -977,7 +988,6 @@ pub extern "C" fn rvpn_tun_stop() -> c_int {
 
     match TUN_CLIENT.lock().unwrap().as_ref() {
         Some(client) => {
-            // Disable reconnection first so the start() loop exits cleanly
             client.set_reconnect_enabled(false);
             client.stop();
             info!("[IOS_TUN_FFI] TUN client stopped");
@@ -987,21 +997,15 @@ pub extern "C" fn rvpn_tun_stop() -> c_int {
         }
     }
 
-    // Abort DNS proxy task if running
-    {
-        let mut guard = DNS_PROXY_HANDLE.lock().unwrap();
-        if let Some(handle) = guard.take() {
-            handle.abort();
-            info!("[IOS_TUN_FFI] DNS proxy task aborted");
-        }
-    }
-
     SUCCESS
 }
 
 /// Destroy the TUN client and free resources
 ///
-/// This clears both the client and runtime Mutex guards, allowing proper re-initialization.
+/// Clears both the client and runtime Mutex guards, allowing proper
+/// re-initialization. Called from Swift's stop thread — NOT from within the
+/// tokio runtime — which is required for the Runtime drop to be safe (see
+/// note on `TUN_RUNTIME`).
 #[no_mangle]
 pub extern "C" fn rvpn_tun_destroy() {
     info!("[IOS_TUN_FFI] rvpn_tun_destroy() called");
@@ -1009,11 +1013,18 @@ pub extern "C" fn rvpn_tun_destroy() {
     // Stop the client first
     rvpn_tun_stop();
 
-    // Clear the client and runtime
+    // 1. Drop the client. Any last `Arc<IosTunClient>` refs held by
+    //    in-flight tasks now drop the client (safe — it holds only a
+    //    Handle, not the Runtime). Tasks that were in-flight are aborted
+    //    when the Runtime drops below.
     {
         let mut guard = TUN_CLIENT.lock().unwrap();
         *guard = None;
     }
+
+    // 2. Drop the Runtime on THIS thread (FFI/Swift stop thread).
+    //    `Runtime::drop` -> `BlockingPool::shutdown` is safe here because
+    //    we are not on a tokio worker — no async context to panic in.
     {
         let mut guard = TUN_RUNTIME.lock().unwrap();
         *guard = None;
@@ -1066,10 +1077,11 @@ pub unsafe extern "C" fn rvpn_tun_set_state_callback(
 /// Returns empty array "[]" on error or if no countries are found.
 ///
 /// # Safety
-/// The `country_codes_json` pointer must be a valid null-terminated C string.
+/// Both pointers must be valid null-terminated C strings (or null).
 #[no_mangle]
 pub unsafe extern "C" fn rvpn_get_bypass_ips_for_countries(
     country_codes_json: *const c_char,
+    country_ips_file: *const c_char,
 ) -> *mut c_char {
     info!("[IOS_TUN_FFI] rvpn_get_bypass_ips_for_countries() called");
 
@@ -1103,13 +1115,40 @@ pub unsafe extern "C" fn rvpn_get_bypass_ips_for_countries(
         }
     };
 
-    // Collect all CIDRs for the specified countries
+    // Try loading from file first, fall back to compiled-in builtin IPs
     let mut all_cidrs: Vec<String> = Vec::new();
+    let mut loaded_from_file = false;
 
-    for country_code in &country_codes {
-        if let Some(cidrs) = rvpn_client::split_tunnel::get_country_ips(country_code) {
-            for cidr in cidrs {
-                all_cidrs.push(cidr.to_string());
+    if !country_ips_file.is_null() {
+        if let Ok(path_str) = CStr::from_ptr(country_ips_file).to_str() {
+            if !path_str.is_empty() {
+                match std::fs::read_to_string(path_str) {
+                    Ok(content) => {
+                        match serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(&content) {
+                            Ok(map) => {
+                                for cc in &country_codes {
+                                    if let Some(cidrs) = map.get(cc.as_str()) {
+                                        all_cidrs.extend(cidrs.iter().cloned());
+                                    }
+                                }
+                                loaded_from_file = true;
+                                info!("[IOS_TUN_FFI] Loaded {} IPs from {}", all_cidrs.len(), path_str);
+                            }
+                            Err(e) => error!("[IOS_TUN_FFI] Failed to parse {}: {}", path_str, e),
+                        }
+                    }
+                    Err(e) => error!("[IOS_TUN_FFI] Failed to read {}: {}", path_str, e),
+                }
+            }
+        }
+    }
+
+    if !loaded_from_file {
+        for country_code in &country_codes {
+            if let Some(cidrs) = rvpn_split_tunnel::get_country_ips(country_code) {
+                for cidr in cidrs {
+                    all_cidrs.push(cidr.to_string());
+                }
             }
         }
     }
@@ -1145,11 +1184,12 @@ pub unsafe extern "C" fn rvpn_get_bypass_ips_for_countries(
 /// JSON array of domain strings, e.g. '["baidu.com", "taobao.com", ...]'
 /// Returns empty array "[]" on error or if no countries are found.
 ///
-// # Safety
-/// The `country_codes_json` pointer must be a valid null-terminated C string.
+/// # Safety
+/// Both pointers must be valid null-terminated C strings (or null).
 #[no_mangle]
 pub unsafe extern "C" fn rvpn_get_bypass_domains_for_countries(
     country_codes_json: *const c_char,
+    country_domains_file: *const c_char,
 ) -> *mut c_char {
     info!("[IOS_TUN_FFI] rvpn_get_bypass_domains_for_countries() called");
 
@@ -1183,13 +1223,40 @@ pub unsafe extern "C" fn rvpn_get_bypass_domains_for_countries(
         }
     };
 
-    // Collect all domains for the specified countries
+    // Try loading from file first, fall back to compiled-in builtin domains
     let mut all_domains: Vec<String> = Vec::new();
+    let mut loaded_from_file = false;
 
-    for country_code in &country_codes {
-        if let Some(domains) = rvpn_client::split_tunnel::get_country_domains(country_code) {
-            for domain in domains {
-                all_domains.push(domain.to_string());
+    if !country_domains_file.is_null() {
+        if let Ok(path_str) = CStr::from_ptr(country_domains_file).to_str() {
+            if !path_str.is_empty() {
+                match std::fs::read_to_string(path_str) {
+                    Ok(content) => {
+                        match serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(&content) {
+                            Ok(map) => {
+                                for cc in &country_codes {
+                                    if let Some(domains) = map.get(cc.as_str()) {
+                                        all_domains.extend(domains.iter().cloned());
+                                    }
+                                }
+                                loaded_from_file = true;
+                                info!("[IOS_TUN_FFI] Loaded {} domains from {}", all_domains.len(), path_str);
+                            }
+                            Err(e) => error!("[IOS_TUN_FFI] Failed to parse {}: {}", path_str, e),
+                        }
+                    }
+                    Err(e) => error!("[IOS_TUN_FFI] Failed to read {}: {}", path_str, e),
+                }
+            }
+        }
+    }
+
+    if !loaded_from_file {
+        for country_code in &country_codes {
+            if let Some(domains) = rvpn_split_tunnel::get_country_domains(country_code) {
+                for domain in domains {
+                    all_domains.push(domain.to_string());
+                }
             }
         }
     }
@@ -1223,6 +1290,10 @@ pub unsafe extern "C" fn rvpn_get_bypass_domains_for_countries(
 /// C string in format:
 /// "R-VPN-IDENTITY-v1\ned25519: <base64_verifying_key>\nx25519: <base64_x25519_public_key>\n<base64_signing_key>\n"
 /// or null on error. Must be freed with rvpn_free_string().
+///
+/// # Safety
+/// This function has no pointer arguments. The returned pointer must be freed
+/// with `rvpn_free_string()`.
 #[no_mangle]
 pub unsafe extern "C" fn rvpn_generate_identity() -> *mut c_char {
     info!("[IOS_TUN_FFI] rvpn_generate_identity() called");

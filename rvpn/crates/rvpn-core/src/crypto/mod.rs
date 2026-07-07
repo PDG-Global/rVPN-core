@@ -1,6 +1,6 @@
 //! Cryptographic primitives for R-VPN
 
-pub use ed25519_dalek::{SigningKey, VerifyingKey};
+pub use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::SeedableRng;
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
@@ -11,7 +11,7 @@ pub mod ratchet;
 pub mod x3dh;
 
 pub use x3dh::{X3DHResponder, X3DHPublicBundle};
-pub use ratchet::{DoubleRatchet, RatchetMessage, MessageHeader};
+pub use ratchet::{DoubleRatchet, RatchetMessage, RatchetMessageRef, MessageHeader};
 
 /// Ed25519 identity key pair
 ///

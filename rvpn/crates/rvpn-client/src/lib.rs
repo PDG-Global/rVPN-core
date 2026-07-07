@@ -8,14 +8,10 @@ pub mod config;
 pub mod dns;
 
 // These modules are temporarily unused in the Brook-style refactor
-// but kept for potential future use (split tunnel, metrics, etc.)
-#[allow(dead_code)]
-pub mod dns_cache;
+// but kept for potential future use (metrics, etc.)
 #[allow(dead_code)]
 pub mod identity_verification;
 pub mod metrics;
-#[allow(dead_code)]
-pub mod split_tunnel;
 #[allow(dead_code)]
 pub mod stats;
 
@@ -26,10 +22,7 @@ pub mod socks5;
 pub mod socks5_tunnel;
 #[cfg(not(target_os = "android"))]
 pub mod stream_relay;
-// tls_boring contains BoringSSL bindings (not available on Android).
-// On Android, a minimal stub provides just the TlsFingerprint enum.
-#[cfg(not(target_os = "android"))]
-pub mod tls_boring;
+// TLS: re-exported from rvpn-tls crate
 #[cfg(target_os = "android")]
 pub mod tls_fingerprint_stub;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -42,10 +35,15 @@ pub mod proxy_common;
 #[cfg(not(target_os = "android"))]
 pub mod http_proxy;
 
+// Backwards compatibility re-exports from rvpn-split-tunnel
+pub mod split_tunnel;
+pub mod dns_cache;
+
 // Re-export commonly used types
 pub use config::{ClientConfig, ServerIdentityConfig};
 #[cfg(not(target_os = "android"))]
-pub use tls_boring::{TlsFingerprint, fingerprint_from_str};
+pub use rvpn_tls::{TlsFingerprint, connect_chrome_like, ChromeTlsStream};
+pub use rvpn_tls::fingerprint_from_str;
 #[cfg(target_os = "android")]
 pub use tls_fingerprint_stub::{TlsFingerprint, fingerprint_from_str};
 #[cfg(not(target_os = "android"))]

@@ -20,8 +20,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::doh_client::DohClient;
-use rvpn_client::split_tunnel::{SplitTunnel, RoutingDecision as SplitTunnelRoutingDecision};
-use rvpn_client::dns_cache::DnsResolver;
+use rvpn_split_tunnel::{SplitTunnel, RoutingDecision as SplitTunnelRoutingDecision};
+use rvpn_split_tunnel::DnsResolver;
 
 /// DNS query routing decision (matches rvpn-client RoutingDecision)
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -114,6 +114,17 @@ impl DnsServer {
         self.filter_aaaa = enabled;
     }
 
+    /// Set custom upstream nameservers for bypass domain resolution.
+    /// Accepts strings like "8.8.8.8:53" or "1.1.1.1:53".
+    pub fn set_nameservers(&mut self, addrs: &[String]) {
+        let parsed: Vec<SocketAddr> = addrs.iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if !parsed.is_empty() {
+            self.nameservers = parsed;
+        }
+    }
+
     fn parse_nameservers(addrs: &[&str]) -> Vec<SocketAddr> {
         addrs.iter()
             .filter_map(|s| s.parse().ok())
@@ -124,6 +135,138 @@ impl DnsServer {
     pub fn bind_addr(&self) -> &str {
         &self.bind_addr
     }
+
+    /// Resolve a raw DNS query packet and return the raw DNS response packet.
+    ///
+    /// This is the synchronous FFI entry point — the NEDNSProxyProvider extension
+    /// calls this directly instead of going through a local UDP server.
+    pub async fn resolve_raw(&self, query_bytes: &[u8]) -> Result<Vec<u8>> {
+        let request = Message::from_vec(query_bytes)
+            .context("Failed to parse DNS query")?;
+
+        // Check routing decision
+        let queries: Vec<&Query> = request.queries().iter().collect();
+        if queries.is_empty() {
+            return Err(anyhow::anyhow!("No questions in query"));
+        }
+
+        let name = queries[0].name();
+        let query_type = queries[0].query_type();
+        let domain = name.to_ascii();
+        let domain = domain.trim_end_matches('.');
+
+        // Filter AAAA
+        if self.filter_aaaa && query_type == RecordType::AAAA {
+            let response = self.make_base_response(&request);
+            return response.to_vec().context("Failed to serialize AAAA filter response");
+        }
+
+        // Route decision
+        let decision = {
+            let split_tunnel = self.split_tunnel.read().await;
+            split_tunnel.decide_by_host(domain).await
+        };
+
+        match decision {
+            SplitTunnelRoutingDecision::Block => {
+                let mut response = self.make_base_response(&request);
+                response.set_response_code(ResponseCode::NXDomain);
+                response.to_vec().context("Failed to serialize block response")
+            }
+            SplitTunnelRoutingDecision::Bypass => {
+                // Forward raw query bytes to upstream DNS and return raw response
+                self.forward_raw_dns(query_bytes).await
+            }
+            SplitTunnelRoutingDecision::Tunnel => {
+                // Resolve via DoH and build minimal response
+                self.resolve_tunnel_minimal(&request, name, query_type, domain).await
+            }
+        }
+    }
+
+    /// Forward raw DNS query to upstream nameservers and return raw response.
+    async fn forward_raw_dns(&self, query_bytes: &[u8]) -> Result<Vec<u8>> {
+        for ns in &self.nameservers {
+            match Self::query_nameserver_udp_raw(*ns, query_bytes).await {
+                Ok(response_bytes) => return Ok(response_bytes),
+                Err(_) => continue,
+            }
+        }
+        Err(anyhow::anyhow!("All upstream DNS servers failed"))
+    }
+
+    /// Resolve a tunnel domain via DoH, returning a minimal response.
+    async fn resolve_tunnel_minimal(&self, request: &Message, name: &Name, query_type: RecordType, domain: &str) -> Result<Vec<u8>> {
+        let qtype_num: u16 = match query_type {
+            RecordType::A => 1,
+            RecordType::AAAA => 28,
+            _ => {
+                let response = self.make_base_response(request);
+                return response.to_vec().context("Failed to serialize response");
+            }
+        };
+
+        let client = match &self.doh_client {
+            Some(c) => c,
+            None => {
+                let mut response = self.make_base_response(request);
+                response.set_response_code(ResponseCode::ServFail);
+                return response.to_vec().context("Failed to serialize ServFail");
+            }
+        };
+
+        // Try cache first
+        if let Some(cached) = client.lookup_cached(domain, qtype_num).await {
+            let ttl = client.get_cached_ttl(domain, qtype_num).await.unwrap_or(14400);
+            let mut response = self.make_base_response(request);
+            response.set_response_code(ResponseCode::NoError);
+            // First matching record only
+            for addr in &cached {
+                match addr {
+                    IpAddr::V4(v4) if query_type == RecordType::A => {
+                        response.add_answer(Record::from_rdata(name.clone(), ttl, RData::A(rdata::A(*v4))));
+                        break;
+                    }
+                    IpAddr::V6(v6) if query_type == RecordType::AAAA => {
+                        response.add_answer(Record::from_rdata(name.clone(), ttl, RData::AAAA(rdata::AAAA(*v6))));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            return response.to_vec().context("Failed to serialize cached response");
+        }
+
+        // Cache miss — resolve via DoH
+        match client.resolve(domain, qtype_num).await {
+            Ok(addrs) => {
+                let ttl = client.get_cached_ttl(domain, qtype_num).await.unwrap_or(14400);
+                let mut response = self.make_base_response(request);
+                response.set_response_code(ResponseCode::NoError);
+                for addr in &addrs {
+                    match addr {
+                        IpAddr::V4(v4) if query_type == RecordType::A => {
+                            response.add_answer(Record::from_rdata(name.clone(), ttl, RData::A(rdata::A(*v4))));
+                            break;
+                        }
+                        IpAddr::V6(v6) if query_type == RecordType::AAAA => {
+                            response.add_answer(Record::from_rdata(name.clone(), ttl, RData::AAAA(rdata::AAAA(*v6))));
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                response.to_vec().context("Failed to serialize DoH response")
+            }
+            Err(e) => {
+                warn!("DoH resolution failed for {}: {}", domain, e);
+                let mut response = self.make_base_response(request);
+                response.set_response_code(ResponseCode::ServFail);
+                response.to_vec().context("Failed to serialize ServFail")
+            }
+        }
+    }
+
 
     /// Try to bind with fallback ports (5453, 5353, 1053, etc.)
     async fn try_bind_with_fallback(primary: SocketAddr) -> Result<UdpSocket> {
@@ -218,6 +361,18 @@ impl DnsServer {
         let query = &queries[0];
         let name = query.name().clone();
         let query_type = query.query_type();
+
+        // Answer root-domain queries locally. The Android service discovers the
+        // DNS proxy by probing with a root query and a short timeout — routing
+        // it upstream would make discovery depend on DoH health.
+        if name.is_root() {
+            let response = self.make_base_response(&request);
+            let response_bytes = response.to_vec()
+                .context("Failed to serialize root probe response")?;
+            socket.send_to(&response_bytes, client_addr).await
+                .context("Failed to send root probe response")?;
+            return Ok(());
+        }
 
         // Filter AAAA queries when the upstream VPN is IPv4-only. Returning an
         // empty NoError response lets apps fall back to IPv4 immediately instead
@@ -637,7 +792,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_routing_decision_with_split_tunnel() {
-        use rvpn_client::split_tunnel::SplitTunnelConfig;
+        use rvpn_split_tunnel::SplitTunnelConfig;
 
         // Create a SplitTunnel config with built-in China domains enabled
         let config = SplitTunnelConfig {
@@ -647,7 +802,7 @@ mod tests {
             ..Default::default()
         };
 
-        let split_tunnel = SplitTunnel::new(config, std::sync::Arc::new(rvpn_client::dns_cache::DnsResolver::new(true, 14400, 1000, false, true, vec![]))).await.unwrap();
+        let split_tunnel = SplitTunnel::new(config, std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![]))).await.unwrap();
         let server = DnsServer::new(split_tunnel);
 
         // Test China domain (should be bypass)
@@ -662,10 +817,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_aaaa_filtering() {
+    async fn test_root_probe_answered_locally() {
         use std::time::Duration;
         use hickory_proto::op::{Message, MessageType, OpCode, Query};
-        use rvpn_client::split_tunnel::SplitTunnelConfig;
+        use rvpn_split_tunnel::SplitTunnelConfig;
 
         let config = SplitTunnelConfig {
             enabled: true,
@@ -676,7 +831,52 @@ mod tests {
 
         let split_tunnel = SplitTunnel::new(
             config,
-            std::sync::Arc::new(rvpn_client::dns_cache::DnsResolver::new(true, 14400, 1000, false, true, vec![])),
+            std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![])),
+        ).await.unwrap();
+        let server = Arc::new(DnsServer::new(split_tunnel));
+
+        let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+
+        // The Android service discovers the DNS proxy by querying the root
+        // domain and expects a fast reply — it must be answered locally,
+        // never routed upstream (DoH may be down or slow).
+        let mut request = Message::new();
+        request.set_id(0x1234);
+        request.set_message_type(MessageType::Query);
+        request.set_op_code(OpCode::Query);
+        request.add_query(Query::query(Name::root(), RecordType::A));
+
+        server.handle_query(request, client_addr, &server_socket).await.unwrap();
+
+        let mut buf = [0u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            Duration::from_millis(500),
+            client_socket.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+        let response = Message::from_vec(&buf[..len]).unwrap();
+
+        assert_eq!(response.id(), 0x1234);
+        assert_eq!(response.response_code(), ResponseCode::NoError);
+    }
+
+    #[tokio::test]
+    async fn test_aaaa_filtering() {
+        use std::time::Duration;
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use rvpn_split_tunnel::SplitTunnelConfig;
+
+        let config = SplitTunnelConfig {
+            enabled: true,
+            builtin_bypass_countries: vec![],
+            block_ads: false,
+            ..Default::default()
+        };
+
+        let split_tunnel = SplitTunnel::new(
+            config,
+            std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![])),
         ).await.unwrap();
         let server = Arc::new(DnsServer::new(split_tunnel));
 

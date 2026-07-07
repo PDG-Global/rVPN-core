@@ -20,7 +20,7 @@ use crate::config::ServerIdentityConfig;
 use crate::socks5_tunnel::{self, Socks5Tunnel};
 use crate::split_tunnel::{SplitTunnel, RoutingDecision};
 use crate::stream_relay::StreamRelay;
-use crate::tls_boring::TlsFingerprint;
+use rvpn_tls::TlsFingerprint;
 
 /// Lightweight handle passed to each connection handler.
 /// Contains everything needed to route traffic through the VPN tunnel.

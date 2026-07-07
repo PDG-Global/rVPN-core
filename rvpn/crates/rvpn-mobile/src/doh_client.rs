@@ -18,10 +18,8 @@ use futures::StreamExt;
 use futures_util::stream::SplitSink;
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
-use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use tokio::net::TcpStream;
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 use tracing::{debug, error, info, warn};
-use tungstenite::handshake::client::generate_key;
 
 use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
@@ -117,7 +115,7 @@ impl DohClient {
             server_ip,
             pending: Arc::new(Mutex::new(HashMap::new())),
             cache: Arc::new(Mutex::new(HashMap::new())),
-            max_cache_size: 1000,
+            max_cache_size: 200,
             query_tx: Arc::new(Mutex::new(None)),
             next_id: Arc::new(Mutex::new(1)),
         }
@@ -357,61 +355,69 @@ impl DohClient {
         let url = format!("wss://{}:{}{}", config.server_host, config.server_port, dns_path);
         info!("[DohClient] Connecting to {} (via IP {})", url, server_ip);
 
-        // Connect via rustls (same approach as TUN mode).
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
+        // TLS backend depends on platform feature
+        #[cfg(not(feature = "android-direct-tun"))]
+        let (ws_stream, _) = {
+            let tls_stream = {
+                #[cfg(feature = "ios-direct-tun")]
+                let s = rvpn_tls::connect_rustls(&config.server_host, config.server_port, Some(&config.server_host))
+                    .await
+                    .context("DNS TLS handshake failed")?;
+                #[cfg(not(feature = "ios-direct-tun"))]
+                let s = rvpn_tls::connect_chrome_like(
+                    &config.server_host,
+                    config.server_port,
+                    rvpn_tls::TlsFingerprint::Chrome,
+                    Some(&config.server_host),
+                )
+                .await
+                .context("DNS TLS handshake failed")?;
+                s
+            };
+            timeout(Duration::from_secs(3), tokio_tungstenite::client_async(&url, tls_stream))
+                .await
+                .context("DNS WebSocket handshake timeout (3s)")?
+                .context("DNS WebSocket handshake failed")?
+        };
 
-        let tcp_addr = std::net::SocketAddr::new(server_ip, config.server_port);
-        let tcp_stream = timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(tcp_addr)
-        )
-        .await
-        .context("DNS TCP connect timeout (5s)")?
-        .context("Failed to connect TCP stream for DNS")?;
+        // Android: tokio-tungstenite's built-in rustls connector has an EMPTY
+        // root store (only __rustls-tls is enabled, no roots feature), so TLS
+        // always fails with UnknownIssuer. Build an explicit rustls connector
+        // with webpki roots — same workaround as the main tunnel connection.
+        // Also connect TCP to the pre-resolved server IP: system DNS points at
+        // our own proxy once the VPN is up, so hostname resolution here would
+        // be a circular dependency.
+        #[cfg(feature = "android-direct-tun")]
+        let (ws_stream, _) = {
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let tls_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector =
+                tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
 
-        // Build Chrome-like WebSocket upgrade request with 15 headers.
-        let ws_key = generate_key();
-        let authority = format!("{}:{}", config.server_host, config.server_port);
-        let request = tungstenite::http::Request::builder()
-            .method("GET")
-            .uri(&url)
-            .header("Host", &authority)
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", &ws_key)
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            let tcp_stream = timeout(
+                Duration::from_secs(5),
+                tokio::net::TcpStream::connect((server_ip, config.server_port)),
             )
-            .header("Accept", "*/*")
-            .header("Accept-Encoding", "gzip, deflate, br")
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Cache-Control", "no-cache")
-            .header("Pragma", "no-cache")
-            .header("Sec-Fetch-Dest", "websocket")
-            .header("Sec-Fetch-Mode", "websocket")
-            .header("Sec-Fetch-Site", "same-origin")
-            .body(())
-            .context("Failed to build DNS WebSocket upgrade request")?;
+            .await
+            .context("DNS TCP connect timeout (5s)")?
+            .context("DNS TCP connect failed")?;
 
-        let (ws_stream, _) = timeout(
-            Duration::from_secs(3),
-            tokio_tungstenite::client_async_tls_with_config(
-                request,
-                tcp_stream,
-                None,
-                Some(connector),
+            timeout(
+                Duration::from_secs(5),
+                tokio_tungstenite::client_async_tls_with_config(
+                    &url,
+                    tcp_stream,
+                    None,
+                    Some(connector),
+                ),
             )
-        )
-        .await
-        .context("DNS WebSocket handshake timeout (3s)")?
-        .context("DNS WebSocket handshake failed")?;
+            .await
+            .context("DNS WebSocket handshake timeout (5s)")?
+            .context("DNS WebSocket handshake failed")?
+        };
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -469,14 +475,14 @@ impl DohClient {
 
         let recv_loop = async {
             loop {
-                let msg = match timeout(Duration::from_secs(15), read.next()).await {
+                let msg = match timeout(Duration::from_secs(90), read.next()).await {
                     Ok(Some(msg)) => msg,
                     Ok(None) => {
                         debug!("[DohClient] Connection closed");
                         break;
                     }
                     Err(_) => {
-                        warn!("[DohClient] WebSocket read timeout (15s), connection appears dead");
+                        warn!("[DohClient] WebSocket read timeout (90s), connection appears dead");
                         break;
                     }
                 };
@@ -541,8 +547,8 @@ impl DohClient {
 
 /// Perform X3DH handshake with the server
 async fn perform_handshake(
-    ws_reader: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    ws_writer: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    ws_reader: &mut futures_util::stream::SplitStream<WebSocketStream<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>>,
+    ws_writer: &mut SplitSink<WebSocketStream<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>, Message>,
     identity_key: &Arc<IdentityKey>,
     server_bundle: &X3DHPublicBundle,
 ) -> Result<DoubleRatchet> {
@@ -575,9 +581,50 @@ async fn perform_handshake(
                 .context("Failed to parse ServerHello")?;
 
             match server_hello {
-                HandshakeMessage::ServerHello { ephemeral_key: _server_ephemeral, .. } => {
+                HandshakeMessage::ServerHello {
+                    ephemeral_key: _server_ephemeral,
+                    identity_key: server_identity_key,
+                    signed_prekey: server_signed_prekey,
+                    prekey_signature: server_prekey_signature,
+                } => {
+                    // Use wire values for X3DH (see stream_relay.rs / ios_tun.rs).
+                    let server_identity_key: [u8; 32] = server_identity_key
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Server identity key has invalid length"))?;
+                    let server_signed_prekey: [u8; 32] = server_signed_prekey
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Server signed prekey has invalid length"))?;
+                    let prekey_signature: [u8; 64] = server_prekey_signature
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Prekey signature has invalid length"))?;
+
+                    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
+                        &server_identity_key,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Invalid server identity key: {}", e))?;
+                    let signature = ed25519_dalek::Signature::from_bytes(&prekey_signature);
+                    ed25519_dalek::Verifier::verify(
+                        &verifying_key,
+                        &server_signed_prekey,
+                        &signature,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
+
+                    let server_bundle_from_hello = X3DHPublicBundle {
+                        identity_key: server_identity_key,
+                        identity_x25519_key: server_bundle.identity_x25519_key,
+                        signed_prekey: server_signed_prekey,
+                        prekey_signature,
+                        one_time_prekey: None,
+                        identity_key_version: server_bundle.identity_key_version,
+                        rotation_signature: server_bundle.rotation_signature,
+                    };
+
                     let (shared_secret, _) = initiator
-                        .agree(server_bundle)
+                        .agree(&server_bundle_from_hello)
                         .context("X3DH key agreement failed")?;
 
                     // In X3DH, the server (Bob) doesn't generate an ephemeral key.

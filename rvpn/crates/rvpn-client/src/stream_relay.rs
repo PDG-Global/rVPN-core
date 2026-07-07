@@ -16,13 +16,13 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
-use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
+use rvpn_core::crypto::{DoubleRatchet, IdentityKey, Signature, Verifier, VerifyingKey, X3DHPublicBundle};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
 use rvpn_core::protocol::HandshakeMessage;
 
 use crate::config::ServerIdentityConfig;
 use crate::identity_verification::{verify_server_identity, KnownHosts, VerificationResult};
-use crate::tls_boring::TlsFingerprint;
+use rvpn_tls::TlsFingerprint;
 use crate::websocket::{connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter};
 
 /// Brook-style stream relay for one SOCKS5 connection
@@ -149,54 +149,96 @@ impl StreamRelay {
                 match server_hello {
                     HandshakeMessage::ServerHello {
                         ephemeral_key: _server_ephemeral,
-                        identity_key: _server_identity_key,
-                        signed_prekey: _,
-                        prekey_signature: _,
+                        identity_key: server_identity_key,
+                        signed_prekey: server_signed_prekey,
+                        prekey_signature: server_prekey_signature,
                     } => {
                         debug!("Received ServerHello with ephemeral key");
+
+                        // Use the SERVER'S ACTUAL wire values for X3DH.
+                        //
+                        // Previously the client discarded every ServerHello key
+                        // (all `_`) and ran X3DH against the pre-loaded on-disk
+                        // bundle. That silently broke every SOCKS5 connection
+                        // whenever the on-disk copy drifted from what the server
+                        // was actually running — e.g. any `rvpn-server prekey-
+                        // bundle` regeneration. Chain keys diverged and the
+                        // first Double Ratchet frame failed AEAD auth with
+                        // `aead::Error`, immediately after a "successful" X3DH.
+                        //
+                        // Mirrors the correct pattern from rvpn-mobile ios_tun.rs.
+                        let server_identity_key: [u8; 32] = server_identity_key
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("Server identity key has invalid length"))?;
+                        let server_signed_prekey: [u8; 32] = server_signed_prekey
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("Server signed prekey has invalid length"))?;
+                        let prekey_signature_bytes: [u8; 64] = server_prekey_signature
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("Prekey signature has invalid length"))?;
+
+                        // Verify the Ed25519 signature on signed_prekey using
+                        // the server's wire identity_key. Without this a MITM
+                        // could feed us any signed_prekey they liked.
+                        let verifying_key = VerifyingKey::from_bytes(&server_identity_key)
+                            .map_err(|e| anyhow::anyhow!("Invalid server identity key: {}", e))?;
+                        let signature = Signature::from_bytes(&prekey_signature_bytes);
+                        verifying_key
+                            .verify(&server_signed_prekey, &signature)
+                            .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
+                        debug!("Server prekey signature verified");
+
+                        // identity_x25519_key can't be derived from the Ed25519
+                        // public alone (would need an Edwards → Montgomery
+                        // birational conversion), so keep the pre-loaded value.
+                        // Safe because TOFU below refuses to proceed if the wire
+                        // identity_key doesn't match the pinned one — and the
+                        // x25519 key is deterministic from the same identity.
+                        let received_bundle = X3DHPublicBundle {
+                            identity_key: server_identity_key,
+                            identity_x25519_key: server_bundle.identity_x25519_key,
+                            signed_prekey: server_signed_prekey,
+                            prekey_signature: prekey_signature_bytes,
+                            one_time_prekey: None,
+                            // ServerHello doesn't yet carry rotation metadata;
+                            // keep the pre-loaded values for TOFU rotation
+                            // checks in verify_server_identity.
+                            identity_key_version: server_bundle.identity_key_version,
+                            rotation_signature: server_bundle.rotation_signature,
+                        };
 
                         // Verify server identity if configured
                         if let Some(config) = server_identity_config {
                             let server_addr = format!("{}:{}", host, port);
-                            
-                            // Load known hosts
-                            let known_hosts = KnownHosts::load(&config.known_hosts_file)
+
+                            // Load known hosts (mut — verify_server_identity
+                            // writes canonical pins on TOFU capture and
+                            // migrates legacy hex entries in-place).
+                            let mut known_hosts = KnownHosts::load(&config.known_hosts_file)
                                 .unwrap_or_default();
-                            
-                            // Build a bundle from the received identity key for verification
-                            let received_bundle = X3DHPublicBundle {
-                                identity_key: server_bundle.identity_key, // Use expected from prekey bundle
-                                identity_x25519_key: server_bundle.identity_x25519_key,
-                                signed_prekey: server_bundle.signed_prekey,
-                                prekey_signature: server_bundle.prekey_signature,
-                                one_time_prekey: None,
-                            };
-                            
-                            // Verify the server identity
+
                             let (result, should_proceed) = verify_server_identity(
                                 &server_addr,
                                 &received_bundle,
-                                &known_hosts,
+                                &mut known_hosts,
                                 config.fingerprint.as_deref(),
                                 config.trust_on_first_use,
                                 config.strict_mode,
                             );
-                            
+
+                            if let Err(e) = known_hosts.save(&config.known_hosts_file) {
+                                warn!("Failed to persist known_hosts.json: {}", e);
+                            }
+
                             match result {
                                 VerificationResult::Verified => {
                                     info!("Server identity verified");
                                 }
                                 VerificationResult::New => {
                                     info!("New server identity, accepting (TOFU mode)");
-                                    // Save to known hosts if TOFU is enabled
-                                    if config.trust_on_first_use {
-                                        let mut hosts = known_hosts;
-                                        // Compute fingerprint matching the format in identity_verification.rs
-                                        // (first 32 hex chars of identity key = 16 bytes)
-                                        let fingerprint = hex::encode(&received_bundle.identity_key[..16]);
-                                        hosts.add_server(server_addr.clone(), fingerprint);
-                                        let _ = hosts.save(&config.known_hosts_file);
-                                    }
                                 }
                                 VerificationResult::Mismatch { expected, got } => {
                                     if config.strict {
@@ -209,15 +251,15 @@ impl StreamRelay {
                                     }
                                 }
                             }
-                            
+
                             if !should_proceed && config.strict {
                                 return Err(anyhow::anyhow!("Server identity verification failed"));
                             }
                         }
 
-                        // Complete X3DH agreement to get shared secret
+                        // Complete X3DH against the SERVER'S ACTUAL bundle
                         let (shared_secret, _x3dh_material) = initiator
-                            .agree(server_bundle)
+                            .agree(&received_bundle)
                             .context("X3DH key agreement failed")?;
 
                         debug!("X3DH shared secret derived successfully");

@@ -18,7 +18,7 @@ use tracing::trace;
 pub use tungstenite::Message;
 
 #[cfg(not(target_os = "android"))]
-use crate::tls_boring::{ChromeTlsStream, TlsFingerprint, connect_chrome_like};
+use rvpn_tls::{ChromeTlsStream, TlsFingerprint, connect_chrome_like};
 
 /// WebSocket reader type (receives messages)
 pub type WebSocketReader = tokio::sync::mpsc::UnboundedReceiver<Message>;

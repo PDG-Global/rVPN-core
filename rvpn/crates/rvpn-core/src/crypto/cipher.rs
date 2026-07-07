@@ -48,6 +48,34 @@ impl Cipher {
         Ok(())
     }
 
+    /// Decrypt ciphertext in place.
+    ///
+    /// `buffer` must contain the ciphertext with the 16-byte tag appended (the
+    /// same layout produced by [`Cipher::encrypt_in_place`] and expected by
+    /// [`Cipher::decrypt`]). On success the tag is stripped and `buffer` holds
+    /// the plaintext, so no per-call `Vec` is allocated — unlike [`decrypt`]
+    /// which returns an owned `Vec`. Returns the plaintext length.
+    ///
+    /// [`decrypt`]: Cipher::decrypt
+    pub fn decrypt_in_place(
+        &self,
+        nonce: &[u8; NONCE_SIZE],
+        associated_data: &[u8],
+        buffer: &mut Vec<u8>,
+    ) -> crate::Result<usize> {
+        if buffer.len() < TAG_SIZE {
+            return Err(crate::Error::DecryptionFailed(
+                "ciphertext too short".to_string(),
+            ));
+        }
+
+        let nonce = ChaChaNonce::from_slice(nonce);
+        self.inner
+            .decrypt_in_place(nonce, associated_data, buffer)
+            .map_err(|e| crate::Error::DecryptionFailed(e.to_string()))?;
+        Ok(buffer.len())
+    }
+
     /// Decrypt ciphertext
     ///
     /// # Arguments

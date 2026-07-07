@@ -137,6 +137,28 @@ pub struct X3DHPublicBundle {
         deserialize_with = "deserialize_base64_opt"
     )]
     pub one_time_prekey: Option<[u8; 32]>,
+    /// Monotonic version of the identity key. Bumped by 1 every time the
+    /// operator rotates the server identity via the chained-signature
+    /// ceremony (see `rvpn_core::identity_pin::rotation_signature_message`).
+    /// Bundles from pre-TOFU servers default to `1` so a fresh install of
+    /// the new client can still deserialize them.
+    #[serde(default = "default_identity_key_version")]
+    pub identity_key_version: u32,
+    /// Ed25519 signature over `new_identity_pub || new_version_le`, signed
+    /// by the *previous* identity's private key. When present and valid,
+    /// a client that already pinned the old identity can silently rotate
+    /// its pin to the new one; when absent (or version = 1), no rotation
+    /// is on offer.
+    #[serde(
+        default,
+        serialize_with = "serialize_base64_opt",
+        deserialize_with = "deserialize_base64_opt"
+    )]
+    pub rotation_signature: Option<[u8; 64]>,
+}
+
+fn default_identity_key_version() -> u32 {
+    1
 }
 
 /// X3DH private keys (held by server)
@@ -421,6 +443,12 @@ impl X3DHResponder {
             signed_prekey: signed_prekey_public.to_bytes(),
             prekey_signature: signature.to_bytes(),
             one_time_prekey,
+            // First-ever bundle: version 1, no rotation signature. The
+            // server CLI's `prekey-bundle --rotate-from ...` flow patches
+            // both fields post-construction; see
+            // `rvpn_server::main::prekey_bundle`.
+            identity_key_version: 1,
+            rotation_signature: None,
         }
     }
 
@@ -468,6 +496,57 @@ fn derive_shared_secret(dh_results: &[u8]) -> SharedSecret {
 mod tests {
     use super::*;
 
+    /// New bundles serialize both TOFU fields (version + optional rotation
+    /// signature); a legacy bundle JSON that predates the format bump
+    /// deserializes with version=1 and rotation_signature=None via
+    /// `#[serde(default)]`. Guards against breaking old on-disk / on-wire
+    /// bundles when we ship the format bump.
+    #[test]
+    fn bundle_serde_backwards_compatible() {
+        // Take a real bundle, serialize it, strip out the two new fields
+        // and confirm it still deserializes — this is the "old client's
+        // bundle file loaded by the new client" migration case.
+        let responder = X3DHResponder::new();
+        let bundle = responder.get_public_bundle();
+        let full_json = serde_json::to_value(&bundle).unwrap();
+        let full_obj = full_json.as_object().unwrap();
+
+        let legacy_obj: serde_json::Map<_, _> = full_obj
+            .iter()
+            .filter(|(k, _)| {
+                k.as_str() != "identity_key_version"
+                    && k.as_str() != "rotation_signature"
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let legacy = serde_json::Value::Object(legacy_obj).to_string();
+
+        let restored: X3DHPublicBundle =
+            serde_json::from_str(&legacy).expect("legacy bundle decodes with defaults");
+        assert_eq!(restored.identity_key_version, 1, "missing version defaults to 1");
+        assert!(restored.rotation_signature.is_none());
+
+        // A new bundle with both TOFU fields set round-trips exactly.
+        let mut rotated = bundle.clone();
+        rotated.identity_key_version = 3;
+        rotated.rotation_signature = Some([0x55; 64]);
+        let json = serde_json::to_string(&rotated).expect("rotated bundle serializes");
+        let back: X3DHPublicBundle = serde_json::from_str(&json).expect("rotated bundle round-trips");
+        assert_eq!(back.identity_key_version, 3);
+        assert_eq!(back.rotation_signature, Some([0x55; 64]));
+    }
+
+    #[test]
+    fn responder_publishes_version_1_by_default() {
+        // A fresh server always publishes version=1 with no rotation
+        // signature. Rotation ceremony via the CLI patches the bundle
+        // after construction (see rvpn-server prekey_bundle()).
+        let responder = X3DHResponder::new();
+        let bundle = responder.get_public_bundle();
+        assert_eq!(bundle.identity_key_version, 1);
+        assert!(bundle.rotation_signature.is_none());
+    }
+
     #[test]
     fn test_x3dh_handshake() {
         // Create responder (server)
@@ -511,6 +590,8 @@ mod tests {
             signed_prekey: server_bundle_full.signed_prekey,
             prekey_signature: server_bundle_full.prekey_signature,
             one_time_prekey: server_bundle_full.one_time_prekey,
+            identity_key_version: server_bundle_full.identity_key_version,
+            rotation_signature: server_bundle_full.rotation_signature,
         };
 
         // Create initiator (client)

@@ -13,20 +13,21 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 
 use anyhow::{Context as _, Result};
+use bytes::Bytes;
 use rand::{Rng, SeedableRng};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, trace, warn};
 
-use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
+use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
 use rvpn_core::protocol::{ControlMessage, HandshakeMessage, MultiplexedFrame, PayloadType};
 
 use crate::config::ServerIdentityConfig;
 use crate::identity_verification::{verify_server_identity, KnownHosts};
-use crate::tls_boring::TlsFingerprint;
 use crate::websocket::{
     connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter,
 };
+use rvpn_tls::TlsFingerprint;
 
 // ── Internal types ──────────────────────────────────────────────────
 
@@ -37,8 +38,10 @@ struct PendingFlow {
 
 /// Server-side state for an active flow
 struct FlowState {
-    /// Sender for WS -> local data (feeds the Socks5Flow receiver)
-    ws_to_local_tx: mpsc::Sender<Vec<u8>>,
+    /// Sender for WS -> local data (feeds the Socks5Flow receiver).
+    /// Uses Bytes so payloads sliced out of the decrypted plaintext can be
+    /// forwarded without allocating a fresh Vec per received frame.
+    ws_to_local_tx: mpsc::Sender<Bytes>,
 }
 
 // ── Public types ────────────────────────────────────────────────────
@@ -62,8 +65,9 @@ pub struct Socks5Flow {
     pub flow_id: u32,
     /// Local TCP -> WS sender (taken out for relay, None after)
     local_to_ws_tx: Option<mpsc::Sender<Vec<u8>>>,
-    /// WS -> local TCP receiver (taken out for relay, None after)
-    ws_to_local_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    /// WS -> local TCP receiver (taken out for relay, None after).
+    /// Carries Bytes (zero-copy view over the decrypted plaintext).
+    ws_to_local_rx: Option<mpsc::Receiver<Bytes>>,
     tunnel: Weak<Socks5Tunnel>,
 }
 
@@ -74,7 +78,7 @@ impl Socks5Flow {
     }
 
     /// Take the receive channel, consuming this part of the flow
-    pub fn take_recv(&mut self) -> Option<mpsc::Receiver<Vec<u8>>> {
+    pub fn take_recv(&mut self) -> Option<mpsc::Receiver<Bytes>> {
         self.ws_to_local_rx.take()
     }
 }
@@ -82,21 +86,26 @@ impl Socks5Flow {
 impl Socks5Flow {
     #[allow(dead_code)]
     pub async fn send_data(&self, data: &[u8]) -> Result<()> {
-        let tx = self.local_to_ws_tx.as_ref()
+        let tx = self
+            .local_to_ws_tx
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Flow send channel already taken"))?;
-        tx.send(data.to_vec()).await
+        tx.send(data.to_vec())
+            .await
             .map_err(|_| anyhow::anyhow!("Flow send channel closed"))
     }
 
     #[allow(dead_code)]
-    pub async fn recv_data(&mut self) -> Option<Vec<u8>> {
+    pub async fn recv_data(&mut self) -> Option<Bytes> {
         self.ws_to_local_rx.as_mut()?.recv().await
     }
 }
 
 impl Drop for Socks5Flow {
     fn drop(&mut self) {
-        let Some(tunnel) = self.tunnel.upgrade() else { return };
+        let Some(tunnel) = self.tunnel.upgrade() else {
+            return;
+        };
         let ws_writer = tunnel.ws_writer.clone();
         let ratchet = Arc::clone(&tunnel.ratchet);
         let flow_id = self.flow_id;
@@ -145,7 +154,10 @@ impl Socks5Tunnel {
         server_bundle: &X3DHPublicBundle,
         server_identity_config: Option<&ServerIdentityConfig>,
     ) -> Result<Arc<Self>> {
-        info!("Connecting SOCKS5 multiplexed tunnel to {}:{}{}", host, port, path);
+        info!(
+            "Connecting SOCKS5 multiplexed tunnel to {}:{}{}",
+            host, port, path
+        );
 
         debug!("WebSocket path for mux tunnel: {}", path);
         let ws_stream = connect_websocket(host, port, path, fingerprint, sni_hostname)
@@ -208,7 +220,10 @@ impl Socks5Tunnel {
                         flow_id
                     )));
                 }
-                debug!("Cleared {} pending flow ACKs after tunnel disconnect", count);
+                debug!(
+                    "Cleared {} pending flow ACKs after tunnel disconnect",
+                    count
+                );
             }
         });
 
@@ -223,7 +238,8 @@ impl Socks5Tunnel {
             async move {
                 let mut rng = rand::rngs::StdRng::from_entropy();
                 // Random initial delay to avoid burst at connection start
-                tokio::time::sleep(std::time::Duration::from_millis(rng.gen_range(3000..=7000))).await;
+                tokio::time::sleep(std::time::Duration::from_millis(rng.gen_range(3000..=7000)))
+                    .await;
                 while tunnel.alive.load(Ordering::SeqCst) {
                     let timestamp = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -233,17 +249,23 @@ impl Socks5Tunnel {
                     match MultiplexedFrame::new_control(&msg) {
                         Ok(frame) => {
                             if let Ok(encoded) = frame.encode() {
-                                let padded = match rvpn_core::protocol::padding::pad_packet(&encoded) {
-                                    Ok(p) => p,
-                                    Err(e) => { debug!("Keepalive pad failed: {}", e); break; }
-                                };
+                                let padded =
+                                    match rvpn_core::protocol::padding::pad_packet(&encoded) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            debug!("Keepalive pad failed: {}", e);
+                                            break;
+                                        }
+                                    };
                                 let encrypted = {
                                     let mut g = tunnel.ratchet.lock().await;
                                     g.encrypt(&padded, &[PayloadType::Admin as u8])
                                 };
                                 match encrypted {
                                     Ok(ciphertext) => {
-                                        let _ = tunnel.ws_writer.send(Message::Binary(ciphertext.to_bytes().unwrap_or_default()));
+                                        let _ = tunnel.ws_writer.send(Message::Binary(
+                                            ciphertext.to_bytes().unwrap_or_default(),
+                                        ));
                                     }
                                     Err(e) => {
                                         debug!("Keepalive encrypt failed: {}", e);
@@ -289,10 +311,13 @@ impl Socks5Tunnel {
             session_token: None,
             connection_nonce: None,
         };
-        ws_writer.send(Message::Binary(serde_json::to_vec(&hello)?))
+        ws_writer
+            .send(Message::Binary(serde_json::to_vec(&hello)?))
             .context("Failed to send Hello")?;
 
-        let response = ws_reader.recv().await
+        let response = ws_reader
+            .recv()
+            .await
             .ok_or_else(|| anyhow::anyhow!("WebSocket closed during handshake"))?;
 
         let data = match response {
@@ -301,8 +326,8 @@ impl Socks5Tunnel {
             other => anyhow::bail!("Unexpected message during handshake: {:?}", other),
         };
 
-        let server_hello: HandshakeMessage = serde_json::from_slice(&data)
-            .context("Failed to parse ServerHello")?;
+        let server_hello: HandshakeMessage =
+            serde_json::from_slice(&data).context("Failed to parse ServerHello")?;
 
         match server_hello {
             HandshakeMessage::ServerHello {
@@ -311,11 +336,17 @@ impl Socks5Tunnel {
                 signed_prekey: server_signed_prekey,
                 prekey_signature: server_prekey_signature,
             } => {
-                let srv_id: [u8; 32] = server_identity_key.as_slice().try_into()
+                let srv_id: [u8; 32] = server_identity_key
+                    .as_slice()
+                    .try_into()
                     .map_err(|_| anyhow::anyhow!("Server identity key wrong length"))?;
-                let srv_sp: [u8; 32] = server_signed_prekey.as_slice().try_into()
+                let srv_sp: [u8; 32] = server_signed_prekey
+                    .as_slice()
+                    .try_into()
                     .map_err(|_| anyhow::anyhow!("Server signed prekey wrong length"))?;
-                let sig: [u8; 64] = server_prekey_signature.as_slice().try_into()
+                let sig: [u8; 64] = server_prekey_signature
+                    .as_slice()
+                    .try_into()
                     .map_err(|_| anyhow::anyhow!("Prekey signature wrong length"))?;
 
                 // Verify Ed25519 signature
@@ -335,24 +366,35 @@ impl Socks5Tunnel {
                     signed_prekey: srv_sp,
                     prekey_signature: sig,
                     one_time_prekey: None,
+                    identity_key_version: server_bundle.identity_key_version,
+                    rotation_signature: server_bundle.rotation_signature,
                 };
 
-                // Optional identity verification
+                // Optional identity verification. Load-mutate-save the
+                // known_hosts file so a TOFU capture on first connect
+                // and a legacy-to-canonical pin migration on subsequent
+                // connects both persist without a caller-side rewrite.
                 if let Some(cfg) = server_identity_config {
                     let addr = format!("{}:{}", host, port);
-                    let known = KnownHosts::load(&cfg.known_hosts_file).unwrap_or_default();
+                    let mut known = KnownHosts::load(&cfg.known_hosts_file).unwrap_or_default();
                     let (_res, ok) = verify_server_identity(
-                        &addr, &bundle, &known,
+                        &addr,
+                        &bundle,
+                        &mut known,
                         cfg.fingerprint.as_deref(),
                         cfg.trust_on_first_use,
                         cfg.strict_mode,
                     );
+                    if let Err(e) = known.save(&cfg.known_hosts_file) {
+                        tracing::warn!("Failed to persist known_hosts.json: {}", e);
+                    }
                     if !ok && cfg.strict_mode {
                         anyhow::bail!("Server identity verification failed");
                     }
                 }
 
-                let (shared, _) = initiator.agree(&bundle)
+                let (shared, _) = initiator
+                    .agree(&bundle)
                     .context("X3DH key agreement failed")?;
                 let ratchet = DoubleRatchet::init_alice(shared, [0u8; 32]);
                 Ok(ratchet)
@@ -395,10 +437,13 @@ impl Socks5Tunnel {
         }
 
         self.send_create_flow(flow_id, target, port).await?;
-        debug!("Flow {} CreateFlow sent (0-RTT mode — not waiting for ACK)", flow_id);
+        debug!(
+            "Flow {} CreateFlow sent (0-RTT mode — not waiting for ACK)",
+            flow_id
+        );
 
         let (local_to_ws_tx, local_to_ws_rx) = mpsc::channel::<Vec<u8>>(256);
-        let (ws_to_local_tx, ws_to_local_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (ws_to_local_tx, ws_to_local_rx) = mpsc::channel::<Bytes>(256);
 
         {
             let mut states = self.flow_states.lock().await;
@@ -408,7 +453,9 @@ impl Socks5Tunnel {
         let ws_writer = self.ws_writer.clone();
         let ratchet = Arc::clone(&self.ratchet);
         tokio::spawn(async move {
-            if let Err(e) = Self::flow_to_ws_loop(flow_id, local_to_ws_rx, &ws_writer, &ratchet).await {
+            if let Err(e) =
+                Self::flow_to_ws_loop(flow_id, local_to_ws_rx, &ws_writer, &ratchet).await
+            {
                 debug!("Flow {} -> WS loop ended: {}", flow_id, e);
             }
         });
@@ -460,15 +507,15 @@ impl Socks5Tunnel {
             // the WebSocket reader may block forever without an error.
             // 21s = 3x max keepalive interval (7s), gives generous buffer for
             // network hiccups while still detecting dead connections promptly.
-            let msg = tokio::time::timeout(
-                std::time::Duration::from_secs(21),
-                ws_reader.recv()
-            ).await;
+            let msg =
+                tokio::time::timeout(std::time::Duration::from_secs(21), ws_reader.recv()).await;
 
             let msg = match msg {
                 Ok(Some(m)) => m,
                 Ok(None) => anyhow::bail!("WebSocket closed"),
-                Err(_) => anyhow::bail!("WebSocket receive timeout (21s) — connection appears dead"),
+                Err(_) => {
+                    anyhow::bail!("WebSocket receive timeout (21s) — connection appears dead")
+                }
             };
 
             // If tunnel was marked dead externally (e.g. FlowCreated timeout),
@@ -481,12 +528,18 @@ impl Socks5Tunnel {
                 Message::Binary(d) => d,
                 Message::Ping(_) | Message::Pong(_) => continue,
                 Message::Close(_) => anyhow::bail!("Server closed connection"),
-                other => { warn!("Unexpected mux msg: {:?}", other); continue; },
+                other => {
+                    warn!("Unexpected mux msg: {:?}", other);
+                    continue;
+                }
             };
 
             let message = match rvpn_core::crypto::RatchetMessage::from_bytes(&data) {
                 Ok(m) => m,
-                Err(e) => { warn!("Bad RatchetMessage: {}", e); continue; },
+                Err(e) => {
+                    warn!("Bad RatchetMessage: {}", e);
+                    continue;
+                }
             };
 
             let plaintext = {
@@ -503,8 +556,11 @@ impl Socks5Tunnel {
                         // Ratchet desync is unrecoverable — the mux tunnel
                         // cannot decrypt any more messages. Mark dead and
                         // bail so the next open_flow triggers a reconnect.
-                        error!("Ratchet desync on mux tunnel: {:?} — marking tunnel dead (age {:.1}s)",
-                               e, self.tunnel_age().as_secs_f64());
+                        error!(
+                            "Ratchet desync on mux tunnel: {:?} — marking tunnel dead (age {:.1}s)",
+                            e,
+                            self.tunnel_age().as_secs_f64()
+                        );
                         self.alive.store(false, Ordering::SeqCst);
 
                         // Fail all pending FlowCreated oneshots immediately
@@ -525,7 +581,10 @@ impl Socks5Tunnel {
 
             let unpadded = match rvpn_core::protocol::padding::unpad_packet(&plaintext) {
                 Ok(d) => d,
-                Err(e) => { warn!("Unpad fail: {}", e); continue; },
+                Err(e) => {
+                    warn!("Unpad fail: {}", e);
+                    continue;
+                }
             };
 
             if unpadded.len() < 6 {
@@ -537,16 +596,23 @@ impl Socks5Tunnel {
             let plen = u16::from_be_bytes([unpadded[4], unpadded[5]]) as usize;
 
             if unpadded.len() < 6 + plen {
-                warn!("Frame truncated: need {}, have {}", 6 + plen, unpadded.len());
+                warn!(
+                    "Frame truncated: need {}, have {}",
+                    6 + plen,
+                    unpadded.len()
+                );
                 continue;
             }
 
-            let payload = &unpadded[6..6 + plen];
-
             if flow_id == 0 {
-                self.handle_control_message(payload).await;
+                self.handle_control_message(&unpadded[6..6 + plen]).await;
             } else {
-                self.dispatch_data_frame(flow_id, payload.to_vec()).await;
+                // Zero-copy: Bytes::from(unpadded) transfers ownership of the
+                // Vec's allocation (no memcpy), and slice() returns a refcount
+                // view over the same buffer — avoiding the per-frame Vec
+                // allocation that .to_vec() would incur.
+                let payload = Bytes::from(unpadded).slice(6..6 + plen);
+                self.dispatch_data_frame(flow_id, payload).await;
             }
         }
     }
@@ -574,7 +640,8 @@ impl Socks5Tunnel {
                 ControlMessage::FlowFailed { flow_id, error } => {
                     warn!("FlowFailed {}: {}", flow_id, error);
                     if let Some(p) = self.pending_flows.lock().await.remove(&flow_id) {
-                        let _ = p.tx.send(Err(anyhow::anyhow!("Server rejected: {}", error)));
+                        let _ =
+                            p.tx.send(Err(anyhow::anyhow!("Server rejected: {}", error)));
                     }
                     // In 0-RTT mode, the caller may already be sending data.
                     // Close the flow state so the relay loop exits cleanly.
@@ -584,25 +651,24 @@ impl Socks5Tunnel {
                     trace!("Server sent CloseFlow {}", flow_id);
                     self.flow_states.lock().await.remove(&flow_id);
                 }
-                _ => {},
+                _ => {}
             }
         }
     }
 
-    async fn dispatch_data_frame(&self, flow_id: u32, data: Vec<u8>) {
+    async fn dispatch_data_frame(&self, flow_id: u32, data: Bytes) {
         let states = self.flow_states.lock().await;
         if let Some(state) = states.get(&flow_id) {
             // Use try_send to avoid blocking the receive loop when a flow's
             // consumer is slow (e.g. large Gemini response, Instagram images).
-            // If the channel is full, spawn a background task to deliver the
-            // data so the receive loop can continue dispatching to other flows.
+            // If the channel is full, drop the data rather than spawning a
+            // background task per packet. Spawning tasks under backpressure
+            // causes unbounded memory growth — each task holds a Vec<u8>
+            // that isn't freed until the consumer catches up.
             match state.ws_to_local_tx.try_send(data) {
                 Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-                    let tx = state.ws_to_local_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = tx.send(data).await;
-                    });
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    trace!("Flow {} channel full, dropping frame", flow_id);
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     trace!("Flow {} receiver dropped, cleaning up", flow_id);
@@ -653,12 +719,14 @@ pub async fn handle_multiplexed_connection(
     // (SOCKS5 reply or HTTP 200) before calling this function.
 
     // Parse target
-    let (host, port) = target_addr.rsplit_once(':')
+    let (host, port) = target_addr
+        .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("Invalid target format"))?;
-    let port: u16 = port.parse()
-        .map_err(|_| anyhow::anyhow!("Invalid port"))?;
+    let port: u16 = port.parse().map_err(|_| anyhow::anyhow!("Invalid port"))?;
 
-    let mut flow = tunnel.open_flow(host, port).await
+    let mut flow = tunnel
+        .open_flow(host, port)
+        .await
         .context("Failed to open multiplexed flow")?;
 
     debug!("Flow {} opened to {}:{}", flow.flow_id, host, port);

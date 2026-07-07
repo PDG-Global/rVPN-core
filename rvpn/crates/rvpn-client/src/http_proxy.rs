@@ -24,7 +24,7 @@ use rvpn_core::crypto::{IdentityKey, X3DHPublicBundle};
 use crate::config::{ClientConfig, HttpProxyConfig, ServerIdentityConfig};
 use crate::proxy_common::{self, ProxyHandle};
 use crate::split_tunnel::{RoutingDecision, SplitTunnel};
-use crate::tls_boring::TlsFingerprint;
+use rvpn_tls::TlsFingerprint;
 use crate::socks5_tunnel::Socks5Tunnel;
 use crate::dns_cache::DnsResolver;
 

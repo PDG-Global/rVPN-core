@@ -63,7 +63,15 @@ async fn main() -> Result<()> {
     if let Some(cmd) = args.command {
         match cmd.as_str() {
             "keygen" => return keygen(&config, args.output),
-            "prekey-bundle" => return prekey_bundle(&config, args.identity, args.output),
+            "prekey-bundle" => {
+                return prekey_bundle(
+                    &config,
+                    args.identity,
+                    args.output,
+                    args.rotate_from,
+                    args.from_version,
+                )
+            }
             _ => {}
         }
     }
@@ -526,6 +534,15 @@ struct Args {
     command: Option<String>,
     identity: Option<PathBuf>,
     output: Option<PathBuf>,
+    /// `prekey-bundle --rotate-from <path>`: path to the *previous* identity
+    /// key file. When present, the new bundle carries a rotation signature
+    /// authored by that previous identity, letting already-pinned clients
+    /// silently accept the new identity.
+    rotate_from: Option<PathBuf>,
+    /// `prekey-bundle --from-version N`: the version number the previous
+    /// bundle published. The new bundle will carry `N + 1`. Required when
+    /// `--rotate-from` is set. See dev_docs/specs/TOFU_FINGERPRINT.md §6.
+    from_version: Option<u32>,
     verbose: u8,
     help: bool,
 }
@@ -537,6 +554,8 @@ fn parse_args() -> Args {
         command: None,
         identity: None,
         output: None,
+        rotate_from: None,
+        from_version: None,
         verbose: 0,
         help: false,
     };
@@ -574,6 +593,24 @@ fn parse_args() -> Args {
                     args.output = Some(PathBuf::from(&argv[i]));
                 }
             }
+            "--rotate-from" => {
+                i += 1;
+                if i < argv.len() {
+                    args.rotate_from = Some(PathBuf::from(&argv[i]));
+                }
+            }
+            "--from-version" => {
+                i += 1;
+                if i < argv.len() {
+                    match argv[i].parse::<u32>() {
+                        Ok(v) => args.from_version = Some(v),
+                        Err(_) => {
+                            eprintln!("--from-version expects a non-negative integer");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -597,11 +634,27 @@ fn print_help() {
     println!("  keygen               Generate server identity key");
     println!("  prekey-bundle        Generate prekey bundle");
     println!();
+    println!("Prekey bundle options:");
+    println!("  --identity FILE      Identity key file to sign the bundle with");
+    println!("  -o, --output FILE    Where to write the bundle JSON");
+    println!("  --rotate-from FILE   Path to the PREVIOUS identity key. When set,");
+    println!("                       the new bundle carries a rotation signature");
+    println!("                       authored by that identity — already-pinned");
+    println!("                       clients accept the rotation silently.");
+    println!("  --from-version N     Version number the previous bundle published.");
+    println!("                       The new bundle will carry N+1. Required with");
+    println!("                       --rotate-from.");
+    println!();
     println!("Examples:");
     println!("  rvpn-server                          # Run with default config");
     println!("  rvpn-server -c /etc/rvpn/server.toml # Use specific config");
     println!("  rvpn-server keygen                   # Generate identity key");
     println!("  rvpn-server prekey-bundle --identity server.key --output bundle.json");
+    println!("  rvpn-server prekey-bundle \\           # Rotate to a new identity");
+    println!("      --identity new_identity.key \\");
+    println!("      --output bundle.json \\");
+    println!("      --rotate-from old_identity.key \\");
+    println!("      --from-version 1");
 }
 
 async fn load_config(path: &PathBuf) -> ServerConfig {
@@ -639,8 +692,15 @@ fn keygen(config: &ServerConfig, output_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn prekey_bundle(config: &ServerConfig, identity_path: Option<PathBuf>, output_path: Option<PathBuf>) -> Result<()> {
-    use rvpn_core::crypto::{IdentityKey, X3DHResponder};
+fn prekey_bundle(
+    config: &ServerConfig,
+    identity_path: Option<PathBuf>,
+    output_path: Option<PathBuf>,
+    rotate_from: Option<PathBuf>,
+    from_version: Option<u32>,
+) -> Result<()> {
+    use rvpn_core::crypto::{IdentityKey, Signer, X3DHResponder};
+    use rvpn_core::identity_pin::rotation_signature_message;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use serde::Serialize;
 
@@ -652,8 +712,56 @@ fn prekey_bundle(config: &ServerConfig, identity_path: Option<PathBuf>, output_p
 
     let identity = IdentityKey::load(&identity_path)?;
     let responder = X3DHResponder::from_identity(identity);
-    let bundle = responder.get_public_bundle();
+    let mut bundle = responder.get_public_bundle();
 
+    // Rotation ceremony (see dev_docs/specs/TOFU_FINGERPRINT.md §6).
+    //
+    // Two paths:
+    //   - Neither flag set: this is a first-ever bundle. Publish
+    //     identity_key_version = 1 and rotation_signature = None. Clients
+    //     doing TOFU capture pin whatever identity key is in this bundle.
+    //   - Both flags set: this is a rotation. Load the *previous*
+    //     identity's SigningKey, bump the version, sign
+    //     `new_identity_pub || new_version_le` with the previous key. A
+    //     client that already pinned the previous identity_key_version
+    //     can silently update its pin via
+    //     `rvpn_core::identity_pin::verify_rotation_signature`.
+    //
+    // We refuse mixed states (one flag but not the other) — the operator
+    // has to be explicit about which version they're rotating from.
+    match (rotate_from, from_version) {
+        (None, None) => {
+            info!("Bundle publishes identity_key_version=1 with no rotation signature (initial deployment)");
+        }
+        (Some(prev_path), Some(prev_ver)) => {
+            let prev_identity = IdentityKey::load(&prev_path)?;
+            let new_version = prev_ver
+                .checked_add(1)
+                .context("Version rollover past u32::MAX not supported")?;
+            let msg = rotation_signature_message(
+                bundle.identity_key.as_slice(),
+                new_version,
+            );
+            let sig = prev_identity.signing_key.sign(&msg);
+            bundle.identity_key_version = new_version;
+            bundle.rotation_signature = Some(sig.to_bytes());
+            info!(
+                "Bundle publishes identity_key_version={} with rotation signature by previous identity {:?}",
+                new_version, prev_path
+            );
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "--rotate-from and --from-version must be supplied together \
+                 (see dev_docs/specs/TOFU_FINGERPRINT.md §6)"
+            );
+        }
+    }
+
+    // BundleJson mirrors the on-disk shape of X3DHPublicBundle field-for-field
+    // rather than serializing the struct itself; we use plain base64 strings
+    // per the historical bundle format, not the strongly-typed serde codec
+    // that X3DHPublicBundle uses at rest.
     #[derive(Serialize)]
     struct BundleJson {
         identity_key: String,
@@ -661,6 +769,8 @@ fn prekey_bundle(config: &ServerConfig, identity_path: Option<PathBuf>, output_p
         signed_prekey: String,
         prekey_signature: String,
         one_time_prekey: Option<String>,
+        identity_key_version: u32,
+        rotation_signature: Option<String>,
     }
 
     let json = serde_json::to_string_pretty(&BundleJson {
@@ -669,6 +779,8 @@ fn prekey_bundle(config: &ServerConfig, identity_path: Option<PathBuf>, output_p
         signed_prekey: BASE64.encode(bundle.signed_prekey),
         prekey_signature: BASE64.encode(bundle.prekey_signature),
         one_time_prekey: bundle.one_time_prekey.map(|k| BASE64.encode(k)),
+        identity_key_version: bundle.identity_key_version,
+        rotation_signature: bundle.rotation_signature.map(|sig| BASE64.encode(sig)),
     })?;
 
     std::fs::write(&output_path, json)?;
@@ -677,18 +789,18 @@ fn prekey_bundle(config: &ServerConfig, identity_path: Option<PathBuf>, output_p
     // Also save the private key
     let private_key = responder.get_signed_prekey_private();
     let private_output_path = output_path.with_extension("private.json");
-    
+
     #[derive(Serialize)]
     struct PrivateKeyJson {
         signed_prekey_private: String,
     }
-    
+
     let private_json = serde_json::to_string_pretty(&PrivateKeyJson {
         signed_prekey_private: BASE64.encode(private_key),
     })?;
-    
+
     std::fs::write(&private_output_path, private_json)?;
     info!("Generated private key: {:?}", private_output_path);
-    
+
     Ok(())
 }

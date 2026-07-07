@@ -23,7 +23,7 @@ use rvpn_core::protocol::{ControlMessage, HandshakeMessage, MultiplexedFrame, Pa
 
 use crate::config::ServerIdentityConfig;
 use crate::identity_verification::{verify_server_identity, KnownHosts, VerificationResult};
-use crate::tls_boring::TlsFingerprint;
+use rvpn_tls::TlsFingerprint;
 use crate::websocket::{
     connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter,
 };
@@ -269,13 +269,17 @@ impl VpnTunnel {
                             signed_prekey: server_signed_prekey,
                             prekey_signature,
                             one_time_prekey: None,
+                            identity_key_version: 1,
+                            rotation_signature: None,
                         };
 
                         // Verify server identity if configured
                         let server_addr = format!("{}:{}", host, port);
 
-                        // Load known hosts
-                        let known_hosts =
+                        // Load known hosts (mut — verify_server_identity
+                        // now writes canonical pins on TOFU capture and
+                        // migrates legacy hex entries in-place).
+                        let mut known_hosts =
                             KnownHosts::load(&server_identity_config.known_hosts_file)
                                 .unwrap_or_default();
 
@@ -287,17 +291,25 @@ impl VpnTunnel {
                             signed_prekey: server_signed_prekey,
                             prekey_signature,
                             one_time_prekey: None,
+                            identity_key_version: 1,
+                            rotation_signature: None,
                         };
 
                         // Verify the server identity
                         let (result, should_proceed) = verify_server_identity(
                             &server_addr,
                             &received_bundle,
-                            &known_hosts,
+                            &mut known_hosts,
                             server_identity_config.fingerprint.as_deref(),
                             server_identity_config.trust_on_first_use,
                             server_identity_config.strict_mode,
                         );
+
+                        // Persist any mutations (TOFU capture, legacy
+                        // pin migration, last_verified bump).
+                        if let Err(e) = known_hosts.save(&server_identity_config.known_hosts_file) {
+                            warn!("Failed to persist known_hosts.json: {}", e);
+                        }
 
                         match result {
                             VerificationResult::Verified => {
@@ -305,14 +317,6 @@ impl VpnTunnel {
                             }
                             VerificationResult::New => {
                                 info!("New server identity, accepting (TOFU mode)");
-                                // Save to known hosts if TOFU is enabled
-                                if server_identity_config.trust_on_first_use {
-                                    let mut hosts = known_hosts;
-                                    let fingerprint =
-                                        hex::encode(&received_bundle.identity_key[..16]);
-                                    hosts.add_server(server_addr.clone(), fingerprint);
-                                    let _ = hosts.save(&server_identity_config.known_hosts_file);
-                                }
                             }
                             VerificationResult::Mismatch { expected, got } => {
                                 if server_identity_config.strict {

@@ -1,0 +1,54 @@
+[package]
+name = "rvpn-tls"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+description = "R-VPN TLS implementation with Chrome fingerprint mimicry"
+
+[lib]
+name = "rvpn_tls"
+path = "src/lib.rs"
+
+[dependencies]
+# Async
+tokio = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization (for TlsFingerprint serde)
+serde = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Networking (TCP keepalive helper, used by both backends)
+socket2 = "0.5"
+
+# --- Backend: BoringSSL (Chrome TLS fingerprint mimicry) ---
+# Default for desktop + macOS. Excluded on iOS (leak in BoringSSL's SSL_read).
+boring = { workspace = true, optional = true }
+tokio-boring = { workspace = true, optional = true }
+
+# --- Backend: rustls (generic ClientHello, mimalloc-tracked) ---
+# Used by iOS. Android uses rustls inline in rvpn-mobile, not via this crate.
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+# --- Backend: native-tls (platform TLS via Security.framework on iOS/macOS) ---
+# Proof-of-concept for iOS: uses Apple's own TLS, eliminating BoringSSL entirely.
+# Cert verification goes through trustd (system trust store) — no bundled CA certs.
+native-tls = { version = "0.2", features = ["alpn"], optional = true }
+tokio-native-tls = { version = "0.3", optional = true }
+
+[features]
+# Default keeps current behavior: desktop client (rvpn-client) and macOS use boring.
+default = ["boring"]
+boring = ["dep:boring", "dep:tokio-boring"]
+rustls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
+native-tls = ["dep:native-tls", "dep:tokio-native-tls"]

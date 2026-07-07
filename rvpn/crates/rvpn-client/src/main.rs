@@ -23,7 +23,7 @@ mod socks5_tunnel;
 mod split_tunnel;
 mod stats;
 mod stream_relay;
-mod tls_boring;
+// TLS re-exported from rvpn-tls crate
 mod tun;
 mod tunnel;
 mod websocket;
@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
         config.prekey_bundle = Some(bundle);
     }
     if let Some(fingerprint) = args.fingerprint {
-        if let Some(fp) = tls_boring::fingerprint_from_str(&fingerprint) {
+        if let Some(fp) = rvpn_tls::fingerprint_from_str(&fingerprint) {
             config.tls_fingerprint = fp;
         }
     }

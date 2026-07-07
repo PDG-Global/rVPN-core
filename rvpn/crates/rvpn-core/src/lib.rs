@@ -9,6 +9,7 @@
 pub mod crypto;
 pub mod error;
 pub mod frame_padding;
+pub mod identity_pin;
 pub mod protocol;
 pub mod routing;
 

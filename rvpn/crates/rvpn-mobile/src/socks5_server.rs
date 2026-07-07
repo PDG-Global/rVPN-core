@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 // Split tunnel imports
-use crate::split_tunnel::{SplitTunnel, RoutingDecision};
+use rvpn_split_tunnel::{SplitTunnel, RoutingDecision};
 
 /// UDP idle timeout duration (5 minutes)
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -268,7 +268,7 @@ pub struct Socks5ServerConfig {
     /// Listen address
     pub listen_addr: SocketAddr,
     /// Split tunnel configuration
-    pub split_tunnel: Option<crate::split_tunnel::SplitTunnelConfig>,
+    pub split_tunnel: Option<rvpn_split_tunnel::SplitTunnelConfig>,
     /// DNS server configuration for split tunnel routing
     pub dns_config: Option<DnsConfig>,
 }
@@ -322,7 +322,7 @@ impl Socks5Server {
                 info!("  - Block ads: {}", st_config.block_ads);
                 info!("  - Inline bypass networks: {:?}", st_config.bypass_networks);
                 
-                let dns_resolver = std::sync::Arc::new(rvpn_client::dns_cache::DnsResolver::new(true, 14400, 1000, false, true, vec![]));
+                let dns_resolver = std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![]));
                 dns_resolver.start_cleanup_task();
                 match SplitTunnel::new(st_config.clone(), dns_resolver).await {
                     Ok(st) => {
@@ -1438,7 +1438,7 @@ mod tests {
     /// Integration test for split tunnel DNS routing
     #[tokio::test]
     async fn test_split_tunnel_dns_routing() {
-        use crate::split_tunnel::SplitTunnelConfig;
+        use rvpn_split_tunnel::SplitTunnelConfig;
         
         // Create a split tunnel config with CN bypass
         let config = SplitTunnelConfig {
@@ -1448,7 +1448,7 @@ mod tests {
             ..Default::default()
         };
         
-        let split_tunnel = SplitTunnel::new(config, std::sync::Arc::new(rvpn_client::dns_cache::DnsResolver::new(true, 14400, 1000, false, true, vec![]))).await.unwrap();
+        let split_tunnel = SplitTunnel::new(config, std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![]))).await.unwrap();
 
         // Test China domain should bypass
         let routing = split_tunnel.decide_by_host("www.baidu.com").await;
@@ -1474,7 +1474,7 @@ mod tests {
     /// Test DNS forwarder creation
     #[tokio::test]
     async fn test_dns_forwarder_creation() {
-        use crate::split_tunnel::SplitTunnelConfig;
+        use rvpn_split_tunnel::SplitTunnelConfig;
         
         let dns_config = DnsConfig::default();
         let (response_tx, _response_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(10);
@@ -1490,7 +1490,7 @@ mod tests {
             block_ads: false,
             ..Default::default()
         };
-        let split_tunnel = SplitTunnel::new(config, std::sync::Arc::new(rvpn_client::dns_cache::DnsResolver::new(true, 14400, 1000, false, true, vec![]))).await.unwrap();
+        let split_tunnel = SplitTunnel::new(config, std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![]))).await.unwrap();
 
         let forwarder = DnsForwarder::new(dns_config, Some(Arc::new(split_tunnel)), response_tx).await;
         assert!(forwarder.is_ok(), "DNS forwarder should be created with split tunnel");
@@ -1499,7 +1499,7 @@ mod tests {
     /// Test DNS forwarder routing decision
     #[tokio::test]
     async fn test_dns_forwarder_routing() {
-        use crate::split_tunnel::SplitTunnelConfig;
+        use rvpn_split_tunnel::SplitTunnelConfig;
         
         let dns_config = DnsConfig {
             tunnel_dns: vec!["1.1.1.1".to_string()],
@@ -1512,7 +1512,7 @@ mod tests {
             block_ads: false,
             ..Default::default()
         };
-        let split_tunnel = SplitTunnel::new(config, std::sync::Arc::new(rvpn_client::dns_cache::DnsResolver::new(true, 14400, 1000, false, true, vec![]))).await.unwrap();
+        let split_tunnel = SplitTunnel::new(config, std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![]))).await.unwrap();
 
         let (response_tx, _response_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(10);
         let forwarder = DnsForwarder::new(dns_config, Some(Arc::new(split_tunnel)), response_tx).await.unwrap();

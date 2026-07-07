@@ -19,11 +19,12 @@ path = "src/main.rs"
 
 [dependencies]
 rvpn-core = { path = "../rvpn-core" }
+rvpn-tls = { path = "../rvpn-tls" }
+rvpn-split-tunnel = { path = "../rvpn-split-tunnel" }
 
 # Crypto (for direct key handling)
 ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
-ring.workspace = true
 subtle.workspace = true
 
 # Async
@@ -35,12 +36,7 @@ futures.workspace = true
 tokio-tungstenite.workspace = true
 tungstenite.workspace = true
 
-# TLS
-rustls.workspace = true
-tokio-rustls.workspace = true
-rustls-pemfile.workspace = true
-rustls-platform-verifier.workspace = true
-webpki-roots = "0.26"
+# TLS - rvpn-tls provides boring (desktop/macOS) and rustls (iOS) backends
 
 # SOCKS5 Proxy
 fast-socks5.workspace = true
@@ -56,9 +52,6 @@ socket2 = "0.5"
 # Data structures
 radix_trie.workspace = true
 lru.workspace = true
-
-# HTTP client
-reqwest.workspace = true
 
 # Serialization
 serde.workspace = true

@@ -12,20 +12,31 @@ use futures::SinkExt;
 use futures::StreamExt;
 use futures_util::stream::SplitSink;
 use std::sync::Arc;
-use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use tokio::net::TcpStream;
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 use tracing::{debug, info};
-use tungstenite::handshake::client::generate_key;
 
 use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
 use rvpn_core::protocol::HandshakeMessage;
 
-use rvpn_client::TlsFingerprint;
+use rvpn_tls::TlsFingerprint;
 
-/// WebSocket writer type
-type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
-type WsStream = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+/// WebSocket reader/writer types — TLS backend selected by platform feature.
+#[cfg(feature = "macos-direct-tun")]
+type WsSink = SplitSink<WebSocketStream<rvpn_tls::ChromeTlsStream>, Message>;
+#[cfg(feature = "macos-direct-tun")]
+type WsStream = futures_util::stream::SplitStream<WebSocketStream<rvpn_tls::ChromeTlsStream>>;
+
+#[cfg(feature = "ios-direct-tun")]
+type WsSink = SplitSink<WebSocketStream<rvpn_tls::RustlsTlsStream>, Message>;
+#[cfg(feature = "ios-direct-tun")]
+type WsStream = futures_util::stream::SplitStream<WebSocketStream<rvpn_tls::RustlsTlsStream>>;
+
+// Android: use tokio-tungstenite's built-in TLS (rustls)
+#[cfg(feature = "android-direct-tun")]
+type WsSink = SplitSink<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>;
+#[cfg(feature = "android-direct-tun")]
+type WsStream = futures_util::stream::SplitStream<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>;
 
 /// Configuration for connecting to VPN server
 #[derive(Clone)]
@@ -86,54 +97,40 @@ pub async fn create_flow_connection(
     info!("[FlowConnector] Creating new connection for {}:{} (flow_id: {})",
           target_host, target_port, flow_id);
 
-    // Step 1: Connect via rustls (same approach as iOS/Android TUN)
+    // Step 1: Connect via TLS
     let url = format!("wss://{}:{}{}", config.server_host, config.server_port, config.server_path);
 
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
-
-    let tcp_addr = format!("{}:{}", config.server_host, config.server_port);
-    let tcp_stream = tokio::net::TcpStream::connect(&tcp_addr)
-        .await
-        .context("Failed to connect TCP stream")?;
-
-    let ws_key = generate_key();
-    let authority = format!("{}:{}", config.server_host, config.server_port);
-    let request = tungstenite::http::Request::builder()
-        .method("GET")
-        .uri(&url)
-        .header("Host", &authority)
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", &ws_key)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
-        .header("Accept", "*/*")
-        .header("Accept-Encoding", "gzip, deflate, br")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Cache-Control", "no-cache")
-        .header("Pragma", "no-cache")
-        .header("Sec-Fetch-Dest", "websocket")
-        .header("Sec-Fetch-Mode", "websocket")
-        .header("Sec-Fetch-Site", "same-origin")
-        .body(())
-        .context("Failed to build WebSocket upgrade request")?;
-
-    let (ws_stream, _) = tokio_tungstenite::client_async_tls_with_config(
-        request,
-        tcp_stream,
-        None,
-        Some(connector),
+    // Android: connect_async_tls_with_config handles TLS + WebSocket in one step.
+    // iOS/macOS: establish TLS first, then upgrade to WebSocket via client_async.
+    #[cfg(feature = "android-direct-tun")]
+    let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
+        &url, None, false, None,
     )
     .await
-    .context("WebSocket upgrade failed")?;
+    .context("FlowConnector connection failed")?;
+
+    #[cfg(not(feature = "android-direct-tun"))]
+    let (ws_stream, _) = {
+        let tls_stream = {
+            #[cfg(feature = "ios-direct-tun")]
+            let s = rvpn_tls::connect_rustls(&config.server_host, config.server_port, Some(&config.server_host))
+                .await
+                .context("TLS handshake failed")?;
+            #[cfg(not(feature = "ios-direct-tun"))]
+            let s = rvpn_tls::connect_chrome_like(
+                &config.server_host,
+                config.server_port,
+                rvpn_tls::TlsFingerprint::Chrome,
+                Some(&config.server_host),
+            )
+            .await
+            .context("TLS handshake failed")?;
+            s
+        };
+        tokio_tungstenite::client_async(&url, tls_stream)
+            .await
+            .context("FlowConnector WebSocket handshake failed")?
+    };
 
     debug!("[FlowConnector] WebSocket connected for flow {}", flow_id);
 
@@ -232,15 +229,51 @@ async fn perform_handshake(
             match server_hello {
                 HandshakeMessage::ServerHello {
                     ephemeral_key: _server_ephemeral,
-                    identity_key: _server_identity_key,
-                    signed_prekey: _,
-                    prekey_signature: _,
+                    identity_key: server_identity_key,
+                    signed_prekey: server_signed_prekey,
+                    prekey_signature: server_prekey_signature,
                 } => {
                     debug!("Received ServerHello with ephemeral key");
 
-                    // Complete X3DH agreement to get shared secret
+                    // Use wire values for X3DH (see stream_relay.rs / ios_tun.rs).
+                    let server_identity_key: [u8; 32] = server_identity_key
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Server identity key has invalid length"))?;
+                    let server_signed_prekey: [u8; 32] = server_signed_prekey
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Server signed prekey has invalid length"))?;
+                    let prekey_signature: [u8; 64] = server_prekey_signature
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Prekey signature has invalid length"))?;
+
+                    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
+                        &server_identity_key,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Invalid server identity key: {}", e))?;
+                    let signature = ed25519_dalek::Signature::from_bytes(&prekey_signature);
+                    ed25519_dalek::Verifier::verify(
+                        &verifying_key,
+                        &server_signed_prekey,
+                        &signature,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
+                    debug!("Server prekey signature verified");
+
+                    let server_bundle_from_hello = X3DHPublicBundle {
+                        identity_key: server_identity_key,
+                        identity_x25519_key: server_bundle.identity_x25519_key,
+                        signed_prekey: server_signed_prekey,
+                        prekey_signature,
+                        one_time_prekey: None,
+                        identity_key_version: server_bundle.identity_key_version,
+                        rotation_signature: server_bundle.rotation_signature,
+                    };
+
                     let (shared_secret, _x3dh_material) = initiator
-                        .agree(server_bundle)
+                        .agree(&server_bundle_from_hello)
                         .context("X3DH key agreement failed")?;
 
                     debug!("X3DH shared secret derived successfully");

@@ -15,7 +15,7 @@
 //! - Server sends VirtualIp with assigned IP
 //! - Raw IP packets are encrypted and relayed
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -29,7 +29,7 @@ use bytes::BytesMut;
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tokio::net::TcpStream;
 use tungstenite::handshake::client::generate_key;
-use rvpn_client::TlsFingerprint;
+use rvpn_tls::TlsFingerprint;
 
 // Use logcat macros for Android logging
 macro_rules! tun_log {
@@ -144,14 +144,33 @@ pub struct AndroidTunClient {
     identity_key: IdentityKey,
     /// Server prekey bundle for X3DH
     server_bundle: X3DHPublicBundle,
+    /// Canonical `ik:1:<base32>` pin of the server's identity key, computed
+    /// at construction from `server_bundle.identity_key`. Kotlin reads this
+    /// via the JNI wrapper for `rvpn_tun_get_server_identity()` after the
+    /// tunnel reaches `Connected` to capture the TOFU pin.
+    server_identity_pin_actual: String,
     /// DNS servers from VirtualIp
     dns_servers: Arc<Mutex<Vec<std::net::IpAddr>>>,
     /// MTU from VirtualIp
     mtu: Arc<Mutex<u16>>,
     /// State callback for Android notifications (sync RwLock to avoid deadlock on 2-thread runtime)
     state_callback: Arc<RwLock<StateCallback>>,
-    /// TLS fingerprint to use for stealth connections
+    /// Stealth TLS fingerprint to use for the ClientHello (browser mimicry).
+    /// Renamed from `tls_fingerprint` on the wire; keeps the same name here
+    /// because it drives the actual TLS handshake code.
     tls_fingerprint: TlsFingerprint,
+    /// Start/reconnect loop running flag (prevents duplicate loops)
+    is_started: AtomicBool,
+    /// Whether the reconnect loop should keep retrying
+    reconnect_enabled: AtomicBool,
+    /// Maximum reconnection attempts (0 = unlimited)
+    reconnect_max_attempts: AtomicU32,
+    /// Initial delay between reconnection attempts (ms)
+    reconnect_initial_delay_ms: AtomicU64,
+    /// Maximum delay between reconnection attempts (ms)
+    reconnect_max_delay_ms: AtomicU64,
+    /// Last time a reconnect was requested via network change (debounces rapid calls)
+    last_reconnect_request: std::sync::Mutex<std::time::Instant>,
 }
 
 impl AndroidTunClient {
@@ -176,9 +195,26 @@ impl AndroidTunClient {
         let server_bundle: X3DHPublicBundle =
             serde_json::from_str(&bundle_json).context("Failed to parse prekey bundle JSON")?;
 
-        // Parse TLS fingerprint (default to Chrome for stealth)
-        let tls_fingerprint = config.tls_fingerprint.as_deref()
-            .and_then(rvpn_client::fingerprint_from_str)
+        // Compute + optionally enforce the TOFU pin (see ios_tun.rs for the
+        // full rationale — same code shape). Failing here means we never
+        // open a TCP socket to a mis-identified server.
+        let server_identity_pin_actual =
+            rvpn_core::identity_pin::encode_identity_pin(&server_bundle.identity_key)
+                .context("Failed to encode server identity pin")?;
+        if let Some(expected) = config.server_identity_pin.as_deref() {
+            let matched = rvpn_core::identity_pin::pins_match(expected, &server_bundle.identity_key)
+                .context("Configured server_identity_pin is not a valid pin string")?;
+            if !matched {
+                return Err(anyhow::Error::from(rvpn_core::Error::ServerIdentityMismatch {
+                    expected: expected.to_string(),
+                    actual: server_identity_pin_actual,
+                }));
+            }
+        }
+
+        // Parse stealth ClientHello fingerprint (default to Chrome).
+        let tls_fingerprint = config.stealth_fingerprint.as_deref()
+            .and_then(rvpn_tls::fingerprint_from_str)
             .unwrap_or(TlsFingerprint::Chrome);
 
         // Create channels for Android TUN communication
@@ -216,27 +252,38 @@ impl AndroidTunClient {
             shutdown_tx,
             identity_key,
             server_bundle,
+            server_identity_pin_actual,
             dns_servers: Arc::new(Mutex::new(Vec::new())),
             mtu: Arc::new(Mutex::new(1420)),
             state_callback: Arc::new(RwLock::new(None)),
             tls_fingerprint,
+            is_started: AtomicBool::new(false),
+            reconnect_enabled: AtomicBool::new(false), // Disabled by default; FFI start enables
+            reconnect_max_attempts: AtomicU32::new(0), // 0 = unlimited
+            reconnect_initial_delay_ms: AtomicU64::new(1000),
+            reconnect_max_delay_ms: AtomicU64::new(5000),
+            last_reconnect_request: std::sync::Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+            ),
         })
     }
 
-    /// Parse server URL into (host, port, path)
+    /// Parse server URL into (host, port, path) — no url crate dependency
     fn parse_server_url(server_address: &str) -> Result<(String, u16, String)> {
-        let parsed =
-            url::Url::parse(server_address).context("Invalid server_address URL")?;
-        let host = parsed
-            .host_str()
-            .context("Missing host in server_address")?
-            .to_string();
-        let port = parsed
-            .port_or_known_default()
-            .context("Missing port in server_address")?;
-        let mut path = parsed.path().to_string();
-        if path.is_empty() {
-            path = "/".to_string();
+        let rest = server_address
+            .strip_prefix("wss://")
+            .or_else(|| server_address.strip_prefix("ws://"))
+            .unwrap_or(server_address);
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let path = if path.is_empty() { "/".to_string() } else { format!("/{}", path) };
+        let (host, port) = if let Some((h, p)) = authority.rsplit_once(':') {
+            let port: u16 = p.parse().context("Invalid port in server_address")?;
+            (h.to_string(), port)
+        } else {
+            (authority.to_string(), 443)
+        };
+        if host.is_empty() {
+            anyhow::bail!("Missing host in server_address");
         }
         Ok((host, port, path))
     }
@@ -460,15 +507,56 @@ impl AndroidTunClient {
                 match server_hello {
                     HandshakeMessage::ServerHello {
                         ephemeral_key: _server_ephemeral,
-                        identity_key: _server_identity_key,
-                        signed_prekey: _,
-                        prekey_signature: _,
+                        identity_key: server_identity_key,
+                        signed_prekey: server_signed_prekey,
+                        prekey_signature: server_prekey_signature,
                     } => {
                         tun_log!("[AndroidTun] Received ServerHello with ephemeral key");
 
-                        // Complete X3DH agreement to get shared secret
+                        // Use wire values for X3DH. Ignoring them and running
+                        // agreement against the pre-loaded on-disk bundle
+                        // silently breaks every connection whenever the disk
+                        // copy drifts from what the server is actually running
+                        // (e.g. after any `rvpn-server prekey-bundle` run).
+                        // Mirrors the working pattern in ios_tun.rs.
+                        let server_identity_key: [u8; 32] = server_identity_key
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("Server identity key has invalid length"))?;
+                        let server_signed_prekey: [u8; 32] = server_signed_prekey
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("Server signed prekey has invalid length"))?;
+                        let prekey_signature: [u8; 64] = server_prekey_signature
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("Prekey signature has invalid length"))?;
+
+                        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
+                            &server_identity_key,
+                        )
+                        .map_err(|e| anyhow::anyhow!("Invalid server identity key: {}", e))?;
+                        let signature = ed25519_dalek::Signature::from_bytes(&prekey_signature);
+                        ed25519_dalek::Verifier::verify(
+                            &verifying_key,
+                            &server_signed_prekey,
+                            &signature,
+                        )
+                        .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
+                        tun_log!("[AndroidTun] Server prekey signature verified");
+
+                        let server_bundle_from_hello = X3DHPublicBundle {
+                            identity_key: server_identity_key,
+                            identity_x25519_key: self.server_bundle.identity_x25519_key,
+                            signed_prekey: server_signed_prekey,
+                            prekey_signature,
+                            one_time_prekey: None,
+                            identity_key_version: self.server_bundle.identity_key_version,
+                            rotation_signature: self.server_bundle.rotation_signature,
+                        };
+
                         let (shared_secret, _x3dh_material) = initiator
-                            .agree(&self.server_bundle)
+                            .agree(&server_bundle_from_hello)
                             .context("X3DH key agreement failed")?;
 
                         tun_log!("[AndroidTun] X3DH shared secret derived successfully");
@@ -957,6 +1045,13 @@ impl AndroidTunClient {
         self.tls_fingerprint
     }
 
+    /// Canonical `ik:1:<base32>` pin of the server this client was
+    /// constructed against — read by the JNI wrapper for
+    /// `rvpn_tun_get_server_identity()` after `Connected`.
+    pub fn server_identity_pin(&self) -> &str {
+        &self.server_identity_pin_actual
+    }
+
     /// Send a packet to the server (call this from Android)
     /// Android calls this to send packets to be relayed to the server
     pub async fn send_packet_to_server(&self, packet: Vec<u8>) -> Result<()> {
@@ -979,19 +1074,130 @@ impl AndroidTunClient {
         rx.try_recv().ok()
     }
 
-    /// Start the client (runs connect and relay in background)
+    /// Start the client (runs connect and relay in background).
+    ///
+    /// Implements a reconnect loop with exponential backoff. Enabled by the
+    /// FFI `rvpnTunStart` entry. Idempotent — repeated calls are no-ops while
+    /// the loop is already running (guarded by `is_started`).
     pub fn start(self: &Arc<Self>) {
+        if self
+            .is_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tun_log!("[AndroidTun] start() called but reconnect loop already running, ignoring");
+            return;
+        }
+
         let client = Arc::clone(self);
         self.runtime.spawn(async move {
-            if let Err(e) = client.connect().await {
-                tun_log_error!("[AndroidTun] Connection failed: {}", e);
+            let mut attempts: u32 = 0;
+            let mut had_successful_session = false;
+            loop {
+                if !client.reconnect_enabled.load(Ordering::Relaxed) {
+                    tun_log!("[AndroidTun] Reconnection disabled, exiting reconnect loop");
+                    break;
+                }
+
+                let max_attempts = client.reconnect_max_attempts.load(Ordering::Relaxed);
+                if max_attempts > 0 && attempts >= max_attempts {
+                    tun_log_error!(
+                        "[AndroidTun] Max reconnection attempts ({}) reached",
+                        max_attempts
+                    );
+                    client
+                        .notify_state(
+                            TunClientState::Error,
+                            None,
+                            "Max reconnection attempts reached",
+                        )
+                        .await;
+                    break;
+                }
+
+                // No delay after a successful session (network transition, e.g. WiFi→5G).
+                // Exponential backoff after failures.
+                if had_successful_session {
+                    had_successful_session = false;
+                } else if attempts > 0 {
+                    let initial = client.reconnect_initial_delay_ms.load(Ordering::Relaxed);
+                    let max_delay = client.reconnect_max_delay_ms.load(Ordering::Relaxed);
+                    let delay = std::cmp::min(
+                        initial.saturating_mul(2u64.saturating_pow(attempts - 1)),
+                        max_delay,
+                    );
+                    tun_log!("[AndroidTun] Reconnecting in {}ms (attempt {})", delay, attempts + 1);
+
+                    // Chunked sleep so a mid-backoff `set_reconnect_enabled(false)` is
+                    // honoured within 100ms instead of blocking for the whole delay.
+                    let start = tokio::time::Instant::now();
+                    let dur = tokio::time::Duration::from_millis(delay);
+                    while tokio::time::Instant::now().duration_since(start) < dur {
+                        if !client.reconnect_enabled.load(Ordering::Relaxed) {
+                            tun_log!("[AndroidTun] Reconnection disabled during backoff, stopping");
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                }
+
+                match client.connect().await {
+                    Ok(()) => {
+                        tun_log!("[AndroidTun] Connection ended, reconnecting immediately...");
+                        attempts = 0;
+                        had_successful_session = true;
+                    }
+                    Err(e) => {
+                        tun_log_error!("[AndroidTun] Connection failed (attempt {}): {}", attempts + 1, e);
+                        attempts += 1;
+                    }
+                }
+
+                if !client.reconnect_enabled.load(Ordering::Relaxed) {
+                    tun_log!("[AndroidTun] Reconnection disabled after session end, stopping");
+                    break;
+                }
             }
+
+            // Loop exited — clear is_started so a future start() can proceed.
+            client.is_started.store(false, Ordering::SeqCst);
         });
     }
 
-    /// Stop the client
+    /// Stop the client (disables reconnection and tears down the current relay).
     pub fn stop(&self) {
+        self.reconnect_enabled.store(false, Ordering::Relaxed);
         let _ = self.shutdown_tx.send(());
+        // Note: is_started is cleared by the reconnect loop itself when it exits.
+    }
+
+    /// Enable / disable the reconnect loop. FFI `rvpnTunStart` calls this with
+    /// `true` before spawning `start()`.
+    pub fn set_reconnect_enabled(&self, enabled: bool) {
+        self.reconnect_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Request a gentle reconnect without disabling the reconnect loop.
+    ///
+    /// Called from `rvpnNetworkChanged` when the Android NetworkCallback reports
+    /// a network transition. Sends `shutdown_tx` — the current `run_packet_relay`
+    /// exits, `connect()` returns, and the reconnect loop starts a fresh session
+    /// on the new interface.
+    ///
+    /// 5-second cooldown prevents reconnect storms from rapid NetworkCallback
+    /// notifications during handoffs.
+    pub fn request_reconnect(&self) {
+        let now = std::time::Instant::now();
+        let mut last = self.last_reconnect_request.lock().unwrap();
+        if now.duration_since(*last) < std::time::Duration::from_secs(5) {
+            tun_log!("[AndroidTun] Reconnect requested too soon (cooldown active), ignoring");
+            return;
+        }
+        *last = now;
+        drop(last);
+
+        let _ = self.shutdown_tx.send(());
+        tun_log!("[AndroidTun] Reconnect requested via gentle shutdown signal");
     }
 }
 

@@ -26,7 +26,6 @@ tokio-tungstenite.workspace = true
 http.workspace = true
 
 # Crypto
-ring.workspace = true
 sha2.workspace = true
 
 # TLS

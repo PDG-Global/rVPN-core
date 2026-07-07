@@ -26,7 +26,7 @@ use rvpn_core::protocol::message::{DnsQuery, DnsResponse};
 
 use crate::dns_cache::DnsResolver;
 use crate::split_tunnel::{RoutingDecision, SplitTunnel};
-use crate::tls_boring::TlsFingerprint;
+use rvpn_tls::TlsFingerprint;
 use crate::websocket::{connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter};
 
 /// Payload type bytes for DNS messages — must match server's DnsHandler

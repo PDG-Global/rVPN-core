@@ -13,21 +13,36 @@ description = "R-VPN mobile FFI bindings"
 crate-type = ["staticlib", "cdylib", "lib"]
 
 [dependencies]
-# Async runtime
-tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
+# Async runtime — multi_thread required (current_thread doesn't drive spawn() tasks)
+tokio = { version = "1.35", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+
+# Custom allocator — aggressive page purging for iOS 50MB jetsam limit.
+# Gated behind the `mimalloc` feature so the system allocator can be used
+# for diagnostics (e.g. confirming mimalloc's VM arena reservation is the
+# source of the `internal` growth seen in memlog).
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+# Core
+rvpn-core = { path = "../rvpn-core" }
+# TLS backend is selected by the *direct-tun feature in use:
+#   ios-direct-tun   → rvpn-tls/rustls  (BoringSSL's SSL_read leaks anonymous VM in the iOS NE sandbox)
+#   macos-direct-tun → rvpn-tls/boring  (keeps Chrome ClientHello mimicry on desktop)
+#   android-direct-tun uses rustls inline in android_tun.rs; only needs TlsFingerprint from rvpn-tls.
+rvpn-tls = { path = "../rvpn-tls", default-features = false }
 futures = "0.3"
 futures-util = "0.3"
 
 # WebSocket
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# WebSocket (iOS uses BoringSSL for TLS, not rustls)
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
 tungstenite = "0.21"
 
-# TLS
-rustls.workspace = true
-tokio-rustls.workspace = true
-rustls-platform-verifier.workspace = true
-webpki-roots = "0.26"
+# TLS - rustls only needed for Android (iOS uses BoringSSL)
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 # Serialization for JSON config
 serde = { version = "1.0", features = ["derive"] }
@@ -39,7 +54,7 @@ bincode = "1.3"
 # Logging
 log = "0.4"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
 
 # State management
 once_cell = "1.19"
@@ -65,7 +80,6 @@ chrono.workspace = true
 # Utilities
 bytes.workspace = true
 rand.workspace = true
-url.workspace = true
 
 # Socket options for SO_REUSEADDR
 socket2 = "0.5"
@@ -77,25 +91,21 @@ ipnetwork = "0.20"
 dashmap = "5.5"
 
 # DNS server and client
-hickory-server = { version = "0.24", optional = true }
-hickory-resolver = { version = "0.24", optional = true }
 hickory-proto = { version = "0.24", optional = true }
 
-# R-VPN core library
-rvpn-core = { path = "../rvpn-core" }
-rvpn-client = { path = "../rvpn-client" }
+# R-VPN split tunnel — iOS disables builtin data (50MB jetsam), Android keeps it
+rvpn-split-tunnel = { path = "../rvpn-split-tunnel", default-features = false }
 
 # iOS-specific dependencies
 [target.'cfg(target_os = "ios")'.dependencies]
-# Memory allocator — prevents jetsam kills under high packet churn.
-# iOS-only: Android's BoringSSL static linking conflicts with mimalloc.
-mimalloc = { version = "0.1", default-features = false }
 # Optional: Use tracing-oslog for iOS device logging (requires iOS SDK)
 # Enable with --features ios-logging when building for device
 tracing-oslog = { version = "0.2", optional = true }
 
 # Android-specific dependencies
 [target.'cfg(target_os = "android")'.dependencies]
+# Android keeps builtin IPs/domains (no 50MB jetsam limit)
+rvpn-split-tunnel = { path = "../rvpn-split-tunnel" }
 # Android logging via logcat
 android_log = "0.1"
 # Bridge tracing to log crate for Android logcat output
@@ -108,14 +118,21 @@ jni-sys = "0.3"
 # Enable iOS logging via os_log (device only, not simulator)
 ios-logging = ["tracing-oslog"]
 # Enable DNS server support
-dns = ["hickory-server", "hickory-resolver", "hickory-proto"]
-# Enable iOS Direct TUN mode (uses ios_tun_ffi instead of legacy TunBridge)
-ios-direct-tun = []
-# Enable macOS Direct TUN mode (uses same ios_tun implementation as iOS)
-macos-direct-tun = []
+dns = ["hickory-proto"]
+# Enable iOS Direct TUN mode (uses ios_tun_ffi instead of legacy TunBridge).
+# Selects the rustls TLS backend — native-tls (Security.framework) cannot
+# negotiate TLS 1.3 correctly on iOS. rustls handles TLS 1.3 reliably and
+# has no memory leak (unlike BoringSSL).
+ios-direct-tun = ["rvpn-tls/rustls"]
+# Enable macOS Direct TUN mode (uses same ios_tun implementation as iOS).
+# Selects the boring TLS backend to retain Chrome ClientHello fingerprint mimicry.
+macos-direct-tun = ["rvpn-tls/boring"]
 # Enable Android Direct TUN mode (uses android_tun_ffi instead of legacy TunBridge)
-android-direct-tun = []
-default = ["dns"]
+android-direct-tun = ["rustls", "tokio-rustls", "rustls-platform-verifier", "webpki-roots", "tokio-tungstenite/__rustls-tls"]
+# Enable on-device memory diagnostics (memlog CSV, malloc zone stats,
+# mimalloc FFI). Not needed for production builds.
+diagnostics = []
+default = ["dns", "mimalloc"]
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 # SOCKS5 proxy - disable on mobile as we handle it differently
