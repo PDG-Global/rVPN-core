@@ -23,6 +23,8 @@ use rvpn_core::crypto::{IdentityKey, X3DHPublicBundle};
 
 use crate::config::{ClientConfig, HttpProxyConfig, ServerIdentityConfig};
 use crate::proxy_common::{self, ProxyHandle};
+use crate::router::Router;
+use crate::server_pool::ServerPool;
 use crate::split_tunnel::{RoutingDecision, SplitTunnel};
 use rvpn_tls::TlsFingerprint;
 use crate::socks5_tunnel::Socks5Tunnel;
@@ -42,9 +44,12 @@ pub struct HttpProxy {
     split_tunnel: Arc<SplitTunnel>,
     http_config: HttpProxyConfig,
     mux_tunnel: Arc<Mutex<Option<Arc<Socks5Tunnel>>>>,
+    pool: Arc<ServerPool>,
+    router: Arc<Router>,
 }
 
 impl HttpProxy {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         listen_addr: SocketAddr,
         config: &ClientConfig,
@@ -53,6 +58,8 @@ impl HttpProxy {
         split_tunnel: Arc<SplitTunnel>,
         dns_resolver: Arc<DnsResolver>,
         mux_tunnel: Arc<Mutex<Option<Arc<Socks5Tunnel>>>>,
+        pool: Arc<ServerPool>,
+        router: Arc<Router>,
     ) -> Result<Self> {
         let (host, port, path) = parse_server_url(&config.server_address);
 
@@ -71,6 +78,8 @@ impl HttpProxy {
             split_tunnel,
             http_config: config.http_proxy.clone(),
             mux_tunnel,
+            pool,
+            router,
         })
     }
 
@@ -97,6 +106,8 @@ impl HttpProxy {
                 multiplex: self.http_config.multiplex,
                 mux_path: self.http_config.mux_path.clone(),
                 mux_tunnel: self.mux_tunnel.clone(),
+                pool: Arc::clone(&self.pool),
+                router: Arc::clone(&self.router),
             };
 
             let auth_config = if self.http_config.auth_enabled {

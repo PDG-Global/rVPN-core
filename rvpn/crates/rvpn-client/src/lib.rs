@@ -34,6 +34,10 @@ pub mod websocket;
 pub mod proxy_common;
 #[cfg(not(target_os = "android"))]
 pub mod http_proxy;
+#[cfg(not(target_os = "android"))]
+pub mod router;
+#[cfg(not(target_os = "android"))]
+pub mod server_pool;
 
 // Backwards compatibility re-exports from rvpn-split-tunnel
 pub mod split_tunnel;

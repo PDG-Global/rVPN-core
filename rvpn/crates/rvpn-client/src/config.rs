@@ -1,5 +1,6 @@
 //! Client configuration
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,20 @@ pub struct ClientConfig {
     /// - Windows: %APPDATA%/rvpn/
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+
+    /// Additional named servers for multi-server routing (SOCKS5 mode only).
+    /// The top-level `server_address` + `prekey_bundle` form the implicit
+    /// `"default"` server; entries here add more. Each `[[server]]` block
+    /// becomes a routing target keyed by `name`.
+    #[serde(default, rename = "server")]
+    pub extra_servers: Vec<ServerEntry>,
+
+    /// Per-server routing rules. Keyed by server `name`. Domains match the
+    /// SOCKS5 request hostname (exact host, `*.parent`, or bare parent).
+    /// IPs match either a literal IPv4/IPv6 target or a CIDR.
+    /// If no rule matches, traffic goes to the default server.
+    #[serde(default)]
+    pub routing: HashMap<String, RoutingRule>,
 }
 
 impl Default for ClientConfig {
@@ -96,8 +111,53 @@ impl Default for ClientConfig {
             dns_proxy: DnsProxyConfig::default(),
             tls_fingerprint: TlsFingerprint::default(),
             data_dir: default_data_dir(),
+            extra_servers: Vec::new(),
+            routing: HashMap::new(),
         }
     }
+}
+
+/// Additional server for multi-server routing.
+///
+/// The top-level `server_address` + `prekey_bundle` fields form the implicit
+/// `"default"` server; every `[[server]]` block adds another routing target.
+/// The client's `identity_key_file` is shared across all servers (SSH-model
+/// — one client key, many hosts).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerEntry {
+    /// Symbolic name used in `[routing.<name>]` sections.
+    /// Must be unique and cannot be `"default"`.
+    pub name: String,
+
+    /// WebSocket address (e.g. `wss://sg.example.com`).
+    pub address: String,
+
+    /// TLS SNI hostname (optional; defaults to the URL host).
+    #[serde(default)]
+    pub sni_hostname: Option<String>,
+
+    /// Path to this server's X3DH prekey bundle JSON.
+    pub prekey_bundle: PathBuf,
+
+    /// Optional pinned identity fingerprint (`ik:1:...`).
+    /// If unset, this server uses the top-level `[server_identity]` settings
+    /// (TOFU by default).
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+/// Routing rules that steer specific hostnames or IPs to a named server.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoutingRule {
+    /// Hostname patterns. Supports exact (`google.com`), wildcard
+    /// (`*.google.com`), or bare parent (`google.com` also matches
+    /// `mail.google.com`).
+    #[serde(default)]
+    pub domains: Vec<String>,
+
+    /// IP addresses or CIDR blocks (`8.8.8.8`, `1.1.1.0/24`, `2606:4700::/32`).
+    #[serde(default)]
+    pub ips: Vec<String>,
 }
 
 impl ClientConfig {
@@ -489,6 +549,54 @@ fn default_data_dir() -> PathBuf {
 
 fn default_tls_fingerprint() -> TlsFingerprint {
     TlsFingerprint::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_server_toml_round_trips() {
+        let raw = r#"
+server_address    = "wss://hk.example.com"
+identity_key_file = "identity.key"
+prekey_bundle     = "hk.bundle.json"
+
+[[server]]
+name          = "sg"
+address       = "wss://sg.example.com"
+prekey_bundle = "sg.bundle.json"
+
+[routing.sg]
+domains = ["google.com", "*.google.com"]
+ips     = ["8.8.8.8/32", "1.1.1.1"]
+"#;
+
+        let cfg: ClientConfig = toml::from_str(raw).expect("parse multi-server config");
+        assert_eq!(cfg.server_address, "wss://hk.example.com");
+        assert_eq!(cfg.extra_servers.len(), 1);
+        assert_eq!(cfg.extra_servers[0].name, "sg");
+        assert_eq!(
+            cfg.extra_servers[0].address,
+            "wss://sg.example.com"
+        );
+
+        let sg = cfg.routing.get("sg").expect("routing.sg block present");
+        assert_eq!(sg.domains, vec!["google.com".to_string(), "*.google.com".to_string()]);
+        assert_eq!(sg.ips, vec!["8.8.8.8/32".to_string(), "1.1.1.1".to_string()]);
+    }
+
+    #[test]
+    fn single_server_toml_still_parses_without_new_sections() {
+        let raw = r#"
+server_address    = "wss://hk.example.com"
+identity_key_file = "identity.key"
+prekey_bundle     = "hk.bundle.json"
+"#;
+        let cfg: ClientConfig = toml::from_str(raw).expect("parse legacy config");
+        assert!(cfg.extra_servers.is_empty());
+        assert!(cfg.routing.is_empty());
+    }
 }
 
 /// Get the configured number of crypto workers

@@ -69,6 +69,11 @@ pub struct ServerConfig {
     /// Prekey bundle file (if specified, server will use keys from bundle instead of generating new ones)
     #[serde(default)]
     pub prekey_bundle_file: Option<PathBuf>,
+
+    /// Automatic TLS certificates via Let's Encrypt (ACME TLS-ALPN-01).
+    /// When enabled, the server obtains and renews certs itself — no proxy needed.
+    #[serde(default)]
+    pub acme: AcmeConfig,
 }
 
 impl Default for ServerConfig {
@@ -88,8 +93,67 @@ impl Default for ServerConfig {
             network: NetworkConfig::default(),
             tun: TunNetworkConfig::default(),
             prekey_bundle_file: None,
+            acme: AcmeConfig::default(),
         }
     }
+}
+
+/// Automatic TLS via Let's Encrypt.
+///
+/// When enabled, `rustls-acme` obtains certificates using the TLS-ALPN-01
+/// challenge on the same `:443` listener the server already uses. No
+/// separate `:80` port is needed and renewal runs in the background.
+///
+/// Prerequisites:
+/// - Each domain in `domains` must resolve (A/AAAA) to this server.
+/// - Inbound `:443` must be reachable from Let's Encrypt's validators.
+/// - `cache_dir` must be writable — the ACME account key and issued certs
+///   are persisted there so restarts don't hit rate limits.
+///
+/// Cannot be combined with a static `tls_cert_file` — startup refuses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcmeConfig {
+    /// Enable automatic ACME certificate issuance.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Fully-qualified hostnames to obtain certificates for. Must be non-empty
+    /// when `enabled = true`. First entry is the primary CN; the rest ride
+    /// along as SANs.
+    #[serde(default)]
+    pub domains: Vec<String>,
+
+    /// Contact URIs for the ACME account (typically `mailto:ops@example.com`).
+    /// Let's Encrypt uses this for expiry warnings if a renewal ever stalls.
+    #[serde(default)]
+    pub contacts: Vec<String>,
+
+    /// Directory to persist the ACME account key and issued certificates.
+    /// Defaults to `"acme-cache"` next to the server binary.
+    #[serde(default = "default_acme_cache_dir")]
+    pub cache_dir: PathBuf,
+
+    /// Use the Let's Encrypt staging directory instead of production.
+    /// Safe for testing — issues untrusted certs but doesn't count against
+    /// production rate limits.
+    #[serde(default)]
+    pub staging: bool,
+}
+
+impl Default for AcmeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            domains: Vec::new(),
+            contacts: Vec::new(),
+            cache_dir: default_acme_cache_dir(),
+            staging: false,
+        }
+    }
+}
+
+fn default_acme_cache_dir() -> PathBuf {
+    PathBuf::from("acme-cache")
 }
 
 impl ServerConfig {

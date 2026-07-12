@@ -114,23 +114,10 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     let addr: SocketAddr = config.bind_address.parse()
         .context("Invalid bind address")?;
 
-    // Check if TLS is configured
-    let tls_acceptor = if config.tls_cert_file.exists() && config.tls_key_file.exists() {
-        info!("Loading TLS certificates...");
-        match load_tls_config(&config.tls_cert_file, &config.tls_key_file) {
-            Ok(tls_config) => {
-                info!("TLS enabled on {}", config.bind_address);
-                Some(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)))
-            }
-            Err(e) => {
-                warn!("Failed to load TLS certificates: {}. Running without TLS.", e);
-                None
-            }
-        }
-    } else {
-        info!("No TLS certificates configured. Running in plain WebSocket mode (suitable for behind reverse proxy)");
-        None
-    };
+    // Check if TLS is configured — either static cert files or automatic
+    // ACME (mutually exclusive, checked in configure_tls).
+    let tls_acceptor = configure_tls(&config).await
+        .context("Failed to configure TLS")?;
 
     let listener = TcpListener::bind(addr).await
         .context("Failed to bind")?;
@@ -321,6 +308,240 @@ fn has_nat_masquerade_rule(interface: &str, subnet: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Server TLS front-end. Either a static rustls acceptor, or the pair of
+/// ACME configs (challenge vs default) that `LazyConfigAcceptor` picks
+/// between per-handshake by inspecting the ClientHello ALPN list.
+#[derive(Clone)]
+enum RvpnTlsAcceptor {
+    Static(tokio_rustls::TlsAcceptor),
+    Acme {
+        challenge: Arc<rustls::ServerConfig>,
+        default: Arc<rustls::ServerConfig>,
+    },
+}
+
+impl RvpnTlsAcceptor {
+    /// Complete a TLS handshake. Returns `Ok(Some(stream))` for a normal
+    /// TLS session the caller should hand off to WebSocket upgrade;
+    /// returns `Ok(None)` if the ClientHello was an ACME TLS-ALPN-01
+    /// challenge (already completed and shut down here) — caller should
+    /// just drop the connection.
+    async fn accept(
+        &self,
+        stream: tokio::net::TcpStream,
+    ) -> Result<Option<Box<dyn AsyncReadWrite + Send + Unpin>>> {
+        match self {
+            RvpnTlsAcceptor::Static(acceptor) => {
+                let tls = acceptor.accept(stream).await?;
+                Ok(Some(Box::new(tls)))
+            }
+            RvpnTlsAcceptor::Acme { challenge, default } => {
+                use rustls_acme::is_tls_alpn_challenge;
+                use tokio_rustls::LazyConfigAcceptor;
+                let start = LazyConfigAcceptor::new(Default::default(), stream).await?;
+                if is_tls_alpn_challenge(&start.client_hello()) {
+                    debug!("ACME TLS-ALPN-01 challenge handshake");
+                    let mut tls = start.into_stream(Arc::clone(challenge)).await?;
+                    tokio::io::AsyncWriteExt::shutdown(&mut tls).await.ok();
+                    Ok(None)
+                } else {
+                    let tls = start.into_stream(Arc::clone(default)).await?;
+                    Ok(Some(Box::new(tls)))
+                }
+            }
+        }
+    }
+}
+
+/// Configure TLS for the server. Three exclusive branches:
+///
+/// - `[acme].enabled = true` → obtain and auto-renew a Let's Encrypt cert
+///   via TLS-ALPN-01 on the existing `:443` listener. No `:80` needed.
+/// - `tls_cert_file` + `tls_key_file` present on disk → static cert path.
+/// - Neither → run in plain-WebSocket mode (reverse proxy expected).
+///
+/// Refuses at startup if both ACME and a static cert are configured, so
+/// there's exactly one authority for the served certificate.
+async fn configure_tls(config: &ServerConfig) -> Result<Option<RvpnTlsAcceptor>> {
+    let static_cert_present = config.tls_cert_file.exists() && config.tls_key_file.exists();
+
+    if config.acme.enabled {
+        if static_cert_present {
+            anyhow::bail!(
+                "[acme].enabled=true but static TLS cert files also exist at {:?} / {:?}. \
+                 Move or remove them, or disable [acme] — the server won't guess which to serve.",
+                config.tls_cert_file, config.tls_key_file
+            );
+        }
+        return Ok(Some(build_acme_acceptor(&config.acme).await?));
+    }
+
+    if static_cert_present {
+        info!("Loading TLS certificates...");
+        match load_tls_config(&config.tls_cert_file, &config.tls_key_file) {
+            Ok(tls_config) => {
+                info!("TLS enabled on {}", config.bind_address);
+                Ok(Some(RvpnTlsAcceptor::Static(
+                    tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)),
+                )))
+            }
+            Err(e) => {
+                warn!("Failed to load TLS certificates: {}. Running without TLS.", e);
+                Ok(None)
+            }
+        }
+    } else {
+        info!("No TLS certificates configured. Running in plain WebSocket mode (suitable for behind reverse proxy)");
+        Ok(None)
+    }
+}
+
+/// Build a `tokio_rustls::TlsAcceptor` backed by `rustls-acme`.
+///
+/// The same `:443` listener handles both live traffic and the TLS-ALPN-01
+/// challenge: rustls sees the `acme-tls/1` ALPN, calls the ACME resolver,
+/// which returns the challenge cert. A background task drives renewals.
+async fn build_acme_acceptor(
+    acme: &rvpn_server::config::AcmeConfig,
+) -> Result<RvpnTlsAcceptor> {
+    use futures_util::StreamExt as _;
+    use rustls_acme::{caches::DirCache, AcmeConfig as RustlsAcmeConfig};
+
+    if acme.domains.is_empty() {
+        anyhow::bail!(
+            "[acme].enabled=true but no [acme].domains listed — set at least one FQDN"
+        );
+    }
+
+    tokio::fs::create_dir_all(&acme.cache_dir).await.with_context(|| {
+        format!(
+            "Failed to create ACME cache directory {:?} — the account key and certs must persist across restarts",
+            acme.cache_dir
+        )
+    })?;
+
+    // Fresh install into production is the one situation where a config
+    // mistake burns through Let's Encrypt's 5-failed-authorizations-per-hour
+    // budget in minutes. Warn loudly at exactly that moment.
+    let cache_is_empty = acme_cache_is_empty(&acme.cache_dir).await;
+    info!(
+        "ACME: requesting Let's Encrypt {} cert for {:?}; cache at {:?}",
+        if acme.staging { "STAGING" } else { "production" },
+        acme.domains,
+        acme.cache_dir
+    );
+    if acme.staging {
+        warn!("ACME staging directory in use — certificates will not be trusted by browsers");
+    } else if cache_is_empty {
+        warn!(
+            "ACME: first-time production issuance for {:?}. If the TLS-ALPN-01 challenge fails 5 times \
+             in an hour, Let's Encrypt locks this hostname out for 60 minutes. If you're setting this up \
+             for the first time, consider `[server.acme].staging = true` first — staging has no rate limits.",
+            acme.domains
+        );
+    }
+
+    let mut state = RustlsAcmeConfig::new(acme.domains.clone())
+        .contact(acme.contacts.iter().cloned())
+        .cache(DirCache::new(acme.cache_dir.clone()))
+        .directory_lets_encrypt(!acme.staging)
+        .state();
+
+    // rustls-acme needs TWO ServerConfigs:
+    // - `challenge_rustls_config` advertises `acme-tls/1` in ALPN and is
+    //   used only when the incoming ClientHello has that ALPN listed.
+    //   The dispatch happens in `RvpnTlsAcceptor::accept`.
+    // - `default_rustls_config` is the normal-traffic path and shares the
+    //   same resolver, so once ACME finishes issuance the real cert is
+    //   served here without a restart.
+    let challenge = state.challenge_rustls_config();
+    let default = state.default_rustls_config();
+
+    // Drive the ACME state machine forever: handles the initial issuance,
+    // TLS-ALPN-01 challenges, and periodic renewal. Errors are logged and
+    // the loop keeps going — a transient LE failure shouldn't kill TLS.
+    tokio::spawn(async move {
+        loop {
+            match state.next().await {
+                Some(Ok(ok)) => info!("ACME event: {:?}", ok),
+                Some(Err(err)) => {
+                    // Downgrade Let's Encrypt rate-limit responses from
+                    // ERROR to a single WARN. rustls-acme retries with its
+                    // own backoff; the raw Debug prints of the whole error
+                    // chain add noise without changing behavior.
+                    let msg = format!("{:?}", err);
+                    if let Some(retry) = parse_acme_rate_limit(&msg) {
+                        warn!(
+                            "ACME rate-limited by Let's Encrypt; next retry allowed after {} \
+                             (see https://letsencrypt.org/docs/rate-limits/)",
+                            retry
+                        );
+                    } else {
+                        error!("ACME error: {}", msg);
+                    }
+                }
+                None => {
+                    warn!("ACME state stream ended; no further renewals will run");
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(RvpnTlsAcceptor::Acme { challenge, default })
+}
+
+/// Return true if the ACME cache directory holds no files. Used to detect
+/// first-time issuance so the operator gets a rate-limit heads-up before
+/// their first production attempt.
+async fn acme_cache_is_empty(dir: &PathBuf) -> bool {
+    match tokio::fs::read_dir(dir).await {
+        Ok(mut entries) => matches!(entries.next_entry().await, Ok(None)),
+        // Nonexistent or unreadable → treat as empty so we still warn.
+        Err(_) => true,
+    }
+}
+
+/// If `msg` contains a Let's Encrypt rate-limit response (HTTP 429 with a
+/// `retry after <timestamp>` phrase), return the parsed timestamp string.
+/// Very deliberately a substring scan rather than a JSON parse — the
+/// exact error shape is a private rustls-acme detail and we only need
+/// the retry-after hint to make the log line useful.
+fn parse_acme_rate_limit(msg: &str) -> Option<String> {
+    if !msg.contains("rateLimited") && !msg.contains("status_code: 429") {
+        return None;
+    }
+    let idx = msg.find("retry after ")?;
+    let rest = &msg[idx + "retry after ".len()..];
+    // Timestamp shape: `2026-07-11 06:01:16 UTC` — terminated by `: see`
+    // (LE's message continues with a link) or `\\n` in the JSON-escaped
+    // body. Split on either boundary and take the first ~40 chars.
+    let end = rest
+        .find(": see")
+        .or_else(|| rest.find("\\n"))
+        .unwrap_or_else(|| rest.len().min(40));
+    Some(rest[..end].trim().trim_end_matches(['"', '\\', ',']).to_string())
+}
+
+#[cfg(test)]
+mod acme_tests {
+    use super::parse_acme_rate_limit;
+
+    #[test]
+    fn parses_le_rate_limit_retry_after() {
+        let msg = "Order(Acme(HttpRequest(Non2xxStatus { status_code: 429, body: \"{ \\\"type\\\": \\\"urn:ietf:params:acme:error:rateLimited\\\", \\\"detail\\\": \\\"too many failed authorizations (5) for \\\\\\\"003.hk.97688.io\\\\\\\" in the last 1h0m0s, retry after 2026-07-11 06:01:16 UTC: see https://letsencrypt.org/docs/rate-limits/\\\" }\" }))";
+        assert_eq!(
+            parse_acme_rate_limit(msg).as_deref(),
+            Some("2026-07-11 06:01:16 UTC")
+        );
+    }
+
+    #[test]
+    fn returns_none_on_normal_error() {
+        assert_eq!(parse_acme_rate_limit("some other error"), None);
+    }
+}
+
 /// Load TLS configuration from certificate files
 fn load_tls_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<rustls::ServerConfig> {
     use rustls_pemfile::{certs, private_key};
@@ -447,14 +668,20 @@ async fn handle_connection(
     tun_path: String,
     dns_path: String,
     mux_path: String,
-    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    tls_acceptor: Option<RvpnTlsAcceptor>,
 ) -> Result<()> {
-    // If TLS is configured, do TLS handshake first
+    // If TLS is configured, do TLS handshake first. In ACME mode the
+    // acceptor may consume the ClientHello as a TLS-ALPN-01 challenge —
+    // that's `Ok(None)`, and we're done with this connection.
     let stream: Box<dyn AsyncReadWrite + Send + Unpin> = if let Some(acceptor) = tls_acceptor {
         match acceptor.accept(stream).await {
-            Ok(tls_stream) => {
+            Ok(Some(tls_stream)) => {
                 info!("TLS handshake successful from {}", peer_addr);
-                Box::new(tls_stream)
+                tls_stream
+            }
+            Ok(None) => {
+                // ACME challenge already completed inside accept().
+                return Ok(());
             }
             Err(e) => {
                 debug!("TLS handshake failed from {}: {}", peer_addr, e);

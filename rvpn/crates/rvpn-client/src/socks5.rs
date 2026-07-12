@@ -28,6 +28,8 @@ use rvpn_core::crypto::{IdentityKey, X3DHPublicBundle};
 
 use crate::config::{ClientConfig, Socks5Config, ServerIdentityConfig};
 use crate::proxy_common::{self, ProxyHandle};
+use crate::router::Router;
+use crate::server_pool::ServerPool;
 use crate::split_tunnel::SplitTunnel;
 use rvpn_tls::TlsFingerprint;
 use crate::socks5_tunnel::Socks5Tunnel;
@@ -48,24 +50,47 @@ pub struct Socks5Proxy {
     socks5_config: Socks5Config,
     mux_tunnel: Arc<Mutex<Option<Arc<Socks5Tunnel>>>>,
     dns_resolver: Arc<DnsResolver>,
+    pool: Arc<ServerPool>,
+    router: Arc<Router>,
 }
 
 impl Socks5Proxy {
     pub async fn new(listen_addr: SocketAddr, config: &ClientConfig) -> Result<Self> {
-        let (host, port, path) = parse_server_url(&config.server_address);
-
         let key_path = config.identity_key_file.clone();
         let identity_key = tokio::task::spawn_blocking(move || IdentityKey::load(&key_path))
             .await
             .context("Identity key load task failed")?
             .context("Failed to load identity key")?;
 
-        let bundle_path = config.prekey_bundle.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Prekey bundle file is required for X3DH authentication"))?;
-        let bundle_json = tokio::fs::read_to_string(bundle_path).await
-            .with_context(|| format!("Failed to read prekey bundle: {:?}", bundle_path))?;
-        let server_bundle: X3DHPublicBundle = serde_json::from_str(&bundle_json)
-            .context("Failed to parse prekey bundle")?;
+        // Build the multi-server pool (the default server + any [[server]]
+        // entries). Fails fast if a referenced bundle can't be loaded.
+        let pool = Arc::new(ServerPool::from_config(config).await?);
+        let router = Arc::new(Router::build(&pool, &config.routing)?);
+
+        // Multiplex mode currently maintains a single shared tunnel; combining
+        // it with multi-server routing would need a per-server tunnel map,
+        // which is out of scope for this pass. Refuse the combination up
+        // front rather than silently ignoring the routing table.
+        if config.socks5.multiplex && pool.extra_count() > 0 {
+            anyhow::bail!(
+                "multi-server routing is not supported in multiplex mode; \
+                 either remove `[[server]]` entries or set `socks5.multiplex = false`"
+            );
+        }
+
+        // Default server metadata for the legacy accessors below (dns_proxy,
+        // http_proxy still consult the default). These fields duplicate what
+        // `pool.get_or_default(\"default\")` returns and would go away when
+        // those callers learn to route.
+        let default_server = pool.get_or_default(crate::server_pool::DEFAULT_SERVER_NAME);
+        let server_bundle: X3DHPublicBundle = (*default_server.bundle).clone();
+        if pool.extra_count() > 0 {
+            let (dom, ip) = router.rule_count();
+            info!(
+                "Multi-server routing: {} extra server(s), {} domain rule(s), {} IP rule(s)",
+                pool.extra_count(), dom, ip
+            );
+        }
 
         let nameserver_list = if config.network.dns_servers.is_empty() {
             &config.dns_proxy.nameservers
@@ -115,9 +140,9 @@ impl Socks5Proxy {
 
         Ok(Self {
             listen_addr,
-            server_host: host,
-            server_port: port,
-            server_path: path,
+            server_host: default_server.host.clone(),
+            server_port: default_server.port,
+            server_path: default_server.path.clone(),
             tls_fingerprint: config.tls_fingerprint,
             sni_hostname: config.sni_hostname.clone(),
             identity_key: Arc::new(identity_key),
@@ -127,6 +152,8 @@ impl Socks5Proxy {
             socks5_config: config.socks5.clone(),
             mux_tunnel: Arc::new(Mutex::new(None)),
             dns_resolver,
+            pool,
+            router,
         })
     }
 
@@ -142,6 +169,8 @@ impl Socks5Proxy {
     pub fn split_tunnel(&self) -> Arc<SplitTunnel> { Arc::clone(&self.split_tunnel) }
     pub fn dns_resolver(&self) -> Arc<DnsResolver> { Arc::clone(&self.dns_resolver) }
     pub fn mux_tunnel(&self) -> Arc<Mutex<Option<Arc<Socks5Tunnel>>>> { Arc::clone(&self.mux_tunnel) }
+    pub fn pool(&self) -> Arc<ServerPool> { Arc::clone(&self.pool) }
+    pub fn router(&self) -> Arc<Router> { Arc::clone(&self.router) }
 
     pub async fn run(&self) -> Result<()> {
         let listener = TcpListener::bind(self.listen_addr).await
@@ -164,6 +193,8 @@ impl Socks5Proxy {
                 multiplex: self.socks5_config.multiplex,
                 mux_path: self.socks5_config.mux_path.clone(),
                 mux_tunnel: self.mux_tunnel.clone(),
+                pool: Arc::clone(&self.pool),
+                router: Arc::clone(&self.router),
             };
 
             tokio::spawn(async move {
@@ -269,47 +300,3 @@ async fn send_socks5_success(socket: &mut TcpStream) -> Result<()> {
     Ok(())
 }
 
-/// Parse server URL into (host, port, path) components
-fn parse_server_url(url: &str) -> (String, u16, String) {
-    let url = url.strip_prefix("wss://")
-        .or_else(|| url.strip_prefix("ws://"))
-        .unwrap_or(url);
-
-    let (host_port, path) = url.split_once('/')
-        .map(|(hp, p)| (hp, format!("/{}", p)))
-        .unwrap_or((url, "/".to_string()));
-
-    let (host, port) = host_port.split_once(':')
-        .map(|(h, p)| (h.to_string(), p.parse().unwrap_or(443)))
-        .unwrap_or_else(|| (host_port.to_string(), 443));
-
-    (host, port, path)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_server_url() {
-        let (host, port, path) = parse_server_url("wss://example.com/api/v1/ws");
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 443);
-        assert_eq!(path, "/api/v1/ws");
-
-        let (host, port, path) = parse_server_url("wss://example.com:8443/api/v1/ws");
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 8443);
-        assert_eq!(path, "/api/v1/ws");
-
-        let (host, port, path) = parse_server_url("wss://example.com");
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 443);
-        assert_eq!(path, "/");
-
-        let (host, port, path) = parse_server_url("ws://example.com:8080/ws");
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 8080);
-        assert_eq!(path, "/ws");
-    }
-}

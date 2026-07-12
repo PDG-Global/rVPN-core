@@ -17,6 +17,8 @@ use tracing::{debug, error, info, warn};
 use rvpn_core::crypto::{IdentityKey, X3DHPublicBundle};
 
 use crate::config::ServerIdentityConfig;
+use crate::router::Router;
+use crate::server_pool::ServerPool;
 use crate::socks5_tunnel::{self, Socks5Tunnel};
 use crate::split_tunnel::{SplitTunnel, RoutingDecision};
 use crate::stream_relay::StreamRelay;
@@ -37,6 +39,13 @@ pub struct ProxyHandle {
     pub multiplex: bool,
     pub mux_path: String,
     pub mux_tunnel: Arc<Mutex<Option<Arc<Socks5Tunnel>>>>,
+    /// Registry of all configured servers keyed by name. In non-multiplex
+    /// mode `handle_tunnel_legacy` consults the router below to pick which
+    /// entry to open the per-flow WebSocket against.
+    pub pool: Arc<ServerPool>,
+    /// Domain/IP → server-name matcher. `choose(host)` returns `"default"`
+    /// when nothing overrides.
+    pub router: Arc<Router>,
 }
 
 /// Parse target address into host and port.
@@ -255,24 +264,38 @@ async fn handle_tunnel_multiplexed(
 }
 
 /// Handle tunnel connection — legacy mode (one WebSocket per flow).
+///
+/// Consults `proxy.router` to pick which named server should handle this
+/// flow. If the choice is anything other than the default, we log it so
+/// operators can see routing decisions in `-vv` mode.
 async fn handle_tunnel_legacy(
     socket: TcpStream,
     addr: SocketAddr,
     target_addr: &str,
     proxy: &ProxyHandle,
 ) -> Result<()> {
+    let (target_host, _) = parse_target(target_addr)?;
+    let server = proxy.pool.get_or_default(proxy.router.choose(&target_host));
+
+    if server.name != crate::server_pool::DEFAULT_SERVER_NAME {
+        debug!(
+            "Routing {} → server '{}' ({}:{})",
+            target_host, server.name, server.host, server.port
+        );
+    }
+
     let (mut relay, ws_reader, ws_writer) = StreamRelay::connect(
-        &proxy.server_host,
-        proxy.server_port,
-        &proxy.server_path,
+        &server.host,
+        server.port,
+        &server.path,
         proxy.tls_fingerprint,
-        proxy.sni_hostname.as_deref(),
+        server.sni_hostname.as_deref(),
         &proxy.identity_key,
-        &proxy.server_bundle,
-        Some(&proxy.server_identity),
+        &server.bundle,
+        Some(&server.identity_config),
     )
     .await
-    .context("Failed to connect StreamRelay")?;
+    .with_context(|| format!("Failed to connect StreamRelay to server '{}'", server.name))?;
 
     let target_bytes = encode_target_address(target_addr)?;
     relay

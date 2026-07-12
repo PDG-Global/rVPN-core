@@ -1,6 +1,9 @@
 [package]
 name = "rvpn-mobile"
-version.workspace = true
+# Pinned separately from the workspace: iOS/macOS/Android apps still ship v1.2.6
+# on the App Store / Play Store. Bump this in lockstep with those mobile releases,
+# not with the CLI/server workspace version.
+version = "1.2.6"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

@@ -18,6 +18,8 @@ mod http_proxy;
 mod identity_verification;
 mod metrics;
 mod proxy_common;
+mod router;
+mod server_pool;
 mod socks5;
 mod socks5_tunnel;
 mod split_tunnel;
@@ -292,6 +294,8 @@ async fn run_socks5(config: ClientConfig) -> Result<()> {
             proxy.split_tunnel(),
             proxy.dns_resolver(),
             proxy.mux_tunnel(),
+            proxy.pool(),
+            proxy.router(),
         )
         .await?;
 
@@ -312,6 +316,16 @@ async fn run_socks5(config: ClientConfig) -> Result<()> {
 async fn run_tun(config: ClientConfig) -> Result<()> {
     use tun::TunDevice;
     use tunnel::VpnTunnel;
+
+    // Multi-server routing is per-flow SOCKS5 only. TUN mode wraps the
+    // whole network stack in one tunnel, so per-domain routing has no
+    // meaningful hook. Refuse rather than silently ignoring the config.
+    if !config.extra_servers.is_empty() || !config.routing.is_empty() {
+        anyhow::bail!(
+            "multi-server routing ([[server]] / [routing.<name>]) is only supported in SOCKS5 mode; \
+             remove those sections or disable TUN mode"
+        );
+    }
 
     info!("Starting R-VPN Client in TUN mode (full VPN)");
     info!("Server: {}", config.server_address);
