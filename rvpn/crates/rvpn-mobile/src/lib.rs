@@ -44,6 +44,9 @@ pub mod android_tun;
 #[cfg(feature = "android-direct-tun")]
 pub mod android_tun_ffi;
 
+#[cfg(feature = "harmony-direct-tun")]
+pub mod harmony_tun_ffi;
+
 #[cfg(feature = "dns")]
 pub mod dns_server;
 #[cfg(feature = "dns")]

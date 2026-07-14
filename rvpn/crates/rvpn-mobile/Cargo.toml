@@ -132,6 +132,9 @@ ios-direct-tun = ["rvpn-tls/rustls"]
 macos-direct-tun = ["rvpn-tls/boring"]
 # Enable Android Direct TUN mode (uses android_tun_ffi instead of legacy TunBridge)
 android-direct-tun = ["rustls", "tokio-rustls", "rustls-platform-verifier", "webpki-roots", "tokio-tungstenite/__rustls-tls"]
+# Enable HarmonyOS NEXT NAPI FFI (uses rustls, same TLS stack as Android).
+# Consumed by the DevEco project at `rvpn-harmonyos/`.
+harmony-direct-tun = ["rustls", "tokio-rustls", "rustls-platform-verifier", "webpki-roots", "tokio-tungstenite/__rustls-tls"]
 # Enable on-device memory diagnostics (memlog CSV, malloc zone stats,
 # mimalloc FFI). Not needed for production builds.
 diagnostics = []

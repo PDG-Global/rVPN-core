@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use rvpn_core::crypto::{DoubleRatchet, IdentityKey, Signature, Verifier, VerifyingKey, X3DHPublicBundle};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
@@ -388,7 +388,7 @@ impl StreamRelay {
         // Task 1: Local -> WebSocket (read from local, encrypt, send)
         let ratchet_clone = Arc::clone(&ratchet);
         let ws_writer_clone = Arc::clone(&ws_writer);
-        let send_task = tokio::spawn(async move {
+        let send_task = async move {
             use rvpn_core::crypto::ratchet::RatchetMessage;
             // 8190 bytes, not 8192 — pad_packet reserves 2 bytes for the
             // padding-length field, so 8192-byte reads would fail with
@@ -397,7 +397,13 @@ impl StreamRelay {
             loop {
                 match local_read.read(&mut buf).await {
                     Ok(0) => {
-                        debug!("Local connection closed (read 0 bytes)");
+                        // Local browser closed. Send a WebSocket Close so the
+                        // server tears its side down too, otherwise ws_reader
+                        // in Task 2 would sit on an idle-alive TCP socket
+                        // forever (server has no reason to close first).
+                        debug!("Local connection closed (read 0 bytes); sending WS Close");
+                        let writer = ws_writer_clone.lock().await;
+                        let _ = writer.send(Message::Close(None));
                         break;
                     }
                     Ok(n) => {
@@ -437,11 +443,11 @@ impl StreamRelay {
                 }
             }
             Ok::<_, anyhow::Error>(())
-        });
+        };
 
         // Task 2: WebSocket -> Local (receive, decrypt, send via channel)
         let ratchet_clone2 = Arc::clone(&ratchet);
-        let recv_task = tokio::spawn(async move {
+        let recv_task = async move {
             use rvpn_core::crypto::ratchet::RatchetMessage;
             loop {
                 match ws_reader.recv().await {
@@ -499,10 +505,10 @@ impl StreamRelay {
                 }
             }
             Ok::<_, anyhow::Error>(())
-        });
+        };
 
         // Task 3: Write decrypted data to local
-        let write_task = tokio::spawn(async move {
+        let write_task = async move {
             while let Some(data) = rx.recv().await {
                 if let Err(e) = local_write.write_all(&data).await {
                     warn!("Error writing to local: {}", e);
@@ -511,39 +517,29 @@ impl StreamRelay {
                 debug!("Relayed {} bytes remote->local", data.len());
             }
             Ok::<_, anyhow::Error>(())
-        });
+        };
 
-        // Wait for all tasks to complete using JoinSet
-        // This properly handles cancellation when any task fails
-        let mut tasks = JoinSet::new();
+        // Race the three tasks. Whichever exits first (or errors first)
+        // triggers `shutdown().await` on the JoinSet, which aborts the
+        // remaining tasks — otherwise a peer that never sends data (or a
+        // half-closed connection) keeps the WebSocket + DoubleRatchet +
+        // buffers pinned forever. That was the 200 MB / 800-fd leak.
+        let mut tasks: JoinSet<Result<()>> = JoinSet::new();
         tasks.spawn(send_task);
         tasks.spawn(recv_task);
         tasks.spawn(write_task);
 
-        let mut first_error = None;
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                // Task succeeded: Ok(Ok(Ok(())))
-                Ok(Ok(Ok(()))) => {
-                    debug!("Relay task completed");
-                }
-                // Task returned error: Ok(Ok(Err(e)))
-                Ok(Ok(Err(e))) => {
-                    error!("Relay task error: {}", e);
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
-                // Task panicked or was aborted: Ok(Err(je)) or Err(je)
-                Ok(Err(je)) | Err(je) => {
-                    // Task was aborted (cancelled) - this is normal during shutdown
-                    debug!("Relay task aborted: {:?}", je);
-                }
-            }
+        let first_result = tasks.join_next().await;
+        match first_result {
+            Some(Ok(Ok(()))) => debug!("First relay task exited cleanly"),
+            Some(Ok(Err(e))) => warn!("First relay task errored: {}", e),
+            Some(Err(je)) => debug!("First relay task join error: {:?}", je),
+            None => debug!("Relay had no tasks"),
         }
 
-        // Abort any remaining tasks (if we exited due to an error, others may still be running)
-        while tasks.join_next().await.is_some() {}
+        // Abort remaining tasks. shutdown() sends abort signals and awaits
+        // their termination so we don't leak state past this function.
+        tasks.shutdown().await;
 
         // Graceful shutdown: give TCP socket time to flush
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
