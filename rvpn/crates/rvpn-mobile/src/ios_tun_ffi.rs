@@ -17,6 +17,15 @@ use crate::ios_tun::IosTunClient;
 use base64::Engine;
 use rvpn_core::crypto::IdentityKey;
 
+#[cfg(feature = "dns")]
+use crate::dns_server::DnsServer;
+#[cfg(feature = "dns")]
+use crate::doh_client::DohClient;
+#[cfg(feature = "dns")]
+use crate::flow_connector::FlowConnectorConfig;
+#[cfg(feature = "dns")]
+use rvpn_split_tunnel::{DnsResolver, SplitTunnel, SplitTunnelConfig};
+
 // Global singleton for the TUN client (iOS only runs one VPN at a time)
 static TUN_CLIENT: Mutex<Option<Arc<IosTunClient>>> = Mutex::new(None);
 
@@ -34,6 +43,13 @@ static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 // Atomic flag to prevent duplicate client creation during iOS double-startTunnel race
 static TUN_CLIENT_CREATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// Global DNS proxy task handle (used by macOS Direct TUN, which intercepts DNS
+// at the packet layer and forwards to this local proxy; iOS passes
+// enable_dns_proxy=false and uses the separate NEDNSProxyProvider extension).
+// Aborted on rvpn_tun_stop.
+#[cfg(feature = "dns")]
+static DNS_PROXY_HANDLE: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 
 // ============================================================================
 // Core Runtime Functions
@@ -59,8 +75,16 @@ fn init_tracing() {
         return; // Already initialized
     }
 
-    // Simple max-level filter — no EnvFilter/regex dependency
-    let filter = tracing_subscriber::filter::LevelFilter::ERROR;
+    // Simple max-level filter — no EnvFilter/regex dependency.
+    // Defaults to ERROR (safe for iOS jetsam-constrained extension); macOS sets
+    // RVPN_LOG_LEVEL=info from Swift before rvpn_initialize() for diagnostics.
+    let filter = match std::env::var("RVPN_LOG_LEVEL").as_deref() {
+        Ok("trace") => tracing_subscriber::filter::LevelFilter::TRACE,
+        Ok("debug") => tracing_subscriber::filter::LevelFilter::DEBUG,
+        Ok("info") => tracing_subscriber::filter::LevelFilter::INFO,
+        Ok("warn") => tracing_subscriber::filter::LevelFilter::WARN,
+        _ => tracing_subscriber::filter::LevelFilter::ERROR,
+    };
 
     tracing_subscriber::registry()
         .with(OsLogLayer)
@@ -529,13 +553,18 @@ pub unsafe extern "C" fn rvpn_tun_create(config_json: *const c_char) -> c_int {
     // prevents `Runtime::drop` from running on a tokio worker thread when
     // the last `Arc<IosTunClient>` ref drops.
     //
-    // iOS: single worker + 48 KB stack to fit within 50 MB NE limit.
+    // iOS: 2 workers + 48 KB stacks. Originally pinned to 1 worker to fit
+    // the 50 MB NE memory limit, but with a page of ~30 concurrent flows
+    // (google.com and similar) the single core serialized all crypto + I/O
+    // and small flows stalled behind bulk traffic — pages rendered quickly
+    // but took ~10 s to finish. The memory fixes restored ~45 MB of
+    // headroom; a second worker + stack is a negligible slice of it.
     // macOS: 2 workers + default stack (no memory constraint).
     // current_thread does NOT run spawn() tasks — multi_thread with >=1
     // worker is required.
     let runtime = if cfg!(feature = "ios-direct-tun") {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            .worker_threads(2)
             .thread_stack_size(48 * 1024)
             .enable_all()
             .thread_name("rvpn-tun")
@@ -629,12 +658,99 @@ pub extern "C" fn rvpn_tun_start() -> c_int {
         }
     };
 
+    // Start the local DNS proxy if the config asks for it. macOS Direct TUN
+    // intercepts DNS at the packet layer and forwards queries to this proxy;
+    // iOS sets enable_dns_proxy=false (its DNS lives in the separate
+    // NEDNSProxyProvider extension), so this is a no-op there.
+    #[cfg(feature = "dns")]
+    {
+        let already_running = DNS_PROXY_HANDLE.lock().unwrap().is_some();
+        if !already_running && client.is_dns_proxy_enabled() {
+            let dns_client = client.clone();
+            let handle = client.runtime_handle().spawn(async move {
+                info!("[IOS_TUN_FFI] Starting DNS proxy task...");
+                if let Err(e) = start_dns_proxy_for_direct_tun(&dns_client).await {
+                    error!("[IOS_TUN_FFI] DNS proxy error: {}", e);
+                }
+            });
+            *DNS_PROXY_HANDLE.lock().unwrap() = Some(handle);
+            info!("[IOS_TUN_FFI] DNS proxy task spawned");
+        }
+    }
+
     // Enable reconnection and start the client
     client.set_reconnect_enabled(true);
     client.start();
 
     info!("[IOS_TUN_FFI] TUN client start initiated (reconnection enabled)");
     SUCCESS
+}
+
+/// Start the local DNS proxy for Direct TUN mode (macOS).
+///
+/// Binds a UDP DNS server on `dns_bind_addr` (with fallback ports, see
+/// `DnsServer::try_bind_with_fallback` — the primary 5353 collides with
+/// mDNSResponder on macOS) and resolves queries through the tunnel via a DoH
+/// WebSocket to `<server_path>/dns`.
+#[cfg(feature = "dns")]
+async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::Result<()> {
+    info!(
+        "[IOS_TUN_FFI] Starting DNS proxy on {} (enable_dns_proxy={})",
+        client.get_dns_bind_addr(),
+        client.is_dns_proxy_enabled()
+    );
+
+    if !client.is_dns_proxy_enabled() {
+        info!("[IOS_TUN_FFI] DNS proxy disabled in config, skipping");
+        return Ok(());
+    }
+
+    let server_host = client.server_host().to_string();
+    let server_port = client.server_port();
+    let base_path = client.server_path();
+
+    let dns_path = format!("{}/dns", base_path.trim_end_matches("/tun").trim_end_matches('/'));
+
+    let flow_config = FlowConnectorConfig {
+        server_host: server_host.clone(),
+        server_port,
+        server_path: dns_path.clone(),
+        // macOS builds select the boring backend — Chrome mimicry, same as
+        // the tunnel transport.
+        tls_fingerprint: rvpn_tls::TlsFingerprint::Chrome,
+        identity_key: Arc::new(client.identity_key().clone()),
+        server_bundle: client.server_bundle().clone(),
+    };
+
+    let doh_client = Arc::new(DohClient::new(flow_config, dns_path));
+    doh_client.clone().start_cleanup_task();
+    doh_client.start().await?;
+
+    info!("[IOS_TUN_FFI] DoH client started, connecting to {}/dns", base_path);
+
+    let split_tunnel_config = SplitTunnelConfig {
+        enabled: true,
+        builtin_bypass_countries: client.get_builtin_bypass_countries().to_vec(),
+        bypass_networks: Vec::new(),
+        block_ads: client.is_block_ads_enabled(),
+        ..Default::default()
+    };
+
+    let dns_resolver = Arc::new(DnsResolver::new(true, 14400, 200, false, true, vec![]));
+    dns_resolver.start_cleanup_task();
+    let split_tunnel = SplitTunnel::new(split_tunnel_config, dns_resolver).await?;
+
+    let dns_server = Arc::new(DnsServer::with_doh(
+        split_tunnel,
+        doh_client,
+        client.get_dns_bind_addr().to_string(),
+    ));
+
+    info!(
+        "[IOS_TUN_FFI] DNS server created, starting on {}",
+        client.get_dns_bind_addr()
+    );
+    dns_server.run().await
 }
 
 /// Get current connection state
@@ -839,12 +955,14 @@ pub unsafe extern "C" fn rvpn_tun_write_packet_batch(
 
     let mut offset = 0;
     let mut sent = 0;
+    let mut total = 0;
     while offset + 2 <= buf.len() {
         let pkt_len = u16::from_le_bytes([buf[offset], buf[offset + 1]]) as usize;
         offset += 2;
         if offset + pkt_len > buf.len() || pkt_len == 0 || pkt_len > 65535 {
             break;
         }
+        total += 1;
         // Take a buffer from the pool instead of allocating a new Vec each time.
         let mut packet = {
             let pool_handle = client.packet_pool();
@@ -858,7 +976,14 @@ pub unsafe extern "C" fn rvpn_tun_write_packet_batch(
         }
     }
 
-    if sent > 0 { SUCCESS } else { ERROR_QUEUE_FULL }
+    // Report ANY drop to the caller. Previously a partial send still
+    // returned SUCCESS, so overflowed packets vanished silently (the Swift
+    // read loop logs the failure, which is how drops become visible).
+    if total > 0 && sent == total {
+        SUCCESS
+    } else {
+        ERROR_QUEUE_FULL
+    }
 }
 
 /// Read packet from TUN (Server → Rust → Swift)
@@ -994,6 +1119,16 @@ pub extern "C" fn rvpn_tun_stop() -> c_int {
         }
         None => {
             warn!("[IOS_TUN_FFI] TUN client not running");
+        }
+    }
+
+    // Abort the local DNS proxy task if running (macOS; iOS never starts it)
+    #[cfg(feature = "dns")]
+    {
+        let mut guard = DNS_PROXY_HANDLE.lock().unwrap();
+        if let Some(handle) = guard.take() {
+            handle.abort();
+            info!("[IOS_TUN_FFI] DNS proxy task aborted");
         }
     }
 

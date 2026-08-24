@@ -46,7 +46,9 @@ impl StreamRelay {
     /// * `server_identity_config` - Server identity verification config
     ///
     /// # Returns
-    /// A tuple of (StreamRelay, WebSocketReader, WebSocketWriter) ready for relay operation
+    /// A tuple of (StreamRelay, WebSocketReader, WebSocketWriter, WebSocketTaskHandle)
+    /// ready for relay operation. The handle controls the reader/writer/ping
+    /// helper tasks and must be shut down when the relay is done.
     #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         host: &str,
@@ -57,7 +59,7 @@ impl StreamRelay {
         identity_key: &Arc<IdentityKey>,
         server_bundle: &X3DHPublicBundle,
         server_identity_config: Option<&ServerIdentityConfig>,
-    ) -> Result<(Self, WebSocketReader, WebSocketWriter)> {
+    ) -> Result<(Self, WebSocketReader, WebSocketWriter, crate::websocket::WebSocketTaskHandle)> {
         info!("Connecting StreamRelay to {}:{}{}", host, port, path);
 
         // Step 1: Establish WebSocket connection
@@ -68,9 +70,11 @@ impl StreamRelay {
         debug!("WebSocket connection established");
 
         // Step 2: Split the WebSocket into reader and writer
-        let (mut ws_reader, mut ws_writer) = split_websocket(ws_stream);
+        let (mut ws_reader, mut ws_writer, ws_tasks) = split_websocket(ws_stream);
 
-        // Step 3: Perform X3DH handshake and initialize Double Ratchet
+        // Step 3: Perform X3DH handshake and initialize Double Ratchet.
+        // If the handshake fails, `ws_tasks` drops here and its Drop impl
+        // signals the reader/writer/ping helper tasks to stop.
         let ratchet = Self::perform_handshake(
             &mut ws_reader,
             &mut ws_writer,
@@ -86,7 +90,7 @@ impl StreamRelay {
 
         let relay = Self { ratchet };
 
-        Ok((relay, ws_reader, ws_writer))
+        Ok((relay, ws_reader, ws_writer, ws_tasks))
     }
 
     /// Perform X3DH handshake with server
@@ -130,6 +134,7 @@ impl StreamRelay {
             .context("Failed to serialize Hello message")?;
         ws_writer
             .send(Message::Binary(hello_bytes))
+            .await
             .context("Failed to send Hello message")?;
 
         debug!("Sent X3DH Hello message");
@@ -311,6 +316,7 @@ impl StreamRelay {
         // Send via WebSocket
         ws_writer
             .send(Message::Binary(encrypted))
+            .await
             .context("Failed to send WebSocket frame")?;
 
         debug!("Sent frame: {} bytes plaintext", data.len());
@@ -385,9 +391,15 @@ impl StreamRelay {
         // Channel for decrypted data from WebSocket -> Local
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
 
+        // Tracks whether a WebSocket Close has already been queued, so the
+        // best-effort Close at teardown doesn't double-send (tungstenite
+        // rejects frames queued after Close with "Sending after closing").
+        let close_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // Task 1: Local -> WebSocket (read from local, encrypt, send)
         let ratchet_clone = Arc::clone(&ratchet);
         let ws_writer_clone = Arc::clone(&ws_writer);
+        let close_sent_clone = Arc::clone(&close_sent);
         let send_task = async move {
             use rvpn_core::crypto::ratchet::RatchetMessage;
             // 8190 bytes, not 8192 — pad_packet reserves 2 bytes for the
@@ -403,7 +415,9 @@ impl StreamRelay {
                         // forever (server has no reason to close first).
                         debug!("Local connection closed (read 0 bytes); sending WS Close");
                         let writer = ws_writer_clone.lock().await;
-                        let _ = writer.send(Message::Close(None));
+                        if writer.send(Message::Close(None)).await.is_ok() {
+                            close_sent_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         break;
                     }
                     Ok(n) => {
@@ -427,9 +441,9 @@ impl StreamRelay {
                         let encrypted = message.to_bytes()
                             .map_err(|e| anyhow::anyhow!("Failed to serialize RatchetMessage: {}", e))?;
 
-                        // Send via WebSocket (send() is synchronous, returns Result)
+                        // Send via WebSocket (bounded channel; awaits under backpressure)
                         let writer = ws_writer_clone.lock().await;
-                        if let Err(e) = writer.send(Message::Binary(encrypted)) {
+                        if let Err(e) = writer.send(Message::Binary(encrypted)).await {
                             warn!("Error sending WebSocket frame: {}", e);
                             return Err(e);
                         }
@@ -541,6 +555,18 @@ impl StreamRelay {
         // their termination so we don't leak state past this function.
         tasks.shutdown().await;
 
+        // Best-effort notify the server on EVERY exit path. send_task only
+        // sends a Close on the local-EOF path; on error paths (local RST,
+        // local write error) the server would otherwise keep its side of the
+        // flow open while the WebSocket-level ping task keeps this socket
+        // alive — and the server counts pings as activity, so its idle
+        // timeout never fires. That combination pinned both halves of the
+        // flow forever (the "zombie flow" leak).
+        if !close_sent.load(std::sync::atomic::Ordering::Relaxed) {
+            let writer = ws_writer.lock().await;
+            let _ = writer.send(Message::Close(None)).await;
+        }
+
         // Graceful shutdown: give TCP socket time to flush
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
@@ -551,6 +577,8 @@ impl StreamRelay {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_length_prefix_format() {
         // Verify length encoding (used in the protocol for target address)
@@ -560,5 +588,106 @@ mod tests {
 
         let decoded = u16::from_be_bytes([bytes[0], bytes[1]]);
         assert_eq!(decoded, len);
+    }
+
+    /// Regression test for the zombie-flow leak.
+    ///
+    /// When the relay exits via an ERROR path (local socket RST — what an
+    /// aborting browser produces), it must still send a WebSocket Close to
+    /// the server, and the reader/writer/ping helper tasks must stop when
+    /// the `WebSocketTaskHandle` is shut down. Before the fix the error
+    /// paths sent no Close and the ping task kept the tunnel socket alive
+    /// forever, so both client and server pinned the flow permanently.
+    #[tokio::test]
+    async fn test_relay_error_exit_closes_ws_and_stops_helper_tasks() -> anyhow::Result<()> {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        // "Server" side of the tunnel WebSocket.
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let ws_addr = ws_listener.local_addr()?;
+        let accept_ws = tokio::spawn(async move {
+            let (stream, _) = ws_listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+
+        // Local (browser) side of the flow.
+        let local_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = local_listener.local_addr()?;
+        let accept_local =
+            tokio::spawn(async move { local_listener.accept().await.unwrap().0 });
+
+        let mut browser = tokio::net::TcpStream::connect(local_addr).await?;
+        let local_stream = accept_local.await?;
+
+        // Client side of the tunnel WebSocket.
+        let (client_ws, _resp) =
+            tokio_tungstenite::connect_async(format!("ws://{}/", ws_addr)).await?;
+        let server_ws = accept_ws.await?;
+
+        let (ws_reader, ws_writer, ws_tasks) = split_websocket(client_ws);
+
+        let secret = [7u8; 32];
+        let ratchet = DoubleRatchet::init_alice(secret, [0u8; 32]);
+        let relay = StreamRelay { ratchet };
+
+        let relay_task = tokio::spawn(async move {
+            let result = relay.relay(local_stream, ws_reader, ws_writer).await;
+            // Same contract as proxy_common::handle_tunnel_legacy: stop the
+            // helper tasks once the relay has ended.
+            ws_tasks.shutdown().await;
+            result
+        });
+
+        // Push data through so the flow is active.
+        browser.write_all(b"hello").await?;
+
+        let mut server_ws = server_ws;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), server_ws.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("server received no frame"))?;
+        assert!(
+            matches!(first, Some(Ok(Message::Binary(_)))),
+            "expected an encrypted data frame from the relay"
+        );
+
+        // Kill the browser socket the way an aborting client does:
+        // SO_LINGER(0) close sends an RST. relay() must exit via the
+        // local-read ERROR path — exactly the path that previously left the
+        // tunnel half open.
+        {
+            let std_stream = browser.into_std()?;
+            let socket = socket2::Socket::from(std_stream);
+            socket.set_linger(Some(std::time::Duration::ZERO))?;
+        }
+
+        // The relay (including helper-task shutdown) must complete promptly.
+        let relay_result = tokio::time::timeout(std::time::Duration::from_secs(5), relay_task)
+            .await
+            .map_err(|_| anyhow::anyhow!("relay did not exit after local RST"))?
+            .expect("relay task panicked");
+        assert!(relay_result.is_ok());
+
+        // The server must receive a WS Close. Before the fix the error path
+        // sent nothing and the server kept the flow forever.
+        let close_seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(msg) = server_ws.next().await {
+                match msg {
+                    Ok(Message::Close(_)) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            close_seen,
+            "server did not receive WS Close after relay error exit"
+        );
+
+        Ok(())
     }
 }

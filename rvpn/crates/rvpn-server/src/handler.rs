@@ -27,7 +27,7 @@ use rvpn_core::crypto::ratchet::RatchetMessage;
 use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHResponder};
 use rvpn_core::protocol::multiplex::ControlMessage;
 use rvpn_core::protocol::HandshakeMessage;
-use rvpn_core::protocol::{AuthMethod, MultiplexedFrame, PayloadType, ProtocolVersion};
+use rvpn_core::protocol::{AuthMethod, PayloadType, ProtocolVersion};
 
 /// Check if an IP address is private or reserved (and should be blocked for outbound connections).
 ///
@@ -429,7 +429,16 @@ impl VpnHandler {
                 );
 
                 // 4. Relay bidirectionally for TCP
-                match self.relay_tcp(ws_write, ws_read, target, ratchet).await {
+                match self
+                    .relay_tcp(
+                        ws_write,
+                        ws_read,
+                        target,
+                        ratchet,
+                        Self::LEGACY_TCP_IDLE_TIMEOUT,
+                    )
+                    .await
+                {
                     Ok(_) => info!("Relay completed for {}", peer_addr),
                     Err(e) => debug!("Relay ended for {}: {}", peer_addr, e),
                 }
@@ -866,16 +875,26 @@ impl VpnHandler {
         Ok(addrs)
     }
 
+    /// Idle timeout for the legacy (one-WebSocket-per-flow) TCP relay.
+    ///
+    /// Only real data frames count as activity — WebSocket pings do NOT.
+    /// The client's ping task keeps sending pings even after the client-side
+    /// relay has exited on an error path (local RST etc.); counting pings
+    /// here would let such zombie flows pin this relay and its target
+    /// connection forever.
+    const LEGACY_TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
     /// Relay data bidirectionally between WebSocket and TCP target
-    async fn relay_tcp<S>(
+    pub(crate) async fn relay_tcp<S>(
         &self,
-        mut ws_write: futures_util::stream::SplitSink<
+        ws_write: futures_util::stream::SplitSink<
             tokio_tungstenite::WebSocketStream<S>,
             Message,
         >,
         mut ws_read: futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>,
         target: TcpStream,
         ratchet: DoubleRatchet,
+        idle_timeout: Duration,
     ) -> Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -884,6 +903,9 @@ impl VpnHandler {
 
         // Share ratchet between tasks using Arc<Mutex>
         let ratchet = std::sync::Arc::new(tokio::sync::Mutex::new(ratchet));
+
+        // Share the sink between task 3 and the post-race Close send below
+        let ws_write = std::sync::Arc::new(tokio::sync::Mutex::new(ws_write));
 
         // Channel for target -> WebSocket direction
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
@@ -894,11 +916,18 @@ impl VpnHandler {
         // Clone ratchet for the spawned tasks
         let ratchet_for_ws = ratchet.clone();
         let ratchet_for_send = ratchet.clone();
+        let ws_write_for_send = ws_write.clone();
+        // Poll the idle deadline at most every 60s, but faster when the
+        // timeout itself is shorter (tests).
+        let idle_check_interval = idle_timeout.min(Duration::from_secs(60));
 
         // Task 1: WebSocket -> Target (decrypt and forward)
         tasks.spawn(async move {
             let mut last_activity = Instant::now();
-            let timeout = Duration::from_secs(300); // 5 minute idle timeout
+            // Interval (not a per-loop sleep) so frequent messages — e.g. a
+            // zombie client's ping stream — cannot keep resetting the check.
+            let mut idle_check = tokio::time::interval(idle_check_interval);
+            idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 tokio::select! {
@@ -935,8 +964,13 @@ impl VpnHandler {
                                 }
                             }
                             Some(Ok(Message::Ping(_))) => {
-                                // Pong handled by tungstenite automatically
-                                last_activity = Instant::now();
+                                // Pong handled by tungstenite automatically.
+                                //
+                                // Deliberately NOT counted as activity: the
+                                // client's ping task keeps pinging even after
+                                // its relay exited on an error path, and
+                                // counting pings would pin zombie flows here
+                                // forever (see LEGACY_TCP_IDLE_TIMEOUT).
                             }
                             Some(Ok(Message::Close(_))) | None => {
                                 break;
@@ -950,8 +984,8 @@ impl VpnHandler {
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                        if last_activity.elapsed() > timeout {
+                    _ = idle_check.tick() => {
+                        if last_activity.elapsed() > idle_timeout {
                             debug!("Idle timeout, closing connection");
                             break;
                         }
@@ -989,18 +1023,21 @@ impl VpnHandler {
         // Task 3: Channel -> WebSocket (encrypt and send)
         tasks.spawn(async move {
             while let Some(data) = rx.recv().await {
-                let mut ratchet_guard = ratchet_for_send.lock().await;
-                match Self::encrypt_frame(&data, &mut ratchet_guard) {
-                    Ok(encrypted) => {
-                        if let Err(e) = ws_write.send(Message::Binary(encrypted)).await {
-                            error!("WebSocket send error: {}", e);
-                            break;
-                        }
-                    }
+                let encrypted = {
+                    let mut ratchet_guard = ratchet_for_send.lock().await;
+                    Self::encrypt_frame(&data, &mut ratchet_guard)
+                };
+                let encrypted = match encrypted {
+                    Ok(e) => e,
                     Err(e) => {
                         error!("Encryption error: {}", e);
                         break;
                     }
+                };
+                let mut sink = ws_write_for_send.lock().await;
+                if let Err(e) = sink.send(Message::Binary(encrypted)).await {
+                    error!("WebSocket send error: {}", e);
+                    break;
                 }
             }
             Ok(())
@@ -1021,6 +1058,14 @@ impl VpnHandler {
                 }
             }
             tasks.abort_all();
+        }
+
+        // Best-effort notify the client on EVERY exit path — most importantly
+        // the target-EOF path, which previously dropped the socket without a
+        // WebSocket Close (clients saw Protocol(ResetWithoutClosingHandshake)).
+        {
+            let mut sink = ws_write.lock().await;
+            let _ = sink.send(Message::Close(None)).await;
         }
 
         // Graceful shutdown: give TLS time to send close_notify
@@ -1110,6 +1155,10 @@ impl VpnHandler {
         tasks.spawn(async move {
             let mut last_activity = Instant::now();
             let timeout = Duration::from_secs(60); // 1 minute idle timeout for UDP
+            // Interval (not a per-loop sleep) so frequent messages cannot
+            // keep resetting the idle check.
+            let mut idle_check = tokio::time::interval(Duration::from_secs(10));
+            idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 tokio::select! {
@@ -1146,7 +1195,8 @@ impl VpnHandler {
                                 }
                             }
                             Some(Ok(Message::Ping(_))) => {
-                                last_activity = Instant::now();
+                                // Not counted as activity — see relay_tcp's
+                                // Ping arm (zombie-flow prevention).
                             }
                             Some(Ok(Message::Close(_))) | None => {
                                 break;
@@ -1158,7 +1208,7 @@ impl VpnHandler {
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    _ = idle_check.tick() => {
                         if last_activity.elapsed() > timeout {
                             debug!("UDP idle timeout, closing connection");
                             break;
@@ -1751,7 +1801,7 @@ where
 
         // Create channel for TUN response packets
         // TunServer sends raw packets here, we encrypt and send via WebSocket
-        let (tun_response_tx, mut tun_response_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+        let (tun_response_tx, tun_response_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
 
         // Register client with TunServer for TUN response routing
         if let Some(allocated_ip) = allocated_ip_for_tun {
@@ -1776,41 +1826,11 @@ where
             warn!("Cannot register client - allocated_ip_for_tun is None!");
         }
 
-        // Task to receive TUN response packets, encrypt, and send via WebSocket.
-        //
-        // IMPORTANT: Do NOT hold the ratchet lock during the WebSocket send.
-        // If the send blocks (TCP backpressure from client), holding the ratchet
-        // lock prevents ws_receiver from decrypting incoming packets, which
-        // freezes the entire session. Encrypt first (with ratchet lock), then
-        // release it, then send (with ws_write lock only).
-        let tun_response_task = async move {
-            while let Some(packet) = tun_response_rx.recv().await {
-                // Step 1: Encrypt — hold ratchet lock only during this fast operation
-                let encrypted = {
-                    let mut ratchet_guard = ratchet_for_tun.lock().await;
-                    match Self::encrypt_data_frame(&mut ratchet_guard, &packet) {
-                        Ok(enc) => enc,
-                        Err(e) => {
-                            error!("Failed to encrypt TUN response: {}", e);
-                            break;
-                        }
-                    }
-                };
-                // ratchet_guard dropped here — ws_receiver / ws_sender can encrypt/decrypt
-
-                // Step 2: Send — hold ws_write lock only
-                {
-                    let mut ws_write_guard = ws_write_for_tun.lock().await;
-                    if let Err(e) = ws_write_guard.send(Message::Binary(encrypted)).await {
-                        error!("Failed to send TUN response via WebSocket: {}", e);
-                        break;
-                    } else {
-                        debug!("Sent encrypted TUN response ({} bytes packet)", packet.len());
-                    }
-                }
-            }
-            debug!("TUN response task ended");
-        };
+        // Task to receive TUN response packets, batch, encrypt, and send via
+        // WebSocket. See run_tun_response_loop for batching rationale and the
+        // ratchet-lock/ws_write-lock discipline.
+        let tun_response_task =
+            Self::run_tun_response_loop(ratchet_for_tun, tun_response_rx, ws_write_for_tun);
 
         // Task to receive from flows and send to WebSocket.
         // Locks are held briefly: ratchet only during encrypt, ws_write only
@@ -1979,10 +1999,16 @@ where
                             }
                         }
                         Ok(Some(Ok(Message::Ping(_)))) => {
-                            *last_activity.lock().unwrap() = Instant::now();
+                            // Deliberately NOT counted as activity: a zombie
+                            // client (relay exited, ping task still running)
+                            // keeps pinging, and counting pings would pin the
+                            // session forever. Real clients always send
+                            // app-level keepalives as Binary frames.
                         }
                         Ok(Some(Ok(Message::Pong(_)))) => {
-                            *last_activity.lock().unwrap() = Instant::now();
+                            // Not activity either: the zombie's tungstenite
+                            // layer auto-pongs our pings even though nobody
+                            // is reading the flow on the client side.
                         }
                         Ok(Some(Ok(Message::Close(_)))) |
                         Ok(None) |
@@ -1990,7 +2016,8 @@ where
                             break;
                         }
                         Ok(Some(Ok(_))) => {
-                            *last_activity.lock().unwrap() = Instant::now();
+                            // Text and any other control frames: ignore,
+                            // do not count as activity.
                         }
                         Err(_) => {
                             // Timeout already checked at the top of the loop;
@@ -2145,30 +2172,135 @@ where
         Ok(())
     }
 
-    /// Encrypt a data frame (for TUN responses)
-    /// Wraps the packet in a MultiplexedFrame with flow_id=1 before encrypting
-    fn encrypt_data_frame(ratchet: &mut DoubleRatchet, data: &[u8]) -> Result<Vec<u8>> {
-        // Wrap the raw packet in a MultiplexedFrame
-        // flow_id=1 for TUN data (control messages use flow_id=0)
-        let frame = MultiplexedFrame::new_data(1, data.to_vec());
-        let encoded = frame.encode()
-            .map_err(|e| anyhow::anyhow!("Failed to encode multiplexed frame: {}", e))?;
+    /// Flow ID for TUN data frames (control messages use flow_id 0).
+    const TUN_DATA_FLOW_ID: u32 = 1;
+    /// Max frames / plaintext bytes per downlink batch — mirrors the
+    /// client's uplink batch caps.
+    const TUN_BATCH_MAX_FRAMES: usize = 16;
+    const TUN_BATCH_MAX_BYTES: usize = 14 * 1024;
 
-        // Pad to 1KB boundary before encryption
-        let padded = rvpn_core::protocol::padding::pad_packet(&encoded)
+    /// Receive TUN response packets, batch them, encrypt, and send over the
+    /// WebSocket.
+    ///
+    /// Batching mirrors the client's uplink path: multiple MultiplexedFrames
+    /// are concatenated, padded ONCE to the 1 KB boundary and encrypted ONCE.
+    /// The previous per-packet framing padded every packet individually,
+    /// inflating a full-MTU segment by ~46 % and a small ACK ~17x on the
+    /// download direction.
+    ///
+    /// Lock discipline: hold the ratchet lock only while encrypting, release
+    /// it, then take the ws_write lock to send. If the send blocks (TCP
+    /// backpressure from the client) the ratchet lock must NOT be held, or
+    /// ws_receiver can no longer decrypt incoming packets and the whole
+    /// session freezes.
+    pub(crate) async fn run_tun_response_loop(
+        ratchet: std::sync::Arc<tokio::sync::Mutex<DoubleRatchet>>,
+        mut tun_response_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        ws_write: std::sync::Arc<
+            tokio::sync::Mutex<
+                futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
+            >,
+        >,
+    ) {
+        // Reused across batches: capacity is retained after clear(), so this
+        // allocates once at steady state instead of per batch.
+        let mut plaintext: Vec<u8> = Vec::with_capacity(Self::TUN_BATCH_MAX_BYTES + 64);
+        // Packet that didn't fit in the current batch (carried to the next).
+        let mut pending: Option<Vec<u8>> = None;
+
+        loop {
+            // First packet of the batch: wait for one if nothing is pending.
+            let first = match pending {
+                Some(p) => {
+                    pending = None;
+                    Some(p)
+                }
+                None => tun_response_rx.recv().await,
+            };
+            let Some(first) = first else { break };
+
+            plaintext.clear();
+            Self::append_tun_frame(&mut plaintext, &first);
+            let mut frame_count = 1usize;
+            let mut byte_count = 6 + first.len();
+            let mut disconnected = false;
+
+            // Drain packets that are already queued without blocking.
+            while frame_count < Self::TUN_BATCH_MAX_FRAMES
+                && byte_count < Self::TUN_BATCH_MAX_BYTES
+            {
+                match tun_response_rx.try_recv() {
+                    Ok(packet) => {
+                        if byte_count + 6 + packet.len() > Self::TUN_BATCH_MAX_BYTES {
+                            pending = Some(packet);
+                            break;
+                        }
+                        Self::append_tun_frame(&mut plaintext, &packet);
+                        frame_count += 1;
+                        byte_count += 6 + packet.len();
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+
+            // Step 1: Encrypt — hold the ratchet lock only during this fast
+            // operation.
+            let encrypted = {
+                let mut ratchet_guard = ratchet.lock().await;
+                match Self::encrypt_data_batch(&mut ratchet_guard, &plaintext) {
+                    Ok(enc) => enc,
+                    Err(e) => {
+                        error!("Failed to encrypt TUN response batch: {}", e);
+                        break;
+                    }
+                }
+            };
+            // ratchet_guard dropped here — ws_receiver / ws_sender can encrypt/decrypt
+
+            // Step 2: Send — hold the ws_write lock only.
+            {
+                let mut ws_write_guard = ws_write.lock().await;
+                if let Err(e) = ws_write_guard.send(Message::Binary(encrypted)).await {
+                    error!("Failed to send TUN response via WebSocket: {}", e);
+                    break;
+                }
+                debug!(
+                    "Sent TUN response batch ({} frames, {} bytes plaintext)",
+                    frame_count, byte_count
+                );
+            }
+
+            if disconnected {
+                break;
+            }
+        }
+        debug!("TUN response task ended");
+    }
+
+    /// Append one TUN data frame (flow_id 1) to a batch plaintext buffer.
+    /// Wire format matches MultiplexedFrame::encode: [flow_id u32 BE][len u16 BE][payload].
+    pub(crate) fn append_tun_frame(buf: &mut Vec<u8>, packet: &[u8]) {
+        buf.extend_from_slice(&Self::TUN_DATA_FLOW_ID.to_be_bytes());
+        buf.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        buf.extend_from_slice(packet);
+    }
+
+    /// Encrypt a batch of concatenated TUN frames: pad once, encrypt once.
+    fn encrypt_data_batch(ratchet: &mut DoubleRatchet, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let padded = rvpn_core::protocol::padding::pad_packet(plaintext)
             .map_err(|e| anyhow::anyhow!("Padding failed: {}", e))?;
 
-        // Encrypt with Data payload type (0x01)
         let message = ratchet
-            .encrypt(&padded, &[0x01])
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+            .encrypt(&padded, &[0x01]) // 0x01 = Data payload type
+            .map_err(|e| anyhow::anyhow!("Double Ratchet encryption failed: {}", e))?;
 
-        // Serialize the RatchetMessage
-        let serialized = message
+        message
             .to_bytes()
-            .map_err(|e| anyhow::anyhow!("Failed to serialize RatchetMessage: {}", e))?;
-
-        Ok(serialized)
+            .context("Failed to serialize RatchetMessage")
     }
 
     /// Process incoming encrypted frame from WebSocket
@@ -2613,8 +2745,14 @@ where
 
     /// Perform X3DH handshake with client
     async fn perform_handshake(&mut self) -> Result<Option<DoubleRatchet>> {
-        // Wait for Hello message
-        let msg = timeout(Duration::from_secs(5), self.ws.next()).await;
+        // Wait for Hello message.
+        //
+        // 15 s (was 5 s): clients now preconnect the transport during
+        // reconnect backoff and may hold the upgraded WebSocket briefly
+        // before sending Hello; 5 s was also tight for real phones
+        // reconnecting mid-handover. Connections that never send a Hello
+        // are still cleaned up — just with a longer grace period.
+        let msg = timeout(Duration::from_secs(15), self.ws.next()).await;
         let msg = match msg {
             Ok(Some(Ok(m))) => m,
             Ok(Some(Err(e))) => {
@@ -3408,7 +3546,7 @@ impl DnsHandler {
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
         // Perform X3DH handshake (same as VpnHandler)
-        let mut ratchet = match self
+        let ratchet = match self
             .perform_handshake(&mut ws_write, &mut ws_read, peer_addr)
             .await?
         {
@@ -3418,7 +3556,33 @@ impl DnsHandler {
 
         info!("DNS handler: handshake complete for {}", peer_addr);
 
-        // DNS query/response loop
+        // DNS query/response loop.
+        //
+        // Queries are resolved CONCURRENTLY. The previous implementation
+        // resolved inline in the read loop: one stalled system-DNS lookup
+        // (no timeout was possible to hang indefinitely) head-of-line blocked
+        // every other query on the connection, and from the client's side the
+        // server simply stopped answering — a silent DNS blackhole until the
+        // client's 60s watchdog forced a reconnect. Now:
+        //   - decryption stays sequential on the read side (ratchet order);
+        //   - each query resolves in its own task bounded by a 5s timeout;
+        //   - encryption is serialized through a mutex (ratchet send chain);
+        //   - outbound frames funnel through a single writer task;
+        //   - in-flight tasks are capped by a semaphore (flood protection).
+        const MAX_IN_FLIGHT_DNS_QUERIES: usize = 64;
+        let ratchet = Arc::new(Mutex::new(ratchet));
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_DNS_QUERIES));
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(256);
+
+        let writer_task = tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                if let Err(e) = ws_write.send(msg).await {
+                    debug!("DNS handler: writer send error: {}", e);
+                    break;
+                }
+            }
+        });
+
         while let Some(msg) = ws_read.next().await {
             match msg {
                 Ok(Message::Binary(data)) => {
@@ -3432,11 +3596,14 @@ impl DnsHandler {
                             }
                         };
 
-                    let plaintext = match ratchet.decrypt(&ratchet_msg, &[0x08]) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            warn!("DNS handler: decryption failed: {}", e);
-                            continue;
+                    let plaintext = {
+                        let mut guard = ratchet.lock().await;
+                        match guard.decrypt(&ratchet_msg, &[0x08]) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("DNS handler: decryption failed: {}", e);
+                                continue;
+                            }
                         }
                     };
 
@@ -3453,45 +3620,97 @@ impl DnsHandler {
                         peer_addr, query.domain, query.query_type
                     );
 
-                    // Resolve the domain
-                    let response = Self::resolve_domain(&query).await;
+                    // Bound concurrency; if saturated, answer with a fast
+                    // failure rather than dropping the query silently — a
+                    // dropped query sits in the client's pending map until
+                    // its watchdog tears down the whole connection.
+                    let permit = in_flight.clone().try_acquire_owned().ok();
+                    if permit.is_none() {
+                        warn!("DNS handler: too many in-flight queries, failing fast: {}", query.domain);
+                    }
 
-                    // Encrypt and send response
-                    let response_bytes = match serde_json::to_vec(&response) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            error!("DNS handler: failed to serialize response: {}", e);
-                            continue;
+                    let ratchet_clone = Arc::clone(&ratchet);
+                    let out_tx_clone = out_tx.clone();
+                    tokio::spawn(async move {
+                        let permit = permit; // held until the response is sent
+
+                        let response = if permit.is_some() {
+                            match timeout(Duration::from_secs(5), Self::resolve_domain(&query))
+                                .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    warn!("DNS handler: resolution timeout for {}", query.domain);
+                                    ProtoDnsResponse {
+                                        query_id: query.query_id,
+                                        success: false,
+                                        ipv4_addrs: vec![],
+                                        ipv6_addrs: vec![],
+                                        ttl: 0,
+                                        error: Some("resolution timeout".to_string()),
+                                    }
+                                }
+                            }
+                        } else {
+                            ProtoDnsResponse {
+                                query_id: query.query_id,
+                                success: false,
+                                ipv4_addrs: vec![],
+                                ipv6_addrs: vec![],
+                                ttl: 0,
+                                error: Some("server busy".to_string()),
+                            }
+                        };
+
+                        // Encrypt and send response
+                        let response_bytes = match serde_json::to_vec(&response) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                error!("DNS handler: failed to serialize response: {}", e);
+                                return;
+                            }
+                        };
+
+                        let encrypted = {
+                            let mut guard = ratchet_clone.lock().await;
+                            match guard.encrypt(&response_bytes, &[0x09]) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    error!("DNS handler: encryption failed: {}", e);
+                                    return;
+                                }
+                            }
+                        };
+
+                        let serialized = match encrypted.to_bytes() {
+                            Ok(b) => b,
+                            Err(e) => {
+                                error!(
+                                    "DNS handler: failed to serialize encrypted response: {}",
+                                    e
+                                );
+                                return;
+                            }
+                        };
+
+                        if out_tx_clone.send(Message::Binary(serialized)).await.is_err() {
+                            debug!("DNS handler: writer channel closed");
                         }
-                    };
-
-                    let encrypted = match ratchet.encrypt(&response_bytes, &[0x09]) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            error!("DNS handler: encryption failed: {}", e);
-                            continue;
-                        }
-                    };
-
-                    let serialized = match encrypted.to_bytes() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            error!("DNS handler: failed to serialize encrypted response: {}", e);
-                            continue;
-                        }
-                    };
-
-                    if let Err(e) = ws_write.send(Message::Binary(serialized)).await {
-                        debug!("DNS handler: send error for {}: {}", peer_addr, e);
+                    });
+                }
+                Ok(Message::Ping(payload)) => {
+                    // Explicit pong so an idle connection still answers client
+                    // keepalives even when no DNS responses are flowing.
+                    if out_tx.send(Message::Pong(payload)).await.is_err() {
                         break;
                     }
                 }
-                Ok(Message::Ping(_)) => {}
                 Ok(Message::Close(_)) | Err(_) => break,
                 _ => {}
             }
         }
 
+        writer_task.abort();
         info!("DNS handler: connection closed for {}", peer_addr);
         Ok(())
     }
@@ -3511,10 +3730,17 @@ impl DnsHandler {
                     }
                 }
 
-                // Filter based on query type: 1=A (IPv4), 28=AAAA (IPv6)
+                // Filter based on query type: 1=A (IPv4), 28=AAAA (IPv6).
+                // Any other qtype (NS/TXT/MX/HTTPS/...) is not representable
+                // in this protocol — return empty lists so the client emits a
+                // proper NODATA instead of A records that don't match the
+                // question type.
                 if query.query_type == 28 {
                     ipv4_addrs.clear();
                 } else if query.query_type == 1 {
+                    ipv6_addrs.clear();
+                } else {
+                    ipv4_addrs.clear();
                     ipv6_addrs.clear();
                 }
 
@@ -3528,7 +3754,12 @@ impl DnsHandler {
                     success: true,
                     ipv4_addrs,
                     ipv6_addrs,
-                    ttl: 300,
+                    // getaddrinfo does not expose real TTLs; 900s is a
+                    // conservative stand-in that cuts tunnel round-trips and
+                    // lengthens outage survival without meaningful staleness
+                    // risk (answers carry multiple A records and clients retry
+                    // alternate IPs on connect failure).
+                    ttl: 900,
                     error: None,
                 }
             }

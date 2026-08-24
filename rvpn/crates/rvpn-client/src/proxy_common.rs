@@ -59,6 +59,26 @@ pub fn parse_target(target: &str) -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
+/// Enable TCP keepalive on an accepted client socket.
+///
+/// LAN peers regularly die without sending FIN/RST — phones roaming between
+/// Wi-Fi and cellular, upstream NAT rebinds, laptops sleeping mid-connection.
+/// Without keepalive the kernel never notices, the socket stays ESTABLISHED
+/// forever, and the flow built on top of it (including its WebSocket to the
+/// server) is pinned forever. With keepalive the dead peer surfaces as a
+/// read error within ~2 minutes and normal teardown runs.
+pub fn enable_tcp_keepalive(stream: TcpStream) -> std::io::Result<TcpStream> {
+    let std_stream = stream.into_std()?;
+    let socket = socket2::Socket::from(std_stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(10));
+    socket.set_tcp_keepalive(&keepalive)?;
+    let std_stream = std::net::TcpStream::from(socket);
+    std_stream.set_nonblocking(true)?;
+    TcpStream::from_std(std_stream)
+}
+
 /// Encode target address for server.
 /// Format: [host_len: u8][host_bytes][port: u16_be]
 pub fn encode_target_address(target: &str) -> Result<Vec<u8>> {
@@ -284,7 +304,7 @@ async fn handle_tunnel_legacy(
         );
     }
 
-    let (mut relay, ws_reader, ws_writer) = StreamRelay::connect(
+    let (mut relay, ws_reader, ws_writer, ws_tasks) = StreamRelay::connect(
         &server.host,
         server.port,
         &server.path,
@@ -305,7 +325,16 @@ async fn handle_tunnel_legacy(
 
     debug!("Sent target address to server: {}", target_addr);
 
-    relay.relay(socket, ws_reader, ws_writer).await?;
+    let result = relay.relay(socket, ws_reader, ws_writer).await;
+
+    // Stop the reader/writer/ping helper tasks now that the relay has ended
+    // (relay() sent a best-effort WS Close before returning). If the ping
+    // task outlives the relay it keeps the socket alive forever — the server
+    // counts pings as activity, so neither side's idle timeout ever fires
+    // and the flow leaks.
+    ws_tasks.shutdown().await;
+
+    result?;
 
     debug!("Legacy tunnel connection closed for {}", addr);
     Ok(())

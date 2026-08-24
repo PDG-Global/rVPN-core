@@ -9,8 +9,14 @@
 // every allocation it makes is tracked by mimalloc (whose `commit_bytes` stays
 // flat at ~10 MB across sustained traffic).
 //
-// Cost: no Chrome ClientHello fingerprint mimicry. macOS keeps the boring
-// backend for stealth; iOS accepts this (same posture as Android).
+// Cost: partial Chrome ClientHello fingerprint mimicry. macOS keeps the boring
+// backend for full mimicry; iOS gets the "best we can do inside stock rustls":
+// TLS 1.3 only (no TLS 1.2 fallback path to differ from Chrome-on-1.3),
+// cipher_suites reordered to Chrome's order (128-GCM first), and kx_groups
+// reordered to lead with X25519. Extension order, GREASE, and padding are still
+// rustls-native — a middlebox doing full JA3/JA4 hashing will still see a
+// different fingerprint from Chrome, but crude cipher/curve-list classifiers
+// pass through.
 //
 // Certificate roots are bundled at compile time via `webpki-roots` (Mozilla CA
 // set), mirroring the boring path's `ca-bundle.pem`. The iOS NE sandbox blocks
@@ -19,7 +25,7 @@
 // trustd dependency.
 
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -48,6 +54,12 @@ fn enable_tcp_keepalive(tcp: TcpStream) -> Result<TcpStream> {
     socket
         .set_tcp_keepalive(&keepalive)
         .context("Failed to set TCP keepalive")?;
+    // Disable Nagle: the tunnel writes small, latency-sensitive frames
+    // (batched packets, keepalives) and Nagle + delayed-ACK interactions
+    // stall them by tens of milliseconds.
+    socket
+        .set_nodelay(true)
+        .context("Failed to set TCP_NODELAY")?;
 
     let std_tcp = std::net::TcpStream::from(socket);
     std_tcp
@@ -101,12 +113,88 @@ impl AsyncWrite for RustlsTlsStream {
     }
 }
 
+/// Build the shared rustls client config.
+///
+/// TLS 1.3 only, Chrome-order cipher suites and kx groups, ALPN http/1.1,
+/// bundled Mozilla roots. See the module docs for the fingerprint rationale.
+fn build_client_config() -> Result<Arc<rustls::ClientConfig>> {
+    // Bundle Mozilla CA roots. iOS NE sandbox blocks /etc/ssl/ and trustd is
+    // unreliable, so we cannot use rustls-platform-verifier here.
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // Build a Chrome-order CryptoProvider on top of the ring provider so the
+    // ClientHello's cipher_suites and kx_groups lists match Chrome-on-TLS-1.3.
+    //
+    // rustls's ring default offers TLS13_AES_256_GCM_SHA384 first; Chrome sends
+    // TLS_AES_128_GCM_SHA256 first. Reordering these two lists is what makes
+    // JA3-style hashers that key on cipher order stop distinguishing us from
+    // Chrome. Extension order and GREASE we can't reach from rustls 0.22.
+    let base = rustls::crypto::ring::default_provider();
+    let provider = rustls::crypto::CryptoProvider {
+        cipher_suites: vec![
+            rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
+            rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+        ],
+        kx_groups: vec![
+            rustls::crypto::ring::kx_group::X25519,
+            rustls::crypto::ring::kx_group::SECP256R1,
+            rustls::crypto::ring::kx_group::SECP384R1,
+        ],
+        ..base
+    };
+
+    // TLS 1.3 only — Chrome-on-1.2 and Chrome-on-1.3 have very different
+    // ClientHellos, and our server always speaks 1.3. Leaving 1.2 in the offer
+    // set would balloon the fingerprint surface for zero real gain.
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("rustls ClientConfig with TLS 1.3-only")?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    // ALPN: http/1.1 only (rustls 0.22 exposes this as a public field, not a
+    // builder method). Matches the boring backend's set_alpn_protos(b"\x08http/1.1").
+    // Advertising `h2` would let nginx pick HTTP/2 and break our manual WS upgrade.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    debug!(
+        "rustls config: TLS 1.3 only (ring, Chrome cipher/KX order), ALPN http/1.1, \
+         bundled Mozilla roots"
+    );
+
+    Ok(Arc::new(config))
+}
+
+/// The process-wide shared client config.
+///
+/// Reusing one config across every connect is what enables TLS 1.3 session
+/// resumption: rustls's in-memory session store hangs off the ClientConfig,
+/// so the NewSessionTickets the server sends (4 by default) are kept and
+/// presented as a PSK on the NEXT connect. With a fresh config per connect
+/// the tickets were thrown away and every reconnect paid a full handshake
+/// (certificate exchange, verification and signature). Resumption also
+/// skips rebuilding the root store and the Chrome-order CryptoProvider on
+/// every reconnect, which matters inside the iOS NE memory budget.
+fn shared_client_config() -> Result<&'static Arc<rustls::ClientConfig>> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    if let Some(config) = CONFIG.get() {
+        return Ok(config);
+    }
+    let config = build_client_config()?;
+    // If another thread raced us, get_or_init keeps the winner's instance so
+    // every connect still shares one config (and one session store).
+    Ok(CONFIG.get_or_init(|| config))
+}
+
 /// Connect to a server via rustls.
 ///
 /// 1. TCP connect (with keepalive: 60s time, 10s interval — parity with the
 ///    boring backend).
 /// 2. TLS 1.3 handshake using Mozilla CA roots bundled at compile time
-///    (`webpki-roots`).
+///    (`webpki-roots`). Reconnects resume via PSK using the shared session
+///    store (see [`shared_client_config`]).
 /// 3. ALPN `http/1.1` only — forces nginx to negotiate HTTP/1.1 so the manual
 ///    WebSocket upgrade parses (advertising `h2` would let nginx pick HTTP/2
 ///    and break the upgrade).
@@ -129,31 +217,12 @@ pub async fn connect_rustls(
         .with_context(|| format!("Failed to connect to {}", addr))?;
     let tcp = enable_tcp_keepalive(tcp).context("Failed to enable TCP keepalive")?;
 
-    // Bundle Mozilla CA roots. iOS NE sandbox blocks /etc/ssl/ and trustd is
-    // unreliable, so we cannot use rustls-platform-verifier here.
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    // Workspace pins rustls with features=["tls12","ring"], so the ring CryptoProvider
-    // is auto-installed as the default — ClientConfig::builder() works without an
-    // explicit provider call (same as android_tun.rs).
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    // ALPN: http/1.1 only (rustls 0.22 exposes this as a public field, not a
-    // builder method). Matches the boring backend's set_alpn_protos(b"\x08http/1.1").
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-    let connector = TlsConnector::from(Arc::new(config));
+    let connector = TlsConnector::from(Arc::clone(shared_client_config()?));
 
     let server_name = rustls::pki_types::ServerName::try_from(sni.to_owned())
         .map_err(|e| anyhow::anyhow!("Invalid SNI hostname {:?}: {}", sni, e))?;
 
-    debug!(
-        "rustls config: TLS 1.2/1.3 (ring), ALPN http/1.1, bundled Mozilla roots, SNI: {}",
-        sni
-    );
+    debug!("rustls connecting (shared config, PSK resumption if ticket held), SNI: {}", sni);
 
     let tls_stream = connector
         .connect(server_name, tcp)
@@ -163,4 +232,20 @@ pub async fn connect_rustls(
     debug!("rustls TLS handshake completed successfully");
 
     Ok(RustlsTlsStream::new(tls_stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Session resumption depends on every connect sharing ONE config: the
+    /// session store lives on the ClientConfig, so two distinct configs can
+    /// never resume each other's tickets.
+    #[test]
+    fn shared_client_config_is_reused_across_calls() {
+        let a = shared_client_config().expect("config builds");
+        let b = shared_client_config().expect("config builds again");
+        assert!(Arc::ptr_eq(a, b), "config must be a single shared instance");
+        assert_eq!(a.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
 }

@@ -25,7 +25,8 @@ use rvpn_core::protocol::{ControlMessage, HandshakeMessage, MultiplexedFrame, Pa
 use crate::config::ServerIdentityConfig;
 use crate::identity_verification::{verify_server_identity, KnownHosts};
 use crate::websocket::{
-    connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter,
+    connect_websocket, split_websocket, Message, WebSocketReader, WebSocketTaskHandle,
+    WebSocketWriter,
 };
 use rvpn_tls::TlsFingerprint;
 
@@ -57,6 +58,11 @@ pub struct Socks5Tunnel {
     alive: AtomicBool,
     /// When this tunnel was created (for diagnostics)
     created_at: std::time::Instant,
+    /// Holds the reader/writer/ping helper tasks' shutdown signal. When this
+    /// tunnel is dropped (replaced after death), the handle's Drop signals
+    /// the tasks to stop so the ping task cannot keep the dead tunnel's
+    /// WebSocket alive forever.
+    _ws_tasks: WebSocketTaskHandle,
 }
 
 /// Handle for a single multiplexed SOCKS5 flow.
@@ -135,7 +141,7 @@ async fn send_close_frame(
         guard.encrypt(&padded, &[PayloadType::Admin as u8])?
     };
     let encrypted = message.to_bytes()?;
-    ws_writer.send(Message::Binary(encrypted))?;
+    ws_writer.send(Message::Binary(encrypted)).await?;
     debug!("Sent CloseFlow for flow {}", flow_id);
     Ok(())
 }
@@ -168,7 +174,7 @@ impl Socks5Tunnel {
             })
             .context("Failed to establish multiplexed WebSocket connection")?;
 
-        let (mut ws_reader, ws_writer) = split_websocket(ws_stream);
+        let (mut ws_reader, ws_writer, ws_tasks) = split_websocket(ws_stream);
 
         let ratchet = Self::perform_handshake(
             &mut ws_reader,
@@ -193,6 +199,7 @@ impl Socks5Tunnel {
             flow_states: Mutex::new(HashMap::new()),
             alive: AtomicBool::new(true),
             created_at: std::time::Instant::now(),
+            _ws_tasks: ws_tasks,
         });
 
         // Background receive loop
@@ -265,7 +272,7 @@ impl Socks5Tunnel {
                                     Ok(ciphertext) => {
                                         let _ = tunnel.ws_writer.send(Message::Binary(
                                             ciphertext.to_bytes().unwrap_or_default(),
-                                        ));
+                                        )).await;
                                     }
                                     Err(e) => {
                                         debug!("Keepalive encrypt failed: {}", e);
@@ -313,6 +320,7 @@ impl Socks5Tunnel {
         };
         ws_writer
             .send(Message::Binary(serde_json::to_vec(&hello)?))
+            .await
             .context("Failed to send Hello")?;
 
         let response = ws_reader
@@ -485,7 +493,7 @@ impl Socks5Tunnel {
             let mut g = self.ratchet.lock().await;
             g.encrypt(&padded, &[PayloadType::Admin as u8])?
         };
-        self.ws_writer.send(Message::Binary(message.to_bytes()?))?;
+        self.ws_writer.send(Message::Binary(message.to_bytes()?)).await?;
         debug!("Sent CreateFlow {} → {}:{}", flow_id, target, port);
         Ok(())
     }
@@ -696,7 +704,7 @@ impl Socks5Tunnel {
                 let mut g = ratchet.lock().await;
                 g.encrypt(&padded, &[PayloadType::Data as u8])?
             };
-            ws_writer.send(Message::Binary(message.to_bytes()?))?;
+            ws_writer.send(Message::Binary(message.to_bytes()?)).await?;
             trace!("Flow {} → {} bytes", flow_id, frame.payload.len());
         }
         Ok(())

@@ -180,6 +180,17 @@ impl Socks5Proxy {
 
         loop {
             let (socket, addr) = listener.accept().await?;
+
+            // Detect silently-dead peers (roaming phones, NAT rebinds) so the
+            // flow built on this socket cannot be pinned forever.
+            let socket = match proxy_common::enable_tcp_keepalive(socket) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to set TCP keepalive for {}: {}", addr, e);
+                    continue;
+                }
+            };
+
             let proxy = ProxyHandle {
                 server_host: self.server_host.clone(),
                 server_port: self.server_port,
@@ -214,8 +225,20 @@ async fn handle_connection(
 ) -> Result<()> {
     debug!("New SOCKS5 connection from {}", addr);
 
-    // 1. SOCKS5 handshake (protocol-specific)
-    let target_addr = socks5_handshake(&mut socket).await?;
+    // 1. SOCKS5 handshake (protocol-specific), bounded so a client that
+    // connects but never speaks SOCKS5 cannot pin the task + fd forever.
+    let target_addr = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        socks5_handshake(&mut socket),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            debug!("SOCKS5 handshake timed out from {}", addr);
+            return Err(anyhow::anyhow!("SOCKS5 handshake timed out (30s)"));
+        }
+    };
     debug!("SOCKS5 target: {}", target_addr);
 
     // 2. Send SOCKS5 success response

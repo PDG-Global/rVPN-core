@@ -3,7 +3,7 @@ name = "rvpn-mobile"
 # Pinned separately from the workspace: iOS/macOS/Android apps still ship v1.2.6
 # on the App Store / Play Store. Bump this in lockstep with those mobile releases,
 # not with the CLI/server workspace version.
-version = "1.2.6"
+version = "1.2.7"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -104,6 +104,11 @@ rvpn-split-tunnel = { path = "../rvpn-split-tunnel", default-features = false }
 # Optional: Use tracing-oslog for iOS device logging (requires iOS SDK)
 # Enable with --features ios-logging when building for device
 tracing-oslog = { version = "0.2", optional = true }
+
+# macOS-specific dependencies
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS keeps builtin IPs/domains (no 50MB NetworkExtension jetsam limit)
+rvpn-split-tunnel = { path = "../rvpn-split-tunnel" }
 
 # Android-specific dependencies
 [target.'cfg(target_os = "android")'.dependencies]

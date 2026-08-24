@@ -297,47 +297,46 @@ impl<S: AsyncWrite + Unpin> MinimalWsWriter<S> {
         let mut mask_key = [0u8; 4];
         rand::rngs::OsRng.fill_bytes(&mut mask_key);
 
-        self.write_frame_header(opcode, payload.len()).await?;
-        self.writer.write_all(&mask_key).await?;
-
-        if payload.is_empty() {
-            return Ok(());
+        // Assemble the ENTIRE frame (header + mask key + masked payload) in
+        // the reusable scratch buffer and send it with a single write. The
+        // previous implementation issued 2-3 separate writes, which became
+        // separate TLS records; with Nagle + receiver delayed-ACKs that
+        // produced intermittent ~40 ms stalls on every uplink frame.
+        // `resize` only sets length here (capacity was pre-allocated up to
+        // READ_BUF_SIZE; the largest data batch is ~14 KB which fits), so
+        // this does not allocate after the buffer reaches steady state.
+        let payload_len = payload.len();
+        let header_len = if payload_len <= 125 {
+            2
+        } else if payload_len <= 65535 {
+            4
+        } else {
+            10
+        };
+        let total = header_len + 4 + payload_len;
+        if self.mask_buf.len() < total {
+            self.mask_buf.resize(total, 0);
         }
+        let buf = &mut self.mask_buf[..total];
 
-        // Mask the payload into the reusable scratch buffer, then send it in one
-        // write. `resize` only sets length here (capacity was pre-allocated up to
-        // READ_BUF_SIZE; the largest data batch is ~14 KB which fits), so this
-        // does not allocate after the buffer reaches steady state.
-        if self.mask_buf.len() < payload.len() {
-            self.mask_buf.resize(payload.len(), 0);
-        }
-        let buf = &mut self.mask_buf[..payload.len()];
-        buf.copy_from_slice(payload);
-        apply_mask_inplace(buf, &mask_key, 0);
-        self.writer.write_all(buf).await?;
-        Ok(())
-    }
-
-    async fn write_frame_header(&mut self, opcode: u8, payload_len: usize) -> Result<()> {
         let byte0 = 0x80 | opcode; // FIN=1, opcode
         // Mask bit (byte1 bit 7) is ALWAYS set for client frames.
         if payload_len <= 125 {
-            self.writer
-                .write_all(&[byte0, 0x80 | payload_len as u8])
-                .await?;
+            buf[..2].copy_from_slice(&[byte0, 0x80 | payload_len as u8]);
         } else if payload_len <= 65535 {
             let len_bytes = (payload_len as u16).to_be_bytes();
-            self.writer
-                .write_all(&[byte0, 0x80 | 126, len_bytes[0], len_bytes[1]])
-                .await?;
+            buf[..4].copy_from_slice(&[byte0, 0x80 | 126, len_bytes[0], len_bytes[1]]);
         } else {
             let len_bytes = (payload_len as u64).to_be_bytes();
-            let mut hdr = [0u8; 10];
-            hdr[0] = byte0;
-            hdr[1] = 0x80 | 127;
-            hdr[2..10].copy_from_slice(&len_bytes);
-            self.writer.write_all(&hdr).await?;
+            buf[0] = byte0;
+            buf[1] = 0x80 | 127;
+            buf[2..10].copy_from_slice(&len_bytes);
         }
+        buf[header_len..header_len + 4].copy_from_slice(&mask_key);
+        buf[header_len + 4..].copy_from_slice(payload);
+        apply_mask_inplace(&mut buf[header_len + 4..], &mask_key, 0);
+
+        self.writer.write_all(buf).await?;
         Ok(())
     }
 }

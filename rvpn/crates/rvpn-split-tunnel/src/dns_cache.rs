@@ -44,6 +44,30 @@ pub struct DnsResolver {
 /// Global atomic counter for DNS query transaction IDs
 static DNS_TXID: AtomicU16 = AtomicU16::new(1);
 
+/// Last-resort public resolvers, appended after the configured nameservers.
+/// The commonly configured CN resolvers (223.6.6.6, 114.114.114.114)
+/// occasionally drop UDP queries under congestion, and the system-resolver
+/// fallback loops back into our own DNS proxy when rvpn is the system DNS —
+/// both observed as sporadic resolution failures in the field. A slower
+/// answer from a last-resort resolver beats SERVFAIL.
+pub const LAST_RESORT_NAMESERVERS: &[SocketAddr] = &[
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 53),
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 53),
+];
+
+/// Append any last-resort resolvers not already present in `nameservers`.
+pub fn with_last_resort_nameservers(nameservers: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut out = nameservers.to_vec();
+    if !out.is_empty() {
+        for &ns in LAST_RESORT_NAMESERVERS {
+            if !out.contains(&ns) {
+                out.push(ns);
+            }
+        }
+    }
+    out
+}
+
 impl DnsResolver {
     /// Create a new DNS resolver
     pub fn new(
@@ -67,7 +91,7 @@ impl DnsResolver {
             cache_size,
             ipv6_enabled,
             prefer_ipv4,
-            nameservers,
+            nameservers: with_last_resort_nameservers(&nameservers),
             cleanup_started: AtomicBool::new(false),
         }
     }
@@ -144,7 +168,7 @@ impl DnsResolver {
                 }
             }
             debug!(
-                "All custom nameservers failed for {}, falling back to system resolver",
+                "All nameservers (including last-resort) failed for {}, falling back to system resolver",
                 host
             );
         }

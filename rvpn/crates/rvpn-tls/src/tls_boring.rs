@@ -39,6 +39,10 @@ fn enable_tcp_keepalive(tcp: TcpStream) -> Result<TcpStream> {
         .with_interval(Duration::from_secs(10));
     socket.set_tcp_keepalive(&keepalive)
         .context("Failed to set TCP keepalive")?;
+    // Disable Nagle: the tunnel writes small, latency-sensitive frames and
+    // Nagle + delayed-ACK interactions stall them by tens of milliseconds.
+    socket.set_nodelay(true)
+        .context("Failed to set TCP_NODELAY")?;
 
     let std_tcp = std::net::TcpStream::from(socket);
     std_tcp.set_nonblocking(true)

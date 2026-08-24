@@ -18,7 +18,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
+use rvpn_core::crypto::{DoubleRatchet, IdentityKey, Signature, Verifier, VerifyingKey, X3DHPublicBundle};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
 use rvpn_core::crypto::ratchet::RatchetMessage;
 use rvpn_core::protocol::HandshakeMessage;
@@ -58,6 +58,10 @@ pub struct DnsProxy {
     dns_resolver: Arc<DnsResolver>,
     /// Public nameservers for bypass domain resolution (direct UDP, avoids loopback)
     nameservers: Vec<SocketAddr>,
+    /// Hostnames of all configured VPN servers (primary + extras), lowercased
+    /// with any trailing dot stripped. Queries for these are always resolved
+    /// locally — see the dispatch loop for why.
+    server_hosts: Arc<Vec<String>>,
 }
 
 impl DnsProxy {
@@ -74,6 +78,7 @@ impl DnsProxy {
         split_tunnel: Arc<SplitTunnel>,
         dns_resolver: Arc<DnsResolver>,
         nameservers: Vec<SocketAddr>,
+        extra_server_hosts: Vec<String>,
     ) -> Self {
         // Derive DNS path from base WebSocket path, stripping any mux/tun suffix
         let base_path = server_path.trim_end_matches('/');
@@ -82,6 +87,15 @@ impl DnsProxy {
             .or_else(|| base_path.strip_suffix("/tun"))
             .unwrap_or(base_path);
         let server_dns_path = format!("{}/dns", base_path);
+        // Normalized hostnames of every VPN server this client may connect to.
+        let mut server_hosts: Vec<String> =
+            Vec::with_capacity(1 + extra_server_hosts.len());
+        server_hosts.push(server_host.trim_end_matches('.').to_ascii_lowercase());
+        server_hosts.extend(
+            extra_server_hosts
+                .iter()
+                .map(|h| h.trim_end_matches('.').to_ascii_lowercase()),
+        );
         Self {
             listen_addr,
             server_host,
@@ -93,7 +107,11 @@ impl DnsProxy {
             split_tunnel,
             next_id: AtomicU64::new(1),
             dns_resolver,
-            nameservers,
+            // Append last-resort public resolvers so a transient failure of
+            // the configured resolvers degrades to a slower answer instead of
+            // SERVFAIL for every bypass query.
+            nameservers: rvpn_split_tunnel::dns_cache::with_last_resort_nameservers(&nameservers),
+            server_hosts: Arc::new(server_hosts),
         }
     }
 
@@ -128,12 +146,31 @@ impl DnsProxy {
             let split_tunnel_clone = Arc::clone(&self.split_tunnel);
             let dns_resolver_clone = Arc::clone(&self.dns_resolver);
             let nameservers_clone = self.nameservers.clone();
+            let server_hosts_clone = Arc::clone(&self.server_hosts);
             tokio::spawn(async move {
                 match parse_dns_query(&data) {
                     Ok((dns_txid, domain, qtype)) => {
                         debug!("DNS query from {}: {} (type={})", src, domain, qtype);
 
-                        let wire = match split_tunnel_clone.decide_by_host(&domain).await {
+                        // The VPN server hostnames themselves must never be
+                        // resolved through the tunnel: the tunnel needs DNS to
+                        // (re)connect, so tunneling these queries creates a
+                        // circular dependency — after any disconnect, buffered
+                        // queries wait for the tunnel while the tunnel waits
+                        // for DNS, and the client never recovers. Resolve them
+                        // locally via the same path as bypass domains.
+                        let is_server_host = {
+                            let q = domain.trim_end_matches('.').to_ascii_lowercase();
+                            server_hosts_clone.iter().any(|h| *h == q)
+                        };
+                        let decision = if is_server_host {
+                            debug!("DNS proxy: {} is a VPN server host, resolving locally", domain);
+                            RoutingDecision::Bypass
+                        } else {
+                            split_tunnel_clone.decide_by_host(&domain).await
+                        };
+
+                        let wire = match decision {
                             RoutingDecision::Bypass => {
                                 // Resolve locally — bypass domain should not go through tunnel
                                 debug!("DNS proxy: resolving {} locally (bypass)", domain);
@@ -161,31 +198,78 @@ impl DnsProxy {
                                 build_dns_nxdomain(&data, dns_txid)
                             }
                             RoutingDecision::Tunnel => {
-                                // Check local cache before forwarding through tunnel
-                                if let Some(ips) = dns_resolver_clone.lookup_cached(&domain).await {
-                                    debug!("DNS proxy: cache hit for {}, skipping tunnel", domain);
-                                    let ipv4_addrs: Vec<std::net::Ipv4Addr> = ips
-                                        .iter()
-                                        .filter_map(|ip| match ip {
-                                            IpAddr::V4(v4) => Some(*v4),
-                                            _ => None,
-                                        })
-                                        .collect();
-                                    // Use the actual remaining TTL from the cache entry
-                                    let ttl = dns_resolver_clone.get_remaining_ttl(&domain).await.unwrap_or(14400);
+                                // Non-address record types (NS/TXT/MX/HTTPS/...)
+                                // cannot be represented by the tunnel DNS protocol
+                                // (server answers via getaddrinfo — A/AAAA only).
+                                // Resolve them locally with a raw UDP forward so
+                                // diagnostic tools (dig) and HTTPS-RR clients get
+                                // real answers instead of empty NODATA/SERVFAIL.
+                                // A/AAAA — the record types CN resolvers poison
+                                // for connectivity — still go through the tunnel.
+                                if qtype != 1 && qtype != 28 {
+                                    debug!("DNS proxy: resolving {} (type={}) locally (non-A/AAAA)", domain, qtype);
+                                    match resolve_locally(
+                                        &data, dns_txid, &domain, qtype, &nameservers_clone
+                                    ).await {
+                                        Ok(wire) => wire,
+                                        Err(e) => {
+                                            warn!("DNS proxy: local resolution failed for {} (type={}): {}", domain, qtype, e);
+                                            build_dns_servfail(&data, dns_txid)
+                                        }
+                                    }
+                                } else {
+
+                                // The server has no IPv6 upstream and build_dns_response
+                                // strips AAAA records, so an AAAA query can only ever
+                                // produce an empty answer. Answer locally with an empty
+                                // NOERROR (NODATA) instead of spending a tunnel
+                                // round-trip — and during tunnel outages AAAA lookups
+                                // can no longer stall the client's resolver.
+                                if qtype == 28 {
                                     let response = DnsResponse {
                                         query_id: 0,
                                         success: true,
-                                        ipv4_addrs,
+                                        ipv4_addrs: vec![],
                                         ipv6_addrs: vec![],
-                                        ttl,
+                                        ttl: 300,
                                         error: None,
                                     };
                                     let wire = build_dns_response(&data, dns_txid, &response);
                                     if let Err(e) = socket_clone.send_to(&wire, src).await {
-                                        debug!("DNS proxy: failed to send cached response to {}: {}", src, e);
+                                        debug!("DNS proxy: failed to send AAAA NODATA to {}: {}", src, e);
                                     }
                                     return;
+                                }
+
+                                // Check local cache before forwarding through tunnel.
+                                // A queries only: cached A data must never answer a
+                                // non-A question (HTTPS/TXT/etc. would get A records).
+                                if qtype == 1 {
+                                    if let Some(ips) = dns_resolver_clone.lookup_cached(&domain).await {
+                                        debug!("DNS proxy: cache hit for {}, skipping tunnel", domain);
+                                        let ipv4_addrs: Vec<std::net::Ipv4Addr> = ips
+                                            .iter()
+                                            .filter_map(|ip| match ip {
+                                                IpAddr::V4(v4) => Some(*v4),
+                                                _ => None,
+                                            })
+                                            .collect();
+                                        // Use the actual remaining TTL from the cache entry
+                                        let ttl = dns_resolver_clone.get_remaining_ttl(&domain).await.unwrap_or(14400);
+                                        let response = DnsResponse {
+                                            query_id: 0,
+                                            success: true,
+                                            ipv4_addrs,
+                                            ipv6_addrs: vec![],
+                                            ttl,
+                                            error: None,
+                                        };
+                                        let wire = build_dns_response(&data, dns_txid, &response);
+                                        if let Err(e) = socket_clone.send_to(&wire, src).await {
+                                            debug!("DNS proxy: failed to send cached response to {}: {}", src, e);
+                                        }
+                                        return;
+                                    }
                                 }
 
                                 // Forward through encrypted WebSocket tunnel
@@ -201,8 +285,13 @@ impl DnsProxy {
                                 // 5s timeout — if the WebSocket is zombie (protocol alive but
                                 // server not responding), don't hang the DNS client forever.
                                 match tokio::time::timeout(tokio::time::Duration::from_secs(5), reply_rx).await {
-                                    Ok(Ok(Some(r))) => build_dns_response(&data, dns_txid, &r),
+                                    // Propagate resolution failure as SERVFAIL
+                                    // instead of a NOERROR with no answers —
+                                    // NODATA wrongly tells stubs the name
+                                    // exists but has no such record.
+                                    Ok(Ok(Some(r))) if r.success => build_dns_response(&data, dns_txid, &r),
                                     _ => build_dns_servfail(&data, dns_txid),
+                                }
                                 }
                             }
                         };
@@ -240,7 +329,7 @@ impl DnsProxy {
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
-            backoff_secs = (backoff_secs * 2).min(30);
+            backoff_secs = (backoff_secs * 2).min(10);
         }
     }
 
@@ -249,17 +338,27 @@ impl DnsProxy {
         &self,
         query_rx: &mut mpsc::UnboundedReceiver<QueryMsg>,
     ) -> Result<()> {
-        let ws = connect_websocket(
-            &self.server_host,
-            self.server_port,
-            &self.server_dns_path,
-            self.tls_fingerprint,
-            None, // SNI hostname not needed for DNS proxy (connects to same server)
+        // Bound the connect (TCP + TLS handshake + WS upgrade are all
+        // unbounded inside connect_websocket) so a dead/hung server cannot
+        // stall the reconnect loop forever.
+        let ws = tokio::time::timeout(
+            Duration::from_secs(15),
+            connect_websocket(
+                &self.server_host,
+                self.server_port,
+                &self.server_dns_path,
+                self.tls_fingerprint,
+                None, // SNI hostname not needed for DNS proxy (connects to same server)
+            ),
         )
         .await
+        .map_err(|_| anyhow::anyhow!("DNS proxy: WebSocket connect timed out (15s)"))?
         .context("DNS proxy: WebSocket connect failed")?;
 
-        let (mut reader, writer) = split_websocket(ws);
+        // Split into reader/writer. The task handle is bound for the lifetime
+        // of this tunnel run; its Drop signals the reader/writer/ping helper
+        // tasks to stop when the run ends (reconnect or shutdown).
+        let (mut reader, writer, _ws_tasks) = split_websocket(ws);
 
         let mut ratchet = dns_handshake(&mut reader, &writer, &self.identity_key, &self.server_bundle)
             .await
@@ -295,7 +394,9 @@ impl DnsProxy {
         // Persistent interval for checking pending query age. Using a persistent
         // interval (not tokio::time::sleep inside select!) ensures the check fires
         // regularly even when other branches (reader.recv, query_rx) fire frequently.
-        let mut check_interval = tokio::time::interval(Duration::from_secs(10));
+        // Tick at half the pending-timeout (10s) so an unanswered query is
+        // detected within ~10-15s rather than up to 2x the threshold.
+        let mut check_interval = tokio::time::interval(Duration::from_secs(5));
         check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
@@ -319,6 +420,7 @@ impl DnsProxy {
 
                             writer
                                 .send(Message::Binary(serialized))
+                                .await
                                 .context("DNS proxy: failed to send query")?;
 
                             pending.insert(query_id, PendingQuery {
@@ -398,19 +500,21 @@ impl DnsProxy {
                 }
 
                 // Application-level timeout: check if any pending query has been
-                // waiting for a response for more than 60s. Using a persistent
-                // interval guarantees this check runs regularly regardless of
-                // WebSocket control-frame traffic that would reset a naive sleep.
+                // waiting for a response for more than 10s. The server caps
+                // resolution at 5s, so a healthy connection always answers well
+                // within this window. Using a persistent interval guarantees this
+                // check runs regularly regardless of WebSocket control-frame
+                // traffic that would reset a naive sleep.
                 _ = check_interval.tick(), if !pending.is_empty() => {
                     let now = Instant::now();
                     let oldest = pending.values().map(|pq| pq.sent_at).min();
                     if let Some(oldest) = oldest {
-                        if now.duration_since(oldest) >= Duration::from_secs(60) {
-                            warn!("DNS proxy: {} pending queries with no response for 60s, forcing reconnect", pending.len());
+                        if now.duration_since(oldest) >= Duration::from_secs(10) {
+                            warn!("DNS proxy: {} pending queries with no response for 10s, forcing reconnect", pending.len());
                             for (_, pq) in pending.drain() {
                                 let _ = pq.tx.send(None);
                             }
-                            anyhow::bail!("DNS proxy: pending query timeout (60s)");
+                            anyhow::bail!("DNS proxy: pending query timeout (10s)");
                         }
                     }
                 }
@@ -447,11 +551,14 @@ async fn dns_handshake(
     let hello_bytes = serde_json::to_vec(&hello).context("Failed to serialize Hello")?;
     writer
         .send(Message::Binary(hello_bytes))
+        .await
         .context("Failed to send Hello")?;
 
-    let response = reader
-        .recv()
+    // Bound the wait for ServerHello so a server that accepts the WebSocket
+    // but never completes the handshake cannot stall the reconnect loop.
+    let response = tokio::time::timeout(Duration::from_secs(15), reader.recv())
         .await
+        .map_err(|_| anyhow::anyhow!("DNS handshake: timed out waiting for ServerHello (15s)"))?
         .ok_or_else(|| anyhow::anyhow!("DNS WebSocket closed during handshake"))?;
 
     match response {
@@ -462,14 +569,62 @@ async fn dns_handshake(
             match server_hello {
                 HandshakeMessage::ServerHello {
                     ephemeral_key: _server_ephemeral,
-                    ..
+                    identity_key: server_identity_key,
+                    signed_prekey: server_signed_prekey,
+                    prekey_signature: server_prekey_signature,
                 } => {
+                    // Use the SERVER'S ACTUAL wire values for X3DH.
+                    //
+                    // Previously this discarded every ServerHello key and ran
+                    // X3DH against the pre-loaded on-disk bundle. Whenever the
+                    // on-disk copy drifted from what the server was actually
+                    // running (any `rvpn-server prekey-bundle` regeneration),
+                    // chain keys diverged and the first Double Ratchet frame
+                    // failed AEAD auth right after a "successful" handshake.
+                    //
+                    // Mirrors StreamRelay::perform_handshake (commit 8234f819
+                    // fixed this for the SOCKS5 path but not the DNS path).
+                    let server_identity_key: [u8; 32] = server_identity_key
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Server identity key has invalid length"))?;
+                    let server_signed_prekey: [u8; 32] = server_signed_prekey
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Server signed prekey has invalid length"))?;
+                    let prekey_signature_bytes: [u8; 64] = server_prekey_signature
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("Prekey signature has invalid length"))?;
+
+                    // Verify the Ed25519 signature on signed_prekey using the
+                    // server's wire identity_key. Without this a MITM could
+                    // feed us any signed_prekey they liked.
+                    let verifying_key = VerifyingKey::from_bytes(&server_identity_key)
+                        .map_err(|e| anyhow::anyhow!("Invalid server identity key: {}", e))?;
+                    let signature = Signature::from_bytes(&prekey_signature_bytes);
+                    verifying_key
+                        .verify(&server_signed_prekey, &signature)
+                        .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
+
+                    // identity_x25519_key can't be derived from the Ed25519
+                    // public alone; keep the pre-loaded value (it is
+                    // deterministic from the same identity).
+                    let received_bundle = X3DHPublicBundle {
+                        identity_key: server_identity_key,
+                        identity_x25519_key: server_bundle.identity_x25519_key,
+                        signed_prekey: server_signed_prekey,
+                        prekey_signature: prekey_signature_bytes,
+                        one_time_prekey: None,
+                        identity_key_version: server_bundle.identity_key_version,
+                        rotation_signature: server_bundle.rotation_signature,
+                    };
+
                     let (shared_secret, _) = initiator
-                        .agree(server_bundle)
+                        .agree(&received_bundle)
                         .context("X3DH key agreement failed")?;
 
                     // In X3DH, the server (Bob) doesn't generate an ephemeral key.
-                    // The _server_ephemeral field in ServerHello is empty.
                     // We pass zeros since init_alice doesn't use this parameter.
                     Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32]))
                 }

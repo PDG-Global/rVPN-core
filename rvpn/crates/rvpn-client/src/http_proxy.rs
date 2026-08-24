@@ -93,6 +93,16 @@ impl HttpProxy {
         loop {
             let (socket, addr) = listener.accept().await?;
 
+            // Detect silently-dead peers (roaming phones, NAT rebinds) so the
+            // flow built on this socket cannot be pinned forever.
+            let socket = match proxy_common::enable_tcp_keepalive(socket) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to set TCP keepalive for {}: {}", addr, e);
+                    continue;
+                }
+            };
+
             let proxy = ProxyHandle {
                 server_host: self.server_host.clone(),
                 server_port: self.server_port,
@@ -151,10 +161,33 @@ async fn handle_connection(
 ) -> Result<()> {
     debug!("New HTTP proxy connection from {}", addr);
 
+    let mut first_request = true;
     loop {
         let mut reader = BufReader::new(socket);
         let mut request_line = String::new();
-        match reader.read_line(&mut request_line).await {
+        // Bound the wait for the FIRST request on a fresh connection so a
+        // client that connects but never sends anything cannot pin the task
+        // + fd forever. Keep-alive reads between requests stay unbounded.
+        let read_result = if first_request {
+            first_request = false;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                reader.read_line(&mut request_line),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    debug!("HTTP proxy: first request timed out from {}", addr);
+                    return Err(anyhow::anyhow!(
+                        "HTTP proxy: timed out waiting for first request (30s)"
+                    ));
+                }
+            }
+        } else {
+            reader.read_line(&mut request_line).await
+        };
+        match read_result {
             Ok(0) => return Ok(()),
             Ok(_) => {}
             Err(e) => return Err(e.into()),

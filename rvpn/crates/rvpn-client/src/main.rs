@@ -30,6 +30,15 @@ mod tun;
 mod tunnel;
 mod websocket;
 
+// Use mimalloc as the global allocator: glibc malloc arenas retain memory
+// indefinitely under this client's allocation churn (a long-running Linux
+// install grew to 850 MB RSS in a week; capping MALLOC_ARENA_MAX=2 pinned the
+// same workload at ~27 MB, proving arena retention rather than a real leak).
+// Disable with --no-default-features to build with the system allocator.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Maximum reconnection attempts before giving up
 const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 /// Initial delay between reconnection attempts (ms)
@@ -257,6 +266,15 @@ async fn run_socks5(config: ClientConfig) -> Result<()> {
             ];
         }
 
+        // All VPN server hostnames (primary + multi-server routing targets).
+        // The DNS proxy resolves these locally so a tunnel reconnect never
+        // depends on the tunnel itself for DNS.
+        let extra_server_hosts: Vec<String> = config
+            .extra_servers
+            .iter()
+            .map(|e| parse_server_url(&e.address).0)
+            .collect();
+
         let dns_proxy = std::sync::Arc::new(dns_proxy::DnsProxy::new(
             dns_listen,
             proxy.server_host().to_string(),
@@ -268,6 +286,7 @@ async fn run_socks5(config: ClientConfig) -> Result<()> {
             proxy.split_tunnel(),
             proxy.dns_resolver(),
             nameservers,
+            extra_server_hosts,
         ));
 
         tokio::spawn(async move {

@@ -441,12 +441,28 @@ impl TunServer {
                                     let sender = sender.clone();
                                     drop(senders);
 
-                                    // Send packet through channel to the session for encryption
-                                    if let Err(e) = sender.send(packet).await {
-                                        error!("Failed to send packet to {} channel: {} — removing stale sender", dst_ip, e);
-                                        // Channel closed — remove stale sender to prevent repeated errors
-                                        let mut senders = client_senders.write().await;
-                                        senders.remove(&dst_ip);
+                                    // Send without blocking: this loop is shared
+                                    // by ALL clients, so blocking on a stalled
+                                    // client's full queue would head-of-line
+                                    // block everyone's downlink. Overflow means
+                                    // that client is stalled; TCP retransmits
+                                    // recover the dropped packet.
+                                    match sender.try_send(packet) {
+                                        Ok(()) => {}
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            debug!(
+                                                "TUN READ: response queue full for {} - packet dropped",
+                                                dst_ip
+                                            );
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            error!(
+                                                "Packet channel for {} closed - removing stale sender",
+                                                dst_ip
+                                            );
+                                            let mut senders = client_senders.write().await;
+                                            senders.remove(&dst_ip);
+                                        }
                                     }
                                 } else {
                                     warn!("TUN READ: No channel registered for destination IP {} - packet dropped!", dst_ip);

@@ -469,10 +469,20 @@ fn mi_commit_after_collect() -> u64 {
 type WsReader = MinimalWsReader<rvpn_tls::RustlsTlsStream>;
 #[cfg(feature = "ios-direct-tun")]
 type WsWriter = MinimalWsWriter<rvpn_tls::RustlsTlsStream>;
+#[cfg(feature = "ios-direct-tun")]
+type TunnelWs = rvpn_tls::RustlsTlsStream;
 #[cfg(not(feature = "ios-direct-tun"))]
 type WsReader = MinimalWsReader<rvpn_tls::ChromeTlsStream>;
 #[cfg(not(feature = "ios-direct-tun"))]
 type WsWriter = MinimalWsWriter<rvpn_tls::ChromeTlsStream>;
+#[cfg(not(feature = "ios-direct-tun"))]
+type TunnelWs = rvpn_tls::ChromeTlsStream;
+
+/// Maximum age of a preconnected transport before connect() discards it.
+/// Must stay under the server's handshake-wait timeout (15 s) so a warm
+/// connection is never consumed after the server killed it; 4 s also keeps
+/// it safe against older servers that still use the original 5 s timeout.
+const PRECONNECT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// DIAGNOSTIC: when true, the inbound (server→client) relay decrypts each
 /// frame but discards it instead of forwarding to Swift. This silences the
@@ -664,6 +674,14 @@ pub struct IosTunClient {
     /// limit within seconds; enforcing a minimum backoff after N reconnects in
     /// 30 s throttles the storm and gives the runtime time to reclaim memory.
     reconnect_history: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
+    /// Warm transport (TLS + WebSocket upgraded, NO protocol handshake yet)
+    /// established in parallel with reconnect backoff. Consumed by
+    /// `connect()` so the reconnect skips the TCP + TLS + WS-upgrade round
+    /// trips entirely. Never holds keys or identity data — nothing sensitive
+    /// is sent until X3DH runs.
+    preconnect: tokio::sync::Mutex<Option<(MinimalWebSocket<TunnelWs>, std::time::Instant)>>,
+    /// Guards against running more than one preconnect warmer at a time.
+    preconnect_warming: AtomicBool,
     /// Object pool for Vec<u8> packets from Swift to reduce heap churn.
     /// Shared with FFI write functions via `Arc<Mutex>`.
     packet_pool: Arc<Mutex<VecPool>>,
@@ -737,11 +755,15 @@ impl IosTunClient {
         }
 
         // Create channels for Swift TUN communication.
-        // iOS uses smaller channels to stay within the 50 MB NE memory limit.
-        // macOS keeps larger channels for throughput (no tight memory limit).
+        // iOS keeps channels modest to stay within the 50 MB NE memory limit,
+        // but 20 packets was too shallow: `readPackets` delivers bursts of up
+        // to 256 packets, and while run_tx is busy encrypting/sending the
+        // previous batch the overflow was silently dropped (TCP retransmits
+        // and DNS retries manifest as multi-hundred-ms freezes). 256 costs
+        // at worst ~0.4 MB. macOS keeps larger channels (no tight limit).
         // Using Bytes instead of Vec<u8> avoids per-packet copy in the server->swift path.
         let chan_cap = if cfg!(feature = "ios-direct-tun") {
-            20
+            256
         } else {
             1000
         };
@@ -810,6 +832,8 @@ impl IosTunClient {
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
             ),
             reconnect_history: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(16)),
+            preconnect: tokio::sync::Mutex::new(None),
+            preconnect_warming: AtomicBool::new(false),
             reconnect_initial_delay_ms: AtomicU64::new(1000),
             reconnect_max_delay_ms: AtomicU64::new(5000),
             packet_pool: Arc::new(Mutex::new(VecPool::new(32))),
@@ -892,46 +916,44 @@ impl IosTunClient {
         self.state.store(new_state as i32, Ordering::SeqCst);
     }
 
-    /// Connect to the VPN server and perform X3DH handshake
-    pub async fn connect(self: &Arc<Self>) -> Result<()> {
-        // Early exit if reconnect was disabled (e.g. stopTunnel() called while we were in backoff)
-        if !self.reconnect_enabled.load(Ordering::Relaxed) {
-            return Err(anyhow::anyhow!("Connection cancelled by stop"));
-        }
+    /// WebSocket URL for the TUN endpoint. Swift may already append /tun,
+    /// so only add it if not present.
+    fn tun_url(&self) -> String {
+        Self::tun_url_for(&self.server_host, self.server_port, &self.server_path)
+    }
 
-        // Set state to Connecting
-        self.state
-            .store(TunClientState::Connecting as i32, Ordering::SeqCst);
-        self.notify_state(TunClientState::Connecting, None, "Connecting to server")
-            .await;
-
-        // Build WebSocket URL for TUN endpoint
-        // Swift may already append /tun, so only add if not present
-        let tun_path = if self.server_path.ends_with("/tun") || self.server_path.ends_with("/tun/")
-        {
-            self.server_path.trim_end_matches('/').to_string()
-        } else if self.server_path.ends_with("/") {
-            format!("{}tun", self.server_path)
+    /// Pure helper behind [`tun_url`] — split out for unit testing.
+    fn tun_url_for(server_host: &str, server_port: u16, server_path: &str) -> String {
+        let tun_path = if server_path.ends_with("/tun") || server_path.ends_with("/tun/") {
+            server_path.trim_end_matches('/').to_string()
+        } else if server_path.ends_with("/") {
+            format!("{}tun", server_path)
         } else {
-            format!("{}/tun", self.server_path)
+            format!("{}/tun", server_path)
         };
-        let url = format!(
-            "wss://{}:{}{}",
-            self.server_host, self.server_port, tun_path
-        );
+        format!("wss://{}:{}{}", server_host, server_port, tun_path)
+    }
 
+    /// Establish the transport (TCP + TLS + WebSocket upgrade) without
+    /// running any protocol handshake. Shared by connect() and the
+    /// preconnect warmer. Nothing sensitive is sent here — no keys, no
+    /// identity, no Hello — so warming a connection ahead of time leaks
+    /// nothing; the server only sees an upgraded WebSocket waiting for a
+    /// handshake, which its handshake-wait timeout cleans up if abandoned.
+    async fn establish_transport(self: &Arc<Self>) -> Result<MinimalWebSocket<TunnelWs>> {
+        let url = self.tun_url();
         info!("[IosTun] Connecting to {}", url);
 
         // TLS connect.
         //
         // iOS: rustls backend — pure-Rust TLS with TLS 1.3 support.
         // native-tls (Security.framework) cannot negotiate TLS 1.3 on iOS;
-        // boring (BoringSSL) leaks anonymous VM. rustls is the only viable option.
-        // Cert verification uses bundled Mozilla roots (webpki-roots) — the NE
-        // sandbox blocks /etc/ssl/ and trustd was unreliable from the extension.
-        //
-        // iOS: rustls backend — BoringSSL's SSL_read leaks anonymous VM in the NE sandbox.
-        // macOS: boring backend — retains Chrome ClientHello fingerprint mimicry.
+        // boring (BoringSSL) leaks anonymous VM. rustls is the only viable
+        // option. Cert verification uses bundled Mozilla roots
+        // (webpki-roots) — the NE sandbox blocks /etc/ssl/ and trustd was
+        // unreliable from the extension.
+        // macOS: boring backend — retains Chrome ClientHello fingerprint
+        // mimicry.
         #[cfg(feature = "ios-direct-tun")]
         let tls_stream =
             rvpn_tls::connect_rustls(&self.server_host, self.server_port, Some(&self.server_host))
@@ -967,8 +989,111 @@ impl IosTunClient {
         .context("WebSocket handshake failed")?;
 
         info!("[IosTun] WebSocket connected (TLS verified, minimal parser)");
+        Ok(ws)
+    }
 
-        // Check again after WS handshake
+    /// Warm a transport during reconnect backoff so the next connect()
+    /// skips the TCP + TLS + WS-upgrade round trips. The warmer keeps one
+    /// warm connection ready and re-establishes it before it goes stale
+    /// (the server kills upgraded-but-unhandshaked connections after its
+    /// handshake-wait timeout). It stops once the warm transport is
+    /// consumed, a session becomes Connected, or reconnection is disabled.
+    /// Safe to call repeatedly — at most one warmer runs at a time.
+    fn spawn_preconnect_warmer(self: &Arc<Self>) {
+        if self
+            .preconnect_warming
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let client = Arc::clone(self);
+        self.handle.spawn(async move {
+            loop {
+                if !client.reconnect_enabled.load(Ordering::Relaxed)
+                    || client.state.load(Ordering::SeqCst)
+                        == TunClientState::Connected as i32
+                {
+                    break;
+                }
+                match client.establish_transport().await {
+                    Ok(ws) => {
+                        let created = std::time::Instant::now();
+                        *client.preconnect.lock().await = Some((ws, created));
+                        info!("[IosTun] Preconnect: warm transport ready");
+                        // Hold it until consumed or stale.
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            if !client.reconnect_enabled.load(Ordering::Relaxed)
+                                || client.state.load(Ordering::SeqCst)
+                                    == TunClientState::Connected as i32
+                            {
+                                break;
+                            }
+                            if client.preconnect.lock().await.is_none() {
+                                // Consumed by connect() — our job is done.
+                                client.preconnect_warming.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                            if created.elapsed() >= PRECONNECT_MAX_AGE {
+                                break; // stale — discard below and re-establish
+                            }
+                        }
+                        *client.preconnect.lock().await = None;
+                    }
+                    Err(e) => {
+                        // Network likely still down — back off briefly and retry.
+                        debug!("[IosTun] Preconnect attempt failed: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+            *client.preconnect.lock().await = None;
+            client.preconnect_warming.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Connect to the VPN server and perform X3DH handshake
+    pub async fn connect(self: &Arc<Self>) -> Result<()> {
+        // Early exit if reconnect was disabled (e.g. stopTunnel() called while we were in backoff)
+        if !self.reconnect_enabled.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("Connection cancelled by stop"));
+        }
+
+        // Set state to Connecting
+        self.state
+            .store(TunClientState::Connecting as i32, Ordering::SeqCst);
+        self.notify_state(TunClientState::Connecting, None, "Connecting to server")
+            .await;
+
+        // Reuse a warm transport if the preconnect warmer prepared one during
+        // backoff (skips the TCP + TLS + WS-upgrade round trips). Stale ones
+        // are discarded. The transport carries no secrets — nothing sensitive
+        // is sent until X3DH runs.
+        let mut used_preconnect = false;
+        let ws: MinimalWebSocket<TunnelWs> = {
+            let taken = self.preconnect.lock().await.take();
+            match taken {
+                Some((ws, created)) if created.elapsed() <= PRECONNECT_MAX_AGE => {
+                    info!(
+                        "[IosTun] Reusing preconnected transport (age {} ms)",
+                        created.elapsed().as_millis()
+                    );
+                    used_preconnect = true;
+                    ws
+                }
+                Some((_, created)) => {
+                    debug!(
+                        "[IosTun] Preconnected transport stale ({} ms), connecting fresh",
+                        created.elapsed().as_millis()
+                    );
+                    self.establish_transport().await?
+                }
+                None => self.establish_transport().await?,
+            }
+        };
+
+        // Check again after transport
         if !self.reconnect_enabled.load(Ordering::Relaxed) {
             return Err(anyhow::anyhow!(
                 "Connection cancelled by stop after WS handshake"
@@ -978,11 +1103,27 @@ impl IosTunClient {
         // Split into independent reader/writer halves
         let (mut ws_read, mut ws_write) = ws.split();
 
-        // Perform X3DH handshake
-        let mut ratchet = self
-            .perform_handshake(&mut ws_read, &mut ws_write)
-            .await
-            .context("X3DH handshake failed")?;
+        // Perform X3DH handshake. If we reused a warm transport and the
+        // handshake fails (the connection can die between warming and
+        // consumption — server handshake timeout, NAT rebind), retry once
+        // with a fresh transport.
+        let mut ratchet = match self.perform_handshake(&mut ws_read, &mut ws_write).await {
+            Ok(r) => r,
+            Err(e) if used_preconnect => {
+                warn!(
+                    "[IosTun] X3DH failed on preconnected transport ({}); retrying fresh",
+                    e
+                );
+                let fresh = self.establish_transport().await?;
+                let (r, w) = fresh.split();
+                ws_read = r;
+                ws_write = w;
+                self.perform_handshake(&mut ws_read, &mut ws_write)
+                    .await
+                    .context("X3DH handshake failed")?
+            }
+            Err(e) => return Err(e).context("X3DH handshake failed"),
+        };
 
         info!("[IosTun] X3DH handshake complete");
 
@@ -1453,8 +1594,22 @@ impl IosTunClient {
             packet_count += 1;
 
             // Collect additional packets until we hit a size/time limit.
-            let deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_millis(OUTGOING_BATCH_TIMEOUT_MS);
+            //
+            // Open the collection window ONLY when another packet is already
+            // queued: interactive single-packet sends (TCP SYN/ACK, DNS
+            // queries) used to pay the full 5 ms even with an empty queue,
+            // adding a 5 ms floor to every uplink round trip. Bursts still
+            // coalesce because their packets are queued by the time we check.
+            let has_more_queued = {
+                let r = from_swift_receiver.lock().await;
+                !r.is_empty()
+            };
+            let deadline = if has_more_queued {
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(OUTGOING_BATCH_TIMEOUT_MS)
+            } else {
+                tokio::time::Instant::now()
+            };
             let mut receiver_closed = false;
             while batch.len() < OUTGOING_BATCH_MAX_FRAMES && batch_bytes < OUTGOING_BATCH_MAX_BYTES
             {
@@ -1610,7 +1765,7 @@ impl IosTunClient {
                 info!("[IosTun] Server->Swift relay: shutdown received, breaking");
                 break;
             }
-            result = timeout(std::time::Duration::from_secs(300), ws_read.next_frame(&mut frame_buf)) => {
+            result = timeout(std::time::Duration::from_secs(60), ws_read.next_frame(&mut frame_buf)) => {
                 #[cfg(feature = "diagnostics")]
                 {
                     let (internal, _) = vm_internal_compressed();
@@ -1745,7 +1900,7 @@ impl IosTunClient {
                             break;
                         }
                         Err(_) => {
-                            error!("[IosTun] Server->Swift: WebSocket read timeout (300s), sending shutdown and breaking");
+                            error!("[IosTun] Server->Swift: WebSocket read timeout (60s), sending shutdown and breaking");
                             let _ = shutdown_tx.send(());
                             break;
                         }
@@ -2048,13 +2203,13 @@ impl IosTunClient {
     }
 
     /// Get identity key reference
-    #[allow(dead_code)] // Used by android_tun_ffi.rs
+    #[allow(dead_code)] // Used by the DNS proxy startup in ios_tun_ffi.rs (dns feature)
     pub(crate) fn identity_key(&self) -> &IdentityKey {
         &self.identity_key
     }
 
     /// Get server bundle reference
-    #[allow(dead_code)] // Used by android_tun_ffi.rs
+    #[allow(dead_code)] // Used by the DNS proxy startup in ios_tun_ffi.rs (dns feature)
     pub(crate) fn server_bundle(&self) -> &X3DHPublicBundle {
         &self.server_bundle
     }
@@ -2240,6 +2395,10 @@ impl IosTunClient {
                 );
 
                 if delay_ms > 0 {
+                    // Warm a transport in parallel with the backoff so the
+                    // reconnect after the delay skips TCP + TLS + WS-upgrade.
+                    client.spawn_preconnect_warmer();
+
                     // Sleep in small chunks so we can check reconnect_enabled mid-sleep
                     let sleep_start = tokio::time::Instant::now();
                     let sleep_duration = tokio::time::Duration::from_millis(delay_ms);
@@ -2380,5 +2539,28 @@ mod tests {
         assert_eq!(host, "test.example.com");
         assert_eq!(port, 443);
         assert_eq!(path, "/api/v1/ws/");
+    }
+
+    /// The TUN endpoint URL must gain a /tun suffix exactly once, however
+    /// the profile's path is written (Swift profiles sometimes already
+    /// include it).
+    #[test]
+    fn test_tun_url_suffix_handling() {
+        assert_eq!(
+            IosTunClient::tun_url_for("s.example.com", 443, "/api/v1/ws"),
+            "wss://s.example.com:443/api/v1/ws/tun"
+        );
+        assert_eq!(
+            IosTunClient::tun_url_for("s.example.com", 443, "/api/v1/ws/"),
+            "wss://s.example.com:443/api/v1/ws/tun"
+        );
+        assert_eq!(
+            IosTunClient::tun_url_for("s.example.com", 443, "/api/v1/ws/tun"),
+            "wss://s.example.com:443/api/v1/ws/tun"
+        );
+        assert_eq!(
+            IosTunClient::tun_url_for("s.example.com", 443, "/api/v1/ws/tun/"),
+            "wss://s.example.com:443/api/v1/ws/tun"
+        );
     }
 }

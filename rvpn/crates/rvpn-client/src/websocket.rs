@@ -10,6 +10,8 @@ use anyhow::{Context as _, Result};
 use futures::SinkExt;
 use rand::{Rng, SeedableRng};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::handshake::client::generate_key;
@@ -21,18 +23,32 @@ pub use tungstenite::Message;
 use rvpn_tls::{ChromeTlsStream, TlsFingerprint, connect_chrome_like};
 
 /// WebSocket reader type (receives messages)
-pub type WebSocketReader = tokio::sync::mpsc::UnboundedReceiver<Message>;
+pub type WebSocketReader = tokio::sync::mpsc::Receiver<Message>;
+
+/// Capacity of the bounded channels created by [`split_websocket`].
+///
+/// Bounded on purpose: with unbounded channels a stalled local consumer let
+/// the reader task ACK the server at line rate while frames piled up in
+/// memory (~5 MB/h leak on long-running clients). The bound makes
+/// backpressure reach TCP instead of the heap.
+const WS_CHANNEL_CAPACITY: usize = 256;
 
 /// WebSocket writer type (sends messages)
 #[derive(Clone)]
 pub struct WebSocketWriter {
-    sender: tokio::sync::mpsc::UnboundedSender<Message>,
+    sender: tokio::sync::mpsc::Sender<Message>,
 }
 
 impl WebSocketWriter {
-    pub fn send(&self, msg: Message) -> Result<()> {
+    /// Send a message to the WebSocket writer task.
+    ///
+    /// Async because the channel is bounded: when the writer task is
+    /// backpressured by a slow TCP connection, this awaits until there is
+    /// capacity, propagating that backpressure to the caller.
+    pub async fn send(&self, msg: Message) -> Result<()> {
         self.sender
             .send(msg)
+            .await
             .map_err(|_| anyhow::anyhow!("WebSocket sender closed"))?;
         Ok(())
     }
@@ -40,6 +56,42 @@ impl WebSocketWriter {
     /// Check if the underlying channel has been closed (writer task exited)
     pub fn is_closed(&self) -> bool {
         self.sender.is_closed()
+    }
+}
+
+/// Handle for the helper tasks spawned by [`split_websocket`].
+///
+/// The reader, writer and ping tasks run independently of the relay tasks.
+/// When a relay ends they must be told to stop: the ping task keeps sending
+/// WebSocket pings, which holds the TCP connection open, and the server
+/// counts those pings as activity, so neither side ever times the flow out.
+/// A flow whose helper tasks outlive its relay leaks its full
+/// TLS + WebSocket + ratchet stack forever ("zombie flow").
+///
+/// Call [`WebSocketTaskHandle::shutdown`] to stop the tasks and wait for
+/// them. Dropping the handle without calling `shutdown` still signals the
+/// tasks (without awaiting them) as a backstop for early-return paths.
+pub struct WebSocketTaskHandle {
+    shutdown_tx: broadcast::Sender<()>,
+    joins: Vec<JoinHandle<()>>,
+}
+
+impl WebSocketTaskHandle {
+    /// Signal all helper tasks to stop and wait for them to exit.
+    pub async fn shutdown(mut self) {
+        let _ = self.shutdown_tx.send(());
+        for join in std::mem::take(&mut self.joins) {
+            let _ = join.await;
+        }
+    }
+}
+
+impl Drop for WebSocketTaskHandle {
+    fn drop(&mut self) {
+        // Drop is synchronous so the tasks cannot be awaited here, but the
+        // signal alone guarantees they exit on their next poll and can no
+        // longer keep a dead flow's socket alive.
+        let _ = self.shutdown_tx.send(());
     }
 }
 
@@ -110,7 +162,14 @@ pub async fn connect_websocket(
 }
 
 /// Split WebSocket stream into reader and writer
-pub fn split_websocket<S>(ws_stream: WebSocketStream<S>) -> (WebSocketReader, WebSocketWriter)
+///
+/// Returns the reader, the writer, and a [`WebSocketTaskHandle`] controlling
+/// the spawned helper tasks. The handle MUST be shut down (or dropped) when
+/// the connection is no longer needed, otherwise the ping task keeps the
+/// socket alive forever — see the handle's docs.
+pub fn split_websocket<S>(
+    ws_stream: WebSocketStream<S>,
+) -> (WebSocketReader, WebSocketWriter, WebSocketTaskHandle)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -118,64 +177,107 @@ where
 
     let (mut write, mut read) = ws_stream.split();
 
-    let (tx_to_ws, mut rx_from_app) = tokio::sync::mpsc::unbounded_channel::<Message>();
-    let (tx_to_app, rx_to_app) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let (tx_to_ws, mut rx_from_app) = tokio::sync::mpsc::channel::<Message>(WS_CHANNEL_CAPACITY);
+    let (tx_to_app, rx_to_app) = tokio::sync::mpsc::channel::<Message>(WS_CHANNEL_CAPACITY);
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     // Writer task
-    tokio::spawn(async move {
-        while let Some(msg) = rx_from_app.recv().await {
-            if let Err(e) = write.send(msg).await {
-                tracing::error!("WebSocket send error: {}", e);
-                break;
+    let writer_join = {
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    msg = rx_from_app.recv() => match msg {
+                        Some(msg) => {
+                            if let Err(e) = write.send(msg).await {
+                                tracing::error!("WebSocket send error: {}", e);
+                                break;
+                            }
+                        }
+                        None => break,
+                    },
+                    _ = shutdown_rx.recv() => break,
+                }
             }
-        }
-        tracing::info!("WebSocket writer task ending");
-    });
+            tracing::info!("WebSocket writer task ending");
+        })
+    };
 
     // Ping task - sends WebSocket-level pings to keep connection alive.
     // Uses jittered intervals to avoid perfectly periodic traffic patterns
     // that statistical classifiers can detect.
-    let ping_sender = tx_to_ws.clone();
-    tokio::spawn(async move {
-        let mut rng = rand::rngs::StdRng::from_entropy();
-        // Random initial delay to avoid burst at connection start
-        tokio::time::sleep(Duration::from_millis(rng.gen_range(5000..=8000))).await;
-        loop {
-            if ping_sender.send(Message::Ping(vec![])).is_err() {
-                tracing::debug!("Ping sender closed, stopping ping task");
-                break;
+    let ping_join = {
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let ping_sender = tx_to_ws.clone();
+        tokio::spawn(async move {
+            let mut rng = rand::rngs::StdRng::from_entropy();
+            // Random initial delay to avoid burst at connection start
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(rng.gen_range(5000..=8000))) => {}
+                _ = shutdown_rx.recv() => {
+                    tracing::info!("WebSocket ping task ending");
+                    return;
+                }
             }
-            trace!("WebSocket ping sent");
-            // Jittered interval: 8-14s (nominal ~11s, matching Chrome behavior)
-            let jitter_ms = rng.gen_range(8000..=14000);
-            tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
-        }
-        tracing::info!("WebSocket ping task ending");
-    });
-
-    // Reader task - note: mpsc channel drops tx_to_app when task exits
-    tokio::spawn(async move {
-        while let Some(result) = read.next().await {
-            match result {
-                Ok(msg) => {
-                    if let Message::Pong(_) = &msg {
-                        trace!("WebSocket pong received");
+            loop {
+                // try_send on the bounded channel: a Full channel means the
+                // writer is backpressured by TCP — skip this ping (the next
+                // one in ~11s will get through) rather than block or break.
+                match ping_sender.try_send(Message::Ping(vec![])) {
+                    Ok(()) => trace!("WebSocket ping sent"),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        trace!("WebSocket channel full, skipping ping");
                     }
-                    if tx_to_app.send(msg).is_err() {
-                        tracing::debug!("WebSocket reader: channel receiver dropped, exiting");
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::debug!("Ping sender closed, stopping ping task");
                         break;
                     }
                 }
-                Err(e) => {
-                    tracing::error!("WebSocket receive error: {:?}, closing connection", e);
-                    // Don't send anything - just let the task exit which drops the sender
-                    break;
+                // Jittered interval: 8-14s (nominal ~11s, matching Chrome behavior)
+                let jitter_ms = rng.gen_range(8000..=14000);
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(jitter_ms)) => {}
+                    _ = shutdown_rx.recv() => break,
                 }
             }
-        }
-        tracing::info!("WebSocket reader task ending");
-    });
+            tracing::info!("WebSocket ping task ending");
+        })
+    };
+
+    // Reader task - note: mpsc channel drops tx_to_app when task exits
+    let reader_join = {
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = read.next() => match result {
+                        Some(Ok(msg)) => {
+                            if let Message::Pong(_) = &msg {
+                                trace!("WebSocket pong received");
+                            }
+                            if tx_to_app.send(msg).await.is_err() {
+                                tracing::debug!("WebSocket reader: channel receiver dropped, exiting");
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::error!("WebSocket receive error: {:?}, closing connection", e);
+                            // Don't send anything - just let the task exit which drops the sender
+                            break;
+                        }
+                        None => break,
+                    },
+                    _ = shutdown_rx.recv() => break,
+                }
+            }
+            tracing::info!("WebSocket reader task ending");
+        })
+    };
 
     let writer = WebSocketWriter { sender: tx_to_ws };
-    (rx_to_app, writer)
+    let handle = WebSocketTaskHandle {
+        shutdown_tx,
+        joins: vec![reader_join, writer_join, ping_join],
+    };
+    (rx_to_app, writer, handle)
 }

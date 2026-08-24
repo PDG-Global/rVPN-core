@@ -25,7 +25,8 @@ use crate::config::ServerIdentityConfig;
 use crate::identity_verification::{verify_server_identity, KnownHosts, VerificationResult};
 use rvpn_tls::TlsFingerprint;
 use crate::websocket::{
-    connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter,
+    connect_websocket, split_websocket, Message, WebSocketReader, WebSocketTaskHandle,
+    WebSocketWriter,
 };
 
 /// VPN Tunnel for TUN mode
@@ -47,6 +48,10 @@ pub struct VpnTunnel {
     pub gateway_ip: Option<std::net::Ipv4Addr>,
     /// MTU from server
     pub mtu: u16,
+    /// Holds the reader/writer/ping helper tasks' shutdown signal. When this
+    /// tunnel is dropped, the handle's Drop signals the tasks to stop so the
+    /// ping task cannot keep the dead tunnel's WebSocket alive forever.
+    _ws_tasks: WebSocketTaskHandle,
 }
 
 impl VpnTunnel {
@@ -105,7 +110,7 @@ impl VpnTunnel {
         info!("WebSocket connection established");
 
         // Step 2: Split the WebSocket into reader and writer
-        let (mut ws_reader, ws_writer) = split_websocket(ws_stream);
+        let (mut ws_reader, ws_writer, ws_tasks) = split_websocket(ws_stream);
 
         // Step 3: Perform X3DH handshake and initialize Double Ratchet
         let ratchet = Self::perform_handshake(
@@ -170,6 +175,7 @@ impl VpnTunnel {
             virtual_ip,
             gateway_ip,
             mtu,
+            _ws_tasks: ws_tasks,
         };
 
         Ok(Arc::new(RwLock::new(tunnel)))
@@ -208,6 +214,7 @@ impl VpnTunnel {
             serde_json::to_vec(&hello).context("Failed to serialize Hello message")?;
         ws_writer
             .send(Message::Binary(hello_bytes))
+            .await
             .context("Failed to send Hello message")?;
 
         debug!("Sent X3DH Hello message");
@@ -453,18 +460,34 @@ impl VpnTunnel {
                         }
                     };
 
-                    // Parse the multiplexed frame
-                    let frame = match MultiplexedFrame::decode(&data) {
-                        Ok(frame) => frame,
-                        Err(e) => {
-                            warn!("Failed to decode multiplexed frame: {}", e);
-                            continue;
-                        }
-                    };
+                    // Parse ALL multiplexed frames in the message. The server
+                    // batches multiple TUN packets into one padded+encrypted
+                    // message (the 1KB-boundary padding amortises over the
+                    // whole batch instead of inflating every packet).
+                    let (frames, consumed) =
+                        rvpn_core::protocol::multiplex::parse_frames(&data);
+                    if frames.is_empty() {
+                        warn!("Failed to decode multiplexed frames");
+                        continue;
+                    }
+                    if consumed < data.len() {
+                        warn!(
+                            "Partially decoded multiplexed frames ({} of {} bytes)",
+                            consumed,
+                            data.len()
+                        );
+                    }
 
-                    // Send frame to TUN device
-                    if let Err(e) = recv_mux_tx.send(frame) {
-                        warn!("Failed to send frame to TUN device: {}", e);
+                    // Send frames to TUN device
+                    let mut send_failed = false;
+                    for frame in frames {
+                        if let Err(e) = recv_mux_tx.send(frame) {
+                            warn!("Failed to send frame to TUN device: {}", e);
+                            send_failed = true;
+                            break;
+                        }
+                    }
+                    if send_failed {
                         break;
                     }
                 }
@@ -560,6 +583,7 @@ impl VpnTunnel {
 
         self.ws_writer
             .send(Message::Binary(encrypted))
+            .await
             .context("Failed to send through WebSocket")?;
 
         Ok(())

@@ -803,33 +803,46 @@ impl AndroidTunClient {
                                 if let Some(decrypted) = decrypted {
                                     match unpad_packet(&decrypted) {
                                         Ok(unpadded) => {
-                                            match MultiplexedFrame::decode(&unpadded) {
-                                                Ok(frame) => {
-                                                    if frame.flow_id == 0 {
-                                                        // Control message (e.g., Pong). Parse and handle;
-                                                        // do not forward to Android.
-                                                        match frame.parse_control() {
-                                                            Ok(ControlMessage::Pong { timestamp }) => {
-                                                                tun_log!("[AndroidTun] Server->Android: received Pong(ts={})", timestamp);
-                                                            }
-                                                            Ok(other) => {
-                                                                tun_log!("[AndroidTun] Server->Android: received control {:?}", other);
-                                                            }
-                                                            Err(e) => {
-                                                                tun_log_error!("[AndroidTun] Failed to parse control frame: {}", e);
-                                                            }
+                                            // Parse ALL frames in the message: the server
+                                            // batches multiple downlink packets into one
+                                            // padded+encrypted message (padding amortises
+                                            // over the batch instead of inflating every
+                                            // packet ~46%).
+                                            let (frames, consumed) =
+                                                rvpn_core::protocol::multiplex::parse_frames(&unpadded);
+                                            if consumed < unpadded.len() {
+                                                tun_log_error!(
+                                                    "[AndroidTun] Partially decoded frames ({} of {} bytes)",
+                                                    consumed, unpadded.len()
+                                                );
+                                            }
+                                            let mut send_failed = false;
+                                            for frame in frames {
+                                                if frame.flow_id == 0 {
+                                                    // Control message (e.g., Pong). Parse and
+                                                    // handle; do not forward to Android.
+                                                    match frame.parse_control() {
+                                                        Ok(ControlMessage::Pong { timestamp }) => {
+                                                            tun_log!("[AndroidTun] Server->Android: received Pong(ts={})", timestamp);
                                                         }
-                                                    } else {
-                                                        tun_log!("[AndroidTun] Server->Android: flow_id={} sending {} bytes to Android", frame.flow_id, frame.payload.len());
-                                                        if to_swift_sender.send(frame.payload.to_vec()).await.is_err() {
-                                                            tun_log!("[AndroidTun] Server->Android: Android receiver closed");
-                                                            break;
+                                                        Ok(other) => {
+                                                            tun_log!("[AndroidTun] Server->Android: received control {:?}", other);
+                                                        }
+                                                        Err(e) => {
+                                                            tun_log_error!("[AndroidTun] Failed to parse control frame: {}", e);
                                                         }
                                                     }
+                                                } else {
+                                                    tun_log!("[AndroidTun] Server->Android: flow_id={} sending {} bytes to Android", frame.flow_id, frame.payload.len());
+                                                    if to_swift_sender.send(frame.payload.to_vec()).await.is_err() {
+                                                        tun_log!("[AndroidTun] Server->Android: Android receiver closed");
+                                                        send_failed = true;
+                                                        break;
+                                                    }
                                                 }
-                                                Err(e) => {
-                                                    tun_log_error!("[AndroidTun] Failed to decode MultiplexedFrame: {}", e);
-                                                }
+                                            }
+                                            if send_failed {
+                                                break;
                                             }
                                         }
                                         Err(e) => {

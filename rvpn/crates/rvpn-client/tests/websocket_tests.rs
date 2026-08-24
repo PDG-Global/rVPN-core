@@ -381,7 +381,7 @@ async fn test_tls_websocket_with_chrome_headers() -> Result<()> {
     let tcp = tokio::net::TcpStream::connect(addr).await?;
     let config = connector.configure()?;
     let tls_stream = tokio_boring::connect(config, "localhost", tcp).await?;
-    let tls_stream = rvpn_client::tls_boring::ChromeTlsStream::new(tls_stream);
+    let tls_stream = rvpn_client::ChromeTlsStream::new(tls_stream);
 
     // Build Chrome-like upgrade request (same headers as connect_websocket)
     use tungstenite::handshake::client::generate_key;

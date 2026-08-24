@@ -87,6 +87,15 @@ parking_lot.workspace = true
 async-trait = "0.1"
 dirs = "5.0"
 
+# mimalloc global allocator — glibc malloc arenas retain memory indefinitely
+# under this client's allocation churn (long-running Linux installs grew
+# ~5 MB/hour in RSS; MALLOC_ARENA_MAX=2 proved arena retention, not a leak).
+# Optional so diagnostics builds can use the system allocator.
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[features]
+default = ["mimalloc"]
+
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = "2"
 

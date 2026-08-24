@@ -294,6 +294,13 @@ impl SplitTunnel {
             return RoutingDecision::Bypass;
         }
 
+        // Release the read guard before the CN branch below. That branch
+        // awaits DNS resolution (with retries, up to ~27s); if the guard were
+        // held across it, the config auto-reload writer would queue on the
+        // write-preferring RwLock and block ALL new readers for the duration
+        // of those retries — a periodic total DNS/routing stall.
+        drop(data);
+
         // Check built-in force tunnel domains (Google, Facebook, etc.)
         // These override China domain bypass
         if matches_force_tunnel_domain(host) {
@@ -1003,6 +1010,87 @@ mod tests {
                 split_tunnel.decide_by_ip(ip).await,
                 RoutingDecision::Tunnel,
                 "When disabled, IP should default to Tunnel"
+            );
+        });
+    }
+
+    /// End-to-end proof for the client toml option: a `[split_tunnel]
+    /// tunnel_domains_file` entry must load the listed domains and force
+    /// them (and their subdomains) through the VPN, even though their
+    /// resolved IPs would normally be subject to bypass rules.
+    #[test]
+    fn test_tunnel_domains_file_config_forces_tunnel() {
+        // 1. The snake_case key from a client.toml must deserialize.
+        let dir = std::env::temp_dir().join(format!("rvpn-st-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let domains_file = dir.join("tunnel-domains.txt");
+        std::fs::write(&domains_file, "# forced through the VPN\ntimestamp.apple.com\n").unwrap();
+
+        let toml_str = format!(
+            "enabled = true\ntunnel_domains_file = {:?}\nauto_reload_interval = 0\n",
+            domains_file.to_string_lossy()
+        );
+        let config: SplitTunnelConfig =
+            toml::from_str(&toml_str).expect("snake_case split-tunnel keys must parse");
+        assert_eq!(config.tunnel_domains_file.as_deref(), Some(domains_file.as_path()));
+
+        // 2. SplitTunnel::new must load the file into tunnel_domains.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let split_tunnel = SplitTunnel::new(
+                config,
+                Arc::new(DnsResolver::new(true, 300, 1000, false, true, vec![])),
+            )
+            .await
+            .expect("SplitTunnel::new must succeed with a valid domains file");
+
+            let stats = split_tunnel.get_stats().await;
+            assert_eq!(stats.tunnel_domains_count, 1, "file must load exactly its one domain");
+
+            // 3. The domain and any subdomain must be forced through the VPN.
+            assert_eq!(
+                split_tunnel.decide_by_host("timestamp.apple.com").await,
+                RoutingDecision::Tunnel
+            );
+            assert_eq!(
+                split_tunnel.decide_by_host("sub.timestamp.apple.com").await,
+                RoutingDecision::Tunnel
+            );
+            // Unrelated hosts are unaffected.
+            assert_eq!(
+                split_tunnel.decide_by_host("example.org").await,
+                RoutingDecision::Tunnel,
+                "with no bypass rules everything else tunnels too"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing domains file must not silently produce an empty rule set
+    /// without surfacing it: load_data logs a warning and continues, and the
+    /// stats must show zero tunnel domains so operators can spot it.
+    #[test]
+    fn test_tunnel_domains_file_missing_is_visible_in_stats() {
+        let config = SplitTunnelConfig {
+            enabled: true,
+            tunnel_domains_file: Some(std::path::PathBuf::from("/nonexistent/rvpn-domains.txt")),
+            ..Default::default()
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let split_tunnel = SplitTunnel::new(
+                config,
+                Arc::new(DnsResolver::new(true, 300, 1000, false, true, vec![])),
+            )
+            .await
+            .expect("missing file must not fail startup (warn + continue)");
+
+            let stats = split_tunnel.get_stats().await;
+            assert_eq!(
+                stats.tunnel_domains_count, 0,
+                "missing file must leave tunnel_domains empty (visible in startup stats)"
             );
         });
     }
