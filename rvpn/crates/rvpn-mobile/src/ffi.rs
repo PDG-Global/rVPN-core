@@ -73,6 +73,45 @@ pub struct TunConfig {
     /// Used instead of compiled-in builtin IPs.
     #[serde(default)]
     pub country_ips_file: Option<String>,
+    /// Additional named exit servers for multi-server routing (optional).
+    ///
+    /// The top-level `server_address` + `prekey_bundle_path` form the
+    /// implicit `"default"` exit; entries here add more, keyed by `name`.
+    /// The client identity key is shared across all servers (SSH-model —
+    /// one client key, many hosts). Traffic is steered by `routing` below:
+    /// domain rules are learned via DNS interception, IP/CIDR rules match
+    /// packet destinations directly. Routed exits never silently fall back
+    /// to the default server.
+    #[serde(default)]
+    pub extra_servers: Vec<MobileServerEntry>,
+    /// Per-exit routing rules, keyed by server `name` from `extra_servers`.
+    /// Same semantics as the CLI's `[routing.<name>]` sections. Rules for
+    /// `"default"` are rejected (unmatched traffic already goes there).
+    #[serde(default)]
+    pub routing: std::collections::HashMap<String, rvpn_split_tunnel::RoutingRule>,
+}
+
+/// An additional named exit server for multi-server Direct TUN routing.
+///
+/// Mirrors the CLI's `[[server]]` block (`ServerEntry` in rvpn-client) but
+/// with mobile's camelCase JSON and file-path bundle reference.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileServerEntry {
+    /// Symbolic name used as the key in `routing`. Must be unique and
+    /// cannot be `"default"`.
+    pub name: String,
+    /// WebSocket address (e.g. `wss://sg.example.com:443/api/v1/ws`).
+    pub address: String,
+    /// Path to this server's X3DH prekey bundle JSON (app-group container).
+    pub prekey_bundle_path: String,
+    /// Optional pinned identity fingerprint (`ik:1:<base32>`). If unset,
+    /// this exit uses TOFU like the default server.
+    #[serde(default, alias = "serverFingerprint")]
+    pub server_identity_pin: Option<String>,
+    /// TLS SNI hostname (optional; defaults to the URL host).
+    #[serde(default)]
+    pub sni_hostname: Option<String>,
 }
 
 fn default_dns_bind_addr() -> String {

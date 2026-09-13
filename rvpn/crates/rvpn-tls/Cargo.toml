@@ -35,7 +35,9 @@ boring = { workspace = true, optional = true }
 tokio-boring = { workspace = true, optional = true }
 
 # --- Backend: rustls (generic ClientHello, mimalloc-tracked) ---
-# Used by iOS. Android uses rustls inline in rvpn-mobile, not via this crate.
+# Used by iOS. Android's transport still builds rustls inline in rvpn-mobile,
+# but enables this feature so the shared ResumptionStore type is available
+# for per-exit TLS session resumption (android_server_session.rs).
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 webpki-roots = { version = "0.26", optional = true }
@@ -52,3 +54,7 @@ default = ["boring"]
 boring = ["dep:boring", "dep:tokio-boring"]
 rustls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 native-tls = ["dep:native-tls", "dep:tokio-native-tls"]
+
+[dev-dependencies]
+# Self-signed certificates for the resumption test harness (local TLS servers).
+rcgen = "0.13"

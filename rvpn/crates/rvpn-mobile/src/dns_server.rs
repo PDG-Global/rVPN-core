@@ -9,8 +9,10 @@
 //!
 //! Uses hickory-proto for DNS protocol handling.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -20,7 +22,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::doh_client::DohClient;
-use rvpn_split_tunnel::{SplitTunnel, RoutingDecision as SplitTunnelRoutingDecision};
+use crate::route_map::RouteMap;
+use rvpn_split_tunnel::{Router, SplitTunnel, RoutingDecision as SplitTunnelRoutingDecision};
 use rvpn_split_tunnel::DnsResolver;
 
 /// DNS query routing decision (matches rvpn-client RoutingDecision)
@@ -60,6 +63,29 @@ pub struct DnsServer {
     /// VPN servers are currently IPv4-only; returning empty AAAA responses
     /// prevents dual-stack apps from waiting on IPv6 timeouts.
     filter_aaaa: bool,
+    /// Multi-server routing table. When set, `Tunnel` decisions are refined
+    /// per domain: `router.choose(domain)` may name a secondary exit, whose
+    /// DoH client (from `extra_doh_clients`) resolves the query instead of
+    /// the default exit's. `None` = single-server, identical to before.
+    router: Option<Arc<Router>>,
+    /// Per-secondary-exit DoH clients, keyed by exit name. Each keeps its
+    /// own persistent `/dns` WebSocket and its own cache.
+    extra_doh_clients: HashMap<String, Arc<DohClient>>,
+    /// Shared with the uplink demux: every A address in a secondary-exit
+    /// answer is recorded here so packets to it take the same exit.
+    route_map: Option<Arc<std::sync::Mutex<RouteMap>>>,
+    /// Pre-warm hook: called with the exit name when a routed domain is
+    /// resolved, so the exit's TUN session starts before its first packet
+    /// arrives. Holds a `Weak<IosTunClient>` internally to avoid a
+    /// client ↔ DNS server reference cycle.
+    prewarm: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Hostnames of the VPN exit servers themselves (default + secondary
+    /// exits). These must NEVER resolve through the tunnel: the tunnel's
+    /// own reconnect path depends on resolving them, so routing them via
+    /// the DoH client is a circular dependency that deadlocks reconnection
+    /// whenever the session is down (DoH fails → ServFail → connect fails →
+    /// DoH still fails…). They always take the direct-UDP bypass path.
+    server_hostnames: Vec<String>,
 }
 
 impl DnsServer {
@@ -78,6 +104,11 @@ impl DnsServer {
             dns_resolver,
             nameservers,
             filter_aaaa: true,
+            router: None,
+            extra_doh_clients: HashMap::new(),
+            route_map: None,
+            prewarm: None,
+            server_hostnames: Vec::new(),
         }
     }
 
@@ -92,6 +123,11 @@ impl DnsServer {
             dns_resolver,
             nameservers,
             filter_aaaa: true,
+            router: None,
+            extra_doh_clients: HashMap::new(),
+            route_map: None,
+            prewarm: None,
+            server_hostnames: Vec::new(),
         }
     }
 
@@ -106,6 +142,82 @@ impl DnsServer {
             dns_resolver,
             nameservers,
             filter_aaaa: true,
+            router: None,
+            extra_doh_clients: HashMap::new(),
+            route_map: None,
+            prewarm: None,
+            server_hostnames: Vec::new(),
+        }
+    }
+
+    /// Enable multi-server exit routing. After this, `Tunnel` decisions are
+    /// refined through `router`: domains matching a secondary exit's rules
+    /// resolve via that exit's DoH client, their A answers are recorded in
+    /// `route_map`, and `prewarm` starts the exit's TUN session.
+    pub fn set_multi_exit(
+        &mut self,
+        router: Arc<Router>,
+        extra_doh_clients: HashMap<String, Arc<DohClient>>,
+        route_map: Arc<std::sync::Mutex<RouteMap>>,
+        prewarm: Arc<dyn Fn(&str) + Send + Sync>,
+    ) {
+        self.router = Some(router);
+        self.extra_doh_clients = extra_doh_clients;
+        self.route_map = Some(route_map);
+        self.prewarm = Some(prewarm);
+    }
+
+    /// Declare the VPN exit servers' own hostnames. Queries for these are
+    /// always answered via the direct-UDP bypass path, never the tunnel —
+    /// the tunnel's reconnect logic depends on resolving them, so letting
+    /// them go through DoH is a circular dependency (dead session → DoH
+    /// ServFail → reconnect can't resolve the server → still dead).
+    pub fn set_server_hostnames(&mut self, hostnames: Vec<String>) {
+        self.server_hostnames = hostnames
+            .into_iter()
+            .map(|h| h.trim_end_matches('.').to_lowercase())
+            .collect();
+    }
+
+    /// Pick the exit for a tunneled domain: the router's choice, or `None`
+    /// for the default exit / when no router is configured.
+    fn choose_exit(&self, domain: &str) -> Option<String> {
+        let router = self.router.as_ref()?;
+        let chosen = router.choose(domain);
+        if chosen == rvpn_split_tunnel::DEFAULT_SERVER_NAME {
+            None
+        } else {
+            Some(chosen.to_string())
+        }
+    }
+
+    /// Select the DoH client for an exit: `None`/default exit → the primary
+    /// client; a named exit → its dedicated client (`None` if somehow
+    /// missing — the caller answers ServFail rather than silently falling
+    /// back to another exit).
+    fn doh_client_for(&self, exit: Option<&str>) -> Option<&Arc<DohClient>> {
+        match exit {
+            Some(name) => self.extra_doh_clients.get(name),
+            None => self.doh_client.as_ref(),
+        }
+    }
+
+    /// Record a secondary-exit answer: every A address goes into the shared
+    /// route map (so the uplink demux sends those flows via this exit), and
+    /// the pre-warm hook starts the exit's session. Never called for the
+    /// default exit — absence from the route map already means "default".
+    fn note_routed_answer(&self, exit: &str, addrs: &[IpAddr], ttl_secs: u32) {
+        if let Some(route_map) = &self.route_map {
+            let ttl = Duration::from_secs(ttl_secs.max(30) as u64);
+            let mut map = route_map.lock().unwrap();
+            for addr in addrs {
+                if let IpAddr::V4(v4) = addr {
+                    map.insert(IpAddr::V4(*v4), exit, ttl);
+                }
+            }
+        }
+        if let Some(prewarm) = &self.prewarm {
+            prewarm(exit);
         }
     }
 
@@ -178,8 +290,11 @@ impl DnsServer {
                 self.forward_raw_dns(query_bytes).await
             }
             SplitTunnelRoutingDecision::Tunnel => {
+                // Multi-server: a router may steer this domain to a
+                // secondary exit; resolve via that exit's DoH client.
+                let exit = self.choose_exit(domain);
                 // Resolve via DoH and build minimal response
-                self.resolve_tunnel_minimal(&request, name, query_type, domain).await
+                self.resolve_tunnel_minimal(&request, name, query_type, domain, exit.as_deref()).await
             }
         }
     }
@@ -196,7 +311,8 @@ impl DnsServer {
     }
 
     /// Resolve a tunnel domain via DoH, returning a minimal response.
-    async fn resolve_tunnel_minimal(&self, request: &Message, name: &Name, query_type: RecordType, domain: &str) -> Result<Vec<u8>> {
+    /// `exit` is the chosen secondary exit name (`None` = default exit).
+    async fn resolve_tunnel_minimal(&self, request: &Message, name: &Name, query_type: RecordType, domain: &str, exit: Option<&str>) -> Result<Vec<u8>> {
         let qtype_num: u16 = match query_type {
             RecordType::A => 1,
             RecordType::AAAA => 28,
@@ -206,9 +322,12 @@ impl DnsServer {
             }
         };
 
-        let client = match &self.doh_client {
+        let client = match self.doh_client_for(exit) {
             Some(c) => c,
             None => {
+                if let Some(exit) = exit {
+                    warn!("No DoH client for exit '{}' (domain {})", exit, domain);
+                }
                 let mut response = self.make_base_response(request);
                 response.set_response_code(ResponseCode::ServFail);
                 return response.to_vec().context("Failed to serialize ServFail");
@@ -218,6 +337,9 @@ impl DnsServer {
         // Try cache first
         if let Some(cached) = client.lookup_cached(domain, qtype_num).await {
             let ttl = client.get_cached_ttl(domain, qtype_num).await.unwrap_or(14400);
+            if let Some(exit) = exit {
+                self.note_routed_answer(exit, &cached, ttl);
+            }
             let mut response = self.make_base_response(request);
             response.set_response_code(ResponseCode::NoError);
             // First matching record only
@@ -241,6 +363,9 @@ impl DnsServer {
         match client.resolve(domain, qtype_num).await {
             Ok(addrs) => {
                 let ttl = client.get_cached_ttl(domain, qtype_num).await.unwrap_or(14400);
+                if let Some(exit) = exit {
+                    self.note_routed_answer(exit, &addrs, ttl);
+                }
                 let mut response = self.make_base_response(request);
                 response.set_response_code(ResponseCode::NoError);
                 for addr in &addrs {
@@ -407,10 +532,31 @@ impl DnsServer {
             return Ok(());
         }
 
+        // VPN exit server hostnames always resolve via the direct-UDP bypass
+        // path — never through the tunnel. The reconnect logic resolves the
+        // server hostname while the tunnel is down (and this proxy is the
+        // system resolver); sending that query through DoH deadlocks
+        // reconnection.
+        if self.server_hostnames.iter().any(|h| *h == domain_lower) {
+            info!("Routing {} to local resolver (VPN server hostname, never tunneled)", name);
+            let response = self.resolve_local(&request, &name, query_type).await;
+            let response_bytes = response.to_vec()
+                .context("Failed to serialize DNS response")?;
+            socket.send_to(&response_bytes, client_addr).await
+                .context("Failed to send DNS response")?;
+            return Ok(());
+        }
+
         // Make routing decision using SplitTunnel
         let decision = self.route_query(&name).await;
+        // Multi-server: refine Tunnel decisions through the exit router.
+        let exit = if decision == RoutingDecision::Tunnel {
+            self.choose_exit(&domain_lower)
+        } else {
+            None
+        };
 
-        info!("DNS query: {} {:?} from {} → {:?}", name, query_type, client_addr, decision);
+        info!("DNS query: {} {:?} from {} → {:?} (exit={:?})", name, query_type, client_addr, decision, exit);
 
         let response = match decision {
             RoutingDecision::Bypass => {
@@ -418,8 +564,8 @@ impl DnsServer {
                 self.resolve_local(&request, &name, query_type).await
             }
             RoutingDecision::Tunnel => {
-                info!("Routing {} to remote DoH (tunnel)", name);
-                self.resolve_remote(&request, &name, query_type).await
+                info!("Routing {} to remote DoH (tunnel, exit={:?})", name, exit);
+                self.resolve_remote(&request, &name, query_type, exit.as_deref()).await
             }
             RoutingDecision::Block => {
                 info!("Blocking {} (ad/tracker)", name);
@@ -449,12 +595,14 @@ impl DnsServer {
         Ok(())
     }
 
-    /// Resolve a domain via the DoH client (tunnel), with caching
+    /// Resolve a domain via the DoH client (tunnel), with caching.
+    /// `exit` names the secondary exit to resolve through (`None` = default).
     async fn resolve_remote(
         &self,
         request: &Message,
         name: &Name,
         query_type: RecordType,
+        exit: Option<&str>,
     ) -> Message {
         let domain = name.to_ascii();
         // Strip trailing dot
@@ -473,16 +621,36 @@ impl DnsServer {
             }
         };
 
+        let doh_client = match self.doh_client_for(exit) {
+            Some(c) => Some(c),
+            None => {
+                if let Some(exit) = exit {
+                    // No DoH client for the named exit — configuration error,
+                    // not a fallback. Never silently resolve a routed domain
+                    // through the default exit.
+                    warn!("No DoH client for exit '{}' (domain {})", exit, domain);
+                    return self.make_error_response(request, ResponseCode::ServFail);
+                }
+                None
+            }
+        };
+
         // Check DoH client cache first (this is the authoritative cache for
         // tunnel-domain DNS results). The DnsResolver cache uses a different
         // key format and would always miss, so we skip it.
-        if let Some(client) = &self.doh_client {
+        if let Some(client) = doh_client {
             if let Some(cached) = client.lookup_cached(domain, qtype_num).await {
                 debug!("DoH cache hit for tunnel domain {}", domain);
                 let mut response = self.make_base_response(request);
                 response.set_response_code(ResponseCode::NoError);
                 // Use DoH client's TTL (capped to reasonable max)
                 let ttl = client.get_cached_ttl(domain, qtype_num).await.unwrap_or(14400);
+
+                if let Some(exit) = exit {
+                    // Refresh the route map from the cached answer — the map's
+                    // entries may expire while the DoH cache entry lives on.
+                    self.note_routed_answer(exit, &cached, ttl);
+                }
 
                 for addr in &cached {
                     match addr {
@@ -508,7 +676,7 @@ impl DnsServer {
             }
         }
 
-        match &self.doh_client {
+        match doh_client {
             Some(client) => {
                 match client.resolve(domain, qtype_num).await {
                     Ok(addrs) => {
@@ -516,6 +684,10 @@ impl DnsServer {
                         response.set_response_code(ResponseCode::NoError);
                         // Use the actual TTL from the DoH response (cached by the client)
                         let ttl = client.get_cached_ttl(domain, qtype_num).await.unwrap_or(14400);
+
+                        if let Some(exit) = exit {
+                            self.note_routed_answer(exit, &addrs, ttl);
+                        }
 
                         for addr in &addrs {
                             match addr {
@@ -903,5 +1075,84 @@ mod tests {
 
         assert_eq!(response.response_code(), ResponseCode::NoError);
         assert!(response.answers().is_empty());
+    }
+
+    async fn test_split_tunnel() -> SplitTunnel {
+        use rvpn_split_tunnel::SplitTunnelConfig;
+        let config = SplitTunnelConfig {
+            enabled: true,
+            builtin_bypass_countries: vec![],
+            block_ads: false,
+            ..Default::default()
+        };
+        SplitTunnel::new(
+            config,
+            std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![])),
+        ).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_choose_exit_without_router_is_default() {
+        let server = DnsServer::new(test_split_tunnel().await);
+        assert_eq!(server.choose_exit("anything.example.com"), None);
+    }
+
+    #[tokio::test]
+    async fn test_choose_exit_with_router() {
+        use rvpn_split_tunnel::{Router, RoutingRule, DEFAULT_SERVER_NAME};
+
+        let mut routing: std::collections::HashMap<String, RoutingRule> = std::collections::HashMap::new();
+        routing.insert("sg".to_string(), RoutingRule {
+            domains: vec!["routed.example.com".to_string()],
+            ips: vec![],
+        });
+        let router = Arc::new(Router::build(&[DEFAULT_SERVER_NAME, "sg"], &routing).unwrap());
+        let route_map = Arc::new(std::sync::Mutex::new(crate::route_map::RouteMap::new()));
+        let prewarm: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_| {});
+
+        let mut server = DnsServer::new(test_split_tunnel().await);
+        server.set_multi_exit(router, HashMap::new(), route_map, prewarm);
+
+        assert_eq!(
+            server.choose_exit("www.routed.example.com").as_deref(),
+            Some("sg")
+        );
+        // Apex matches too (Suffix rule).
+        assert_eq!(
+            server.choose_exit("routed.example.com").as_deref(),
+            Some("sg")
+        );
+        // Unmatched domains stay on the default exit.
+        assert_eq!(server.choose_exit("other.example.org"), None);
+    }
+
+    #[tokio::test]
+    async fn test_note_routed_answer_records_a_only_and_prewarms() {
+        use rvpn_split_tunnel::{Router, RoutingRule, DEFAULT_SERVER_NAME};
+
+        let mut routing: std::collections::HashMap<String, RoutingRule> = std::collections::HashMap::new();
+        routing.insert("sg".to_string(), RoutingRule::default());
+        let router = Arc::new(Router::build(&[DEFAULT_SERVER_NAME, "sg"], &routing).unwrap());
+        let route_map = Arc::new(std::sync::Mutex::new(crate::route_map::RouteMap::new()));
+        let prewarm_calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let calls = Arc::clone(&prewarm_calls);
+        let prewarm: Arc<dyn Fn(&str) + Send + Sync> =
+            Arc::new(move |exit: &str| calls.lock().unwrap().push(exit.to_string()));
+
+        let mut server = DnsServer::new(test_split_tunnel().await);
+        server.set_multi_exit(router, HashMap::new(), Arc::clone(&route_map), prewarm);
+
+        let v4: IpAddr = "203.0.113.7".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        server.note_routed_answer("sg", &[v4, v6], 300);
+
+        // A address recorded with the exit; AAAA is not (the uplink demux is
+        // IPv4-only). Absence = default, so default answers are never here.
+        assert_eq!(
+            route_map.lock().unwrap().lookup(&v4).as_deref(),
+            Some("sg")
+        );
+        assert_eq!(route_map.lock().unwrap().lookup(&v6), None);
+        assert_eq!(prewarm_calls.lock().unwrap().as_slice(), &["sg".to_string()]);
     }
 }

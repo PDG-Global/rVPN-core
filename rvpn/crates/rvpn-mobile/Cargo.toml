@@ -1,9 +1,8 @@
 [package]
 name = "rvpn-mobile"
-# Pinned separately from the workspace: iOS/macOS/Android apps still ship v1.2.6
-# on the App Store / Play Store. Bump this in lockstep with those mobile releases,
-# not with the CLI/server workspace version.
-version = "1.2.7"
+# Pinned separately from the workspace. Bump this in lockstep with the mobile
+# app releases (iOS/macOS/Android), not with the CLI/server workspace version.
+version = "1.2.11"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -31,7 +30,10 @@ rvpn-core = { path = "../rvpn-core" }
 # TLS backend is selected by the *direct-tun feature in use:
 #   ios-direct-tun   → rvpn-tls/rustls  (BoringSSL's SSL_read leaks anonymous VM in the iOS NE sandbox)
 #   macos-direct-tun → rvpn-tls/boring  (keeps Chrome ClientHello mimicry on desktop)
-#   android-direct-tun uses rustls inline in android_tun.rs; only needs TlsFingerprint from rvpn-tls.
+#   android-direct-tun → rustls inline in android_server_session.rs for the transport, but
+#     rvpn-tls/rustls is enabled so the shared ResumptionStore type (rustls side) is available
+#     for per-exit TLS session resumption. All of rvpn-tls's rustls deps (rustls, tokio-rustls,
+#     webpki-roots) are already in the Android dep graph, so this adds no new dependencies.
 rvpn-tls = { path = "../rvpn-tls", default-features = false }
 futures = "0.3"
 futures-util = "0.3"
@@ -136,7 +138,7 @@ ios-direct-tun = ["rvpn-tls/rustls"]
 # Selects the boring TLS backend to retain Chrome ClientHello fingerprint mimicry.
 macos-direct-tun = ["rvpn-tls/boring"]
 # Enable Android Direct TUN mode (uses android_tun_ffi instead of legacy TunBridge)
-android-direct-tun = ["rustls", "tokio-rustls", "rustls-platform-verifier", "webpki-roots", "tokio-tungstenite/__rustls-tls"]
+android-direct-tun = ["rustls", "tokio-rustls", "rustls-platform-verifier", "webpki-roots", "tokio-tungstenite/__rustls-tls", "rvpn-tls/rustls"]
 # Enable HarmonyOS NEXT NAPI FFI (uses rustls, same TLS stack as Android).
 # Consumed by the DevEco project at `rvpn-harmonyos/`.
 harmony-direct-tun = ["rustls", "tokio-rustls", "rustls-platform-verifier", "webpki-roots", "tokio-tungstenite/__rustls-tls"]

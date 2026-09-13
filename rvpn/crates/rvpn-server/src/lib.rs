@@ -1,6 +1,7 @@
 //! R-VPN Server Library
 
 pub mod config;
+pub mod decoy;
 pub mod handler;
 pub mod tun_server;
 
@@ -33,6 +34,7 @@ mod tun_writer {
             &self,
             client_ip: IpAddr,
             client_id: &str,
+            sender: mpsc::Sender<Vec<u8>>,
         ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
         fn allocate_ip(
             &self,
@@ -59,8 +61,9 @@ mod tun_writer {
             &self,
             client_ip: IpAddr,
             client_id: &str,
+            sender: mpsc::Sender<Vec<u8>>,
         ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-            (**self).unregister_client(client_ip, client_id)
+            (**self).unregister_client(client_ip, client_id, sender)
         }
         fn allocate_ip(
             &self,
@@ -96,11 +99,12 @@ mod tun_writer {
             &self,
             client_ip: IpAddr,
             client_id: &str,
+            sender: mpsc::Sender<Vec<u8>>,
         ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
             let client_id = client_id.to_string();
             Box::pin(async move {
                 let ts = self.read().await;
-                ts.unregister_client(client_ip, &client_id).await
+                ts.unregister_client(client_ip, &client_id, &sender).await
             })
         }
         fn allocate_ip(
@@ -138,11 +142,12 @@ mod tun_writer {
             &self,
             client_ip: IpAddr,
             client_id: &str,
+            sender: mpsc::Sender<Vec<u8>>,
         ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
             let client_id = client_id.to_string();
             Box::pin(async move {
                 let ts = self;
-                ts.unregister_client(client_ip, &client_id).await
+                ts.unregister_client(client_ip, &client_id, &sender).await
             })
         }
         fn allocate_ip(

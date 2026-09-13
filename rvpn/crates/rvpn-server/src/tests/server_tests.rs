@@ -347,7 +347,10 @@ async fn test_tun_response_loop_batches_packets() -> anyhow::Result<()> {
     let ws_write = std::sync::Arc::new(tokio::sync::Mutex::new(ws_write));
     let loop_task = tokio::spawn(
         crate::handler::MultiplexerSession::<tokio::net::TcpStream>::run_tun_response_loop(
-            bob, rx, ws_write,
+            bob,
+            rx,
+            ws_write,
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
         ),
     );
 
@@ -395,5 +398,531 @@ async fn test_tun_response_loop_batches_packets() -> anyhow::Result<()> {
         packets.len()
     );
 
+    Ok(())
+}
+
+// ── Credit-based per-flow flow control ─────────────────────────────
+
+use crate::handler::{FlowMap, MuxMessage, MultiplexerSession, ServerFlow};
+use bytes::Bytes;
+use rvpn_core::protocol::multiplex::{
+    ControlMessage, FlowSendCredits, FLOW_CREDIT_STALL_TIMEOUT, INITIAL_FLOW_WINDOW,
+};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
+
+type Session = MultiplexerSession<tokio::net::TcpStream>;
+
+/// Loopback TCP pair: (peer end the test drives, server end handed to the
+/// flow tasks).
+async fn tcp_pair() -> anyhow::Result<(tokio::net::TcpStream, tokio::net::TcpStream)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+    Ok((client?, accepted?.0))
+}
+
+fn test_peer_addr() -> std::net::SocketAddr {
+    "127.0.0.1:55555".parse().expect("valid socket addr")
+}
+
+fn insert_test_flow(
+    flows: &FlowMap,
+    flow_id: u32,
+    to_target_tx: mpsc::Sender<Bytes>,
+    send_credits: Arc<FlowSendCredits>,
+) -> tokio::task::JoinHandle<()> {
+    let flows = flows.clone();
+    tokio::spawn(async move {
+        // Stand-in abort handles: this flow has no real tasks.
+        let relay_task = tokio::spawn(std::future::pending::<()>()).abort_handle();
+        let writer_task = tokio::spawn(std::future::pending::<()>()).abort_handle();
+        flows.lock().await.insert(
+            flow_id,
+            Arc::new(ServerFlow {
+                to_target_tx,
+                send_credits,
+                relay_task,
+                writer_task,
+            }),
+        );
+    })
+}
+
+/// Drain data frames for `flow_id` until `received` reaches `until` bytes.
+async fn recv_data_until(
+    rx: &mut mpsc::Receiver<MuxMessage>,
+    flow_id: u32,
+    expected_byte: u8,
+    received: &mut usize,
+    until: usize,
+) {
+    while *received < until {
+        match rx.recv().await {
+            Some(MuxMessage::Data { flow_id: fid, data }) => {
+                assert_eq!(fid, flow_id);
+                assert!(data.iter().all(|&b| b == expected_byte));
+                *received += data.len();
+            }
+            Some(MuxMessage::Control(_)) => panic!("relay must not emit control frames here"),
+            None => panic!("data channel closed early"),
+        }
+    }
+}
+
+/// The per-flow writer task must forward bytes to the target socket in order
+/// and emit a WindowUpdate granting exactly the consumed byte count after
+/// each write (receiver-side credit accounting).
+#[tokio::test]
+async fn test_flow_writer_emits_window_update() -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut peer, target) = tcp_pair().await?;
+    let (_read_half, write_half) = target.into_split();
+
+    let flows: FlowMap = Arc::new(Mutex::new(HashMap::new()));
+    let (to_target_tx, to_target_rx) = mpsc::channel::<Bytes>(8);
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlMessage>(16);
+    let flow_id = 7u32;
+    insert_test_flow(
+        &flows,
+        flow_id,
+        to_target_tx.clone(),
+        Arc::new(FlowSendCredits::new()),
+    )
+    .await?;
+
+    let writer = Session::spawn_flow_writer(
+        flow_id,
+        write_half,
+        to_target_rx,
+        flows.clone(),
+        control_tx,
+        test_peer_addr(),
+    );
+
+    let chunks: Vec<Vec<u8>> = vec![vec![1u8; 1000], vec![2u8; 2000], vec![3u8; 500]];
+    let mut expected = Vec::new();
+    for chunk in &chunks {
+        to_target_tx.send(Bytes::copy_from_slice(chunk)).await?;
+        expected.extend_from_slice(chunk);
+    }
+
+    // The target receives the exact bytes in order.
+    let mut received = vec![0u8; expected.len()];
+    tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut received)).await??;
+    assert_eq!(received, expected);
+
+    // Each write produced a WindowUpdate granting exactly the bytes written.
+    for chunk in &chunks {
+        let msg = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await?
+            .expect("control channel closed early");
+        assert_eq!(
+            msg,
+            ControlMessage::WindowUpdate {
+                flow_id,
+                window_size: chunk.len() as u32
+            }
+        );
+    }
+
+    // Removing the flow drops the queue sender; the writer drains and exits.
+    flows.lock().await.remove(&flow_id);
+    drop(to_target_tx);
+    tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .map_err(|_| anyhow::anyhow!("flow writer did not exit after flow removal"))??;
+
+    Ok(())
+}
+
+/// A client over-sending beyond its credits (uplink queue full) must get its
+/// flow closed — never block the WebSocket receive loop.
+#[tokio::test]
+async fn test_handle_flow_data_closes_flow_on_oversend() -> anyhow::Result<()> {
+    let flows: FlowMap = Arc::new(Mutex::new(HashMap::new()));
+    // No writer task draining: the queue stays full, simulating a client
+    // that sends far beyond its credit window.
+    let (to_target_tx, _to_target_rx) = mpsc::channel::<Bytes>(64);
+    while to_target_tx.try_send(Bytes::from_static(b"x")).is_ok() {}
+    let flow_id = 9u32;
+    insert_test_flow(
+        &flows,
+        flow_id,
+        to_target_tx,
+        Arc::new(FlowSendCredits::new()),
+    )
+    .await?;
+
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlMessage>(4);
+    let result = Session::handle_flow_data(flow_id, b"overflow", &flows, &control_tx).await;
+    assert!(result.is_err(), "over-send past a full queue must fail");
+    assert!(
+        flows.lock().await.is_empty(),
+        "over-sending flow must be removed from the flow map"
+    );
+    let msg = control_rx
+        .recv()
+        .await
+        .expect("over-sending flow must be closed with CloseFlow");
+    assert_eq!(msg, ControlMessage::CloseFlow { flow_id });
+
+    Ok(())
+}
+
+/// The downlink relay must stop reading the target socket when the credit
+/// window is exhausted and resume when WindowUpdate grants arrive. The
+/// in-flight byte count per flow is bounded by INITIAL_FLOW_WINDOW.
+#[tokio::test]
+async fn test_flow_relay_respects_send_credits() -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (mut peer, target) = tcp_pair().await?;
+    let (read_half, _write_half) = target.into_split();
+
+    let flows: FlowMap = Arc::new(Mutex::new(HashMap::new()));
+    let (to_target_tx, _to_target_rx) = mpsc::channel::<Bytes>(1);
+    let send_credits = Arc::new(FlowSendCredits::new());
+    let flow_id = 11u32;
+    insert_test_flow(&flows, flow_id, to_target_tx, send_credits.clone()).await?;
+
+    let (tx, mut rx) = mpsc::channel::<MuxMessage>(2000);
+    let (control_tx, _control_rx) = mpsc::channel::<ControlMessage>(16);
+    let _relay = Session::spawn_flow_relay(
+        flow_id,
+        read_half,
+        flows.clone(),
+        tx,
+        control_tx,
+        send_credits.clone(),
+        test_peer_addr(),
+    );
+
+    // The target sends twice the window.
+    let window = INITIAL_FLOW_WINDOW as usize;
+    let writer = tokio::spawn(async move {
+        peer.write_all(&vec![0xABu8; window * 2]).await
+    });
+
+    // Exactly one window's worth of data may arrive; then the relay stalls.
+    let mut received = 0usize;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        recv_data_until(&mut rx, flow_id, 0xAB, &mut received, window),
+    )
+    .await?;
+    assert_eq!(received, window, "relay forwarded more than the window");
+    assert_eq!(send_credits.available(), 0, "window must be fully consumed");
+
+    // No more data while credits are exhausted.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .is_err(),
+        "relay sent data with zero credits"
+    );
+
+    // Grant the second window — the remainder flows.
+    send_credits.grant(window as u64);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        recv_data_until(&mut rx, flow_id, 0xAB, &mut received, window * 2),
+    )
+    .await?;
+    assert_eq!(received, window * 2);
+    tokio::time::timeout(Duration::from_secs(5), writer).await???;
+
+    Ok(())
+}
+
+/// Regression: a peer that never sends WindowUpdate stalls the downlink at
+/// zero credits; the stall valve must close the flow after
+/// FLOW_CREDIT_STALL_TIMEOUT instead of hanging forever.
+#[tokio::test(start_paused = true)]
+async fn test_flow_relay_stall_valve_closes_flow() -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (mut peer, target) = tcp_pair().await?;
+    let (read_half, _write_half) = target.into_split();
+
+    let flows: FlowMap = Arc::new(Mutex::new(HashMap::new()));
+    let (to_target_tx, _to_target_rx) = mpsc::channel::<Bytes>(1);
+    let send_credits = Arc::new(FlowSendCredits::new());
+    let flow_id = 13u32;
+    insert_test_flow(&flows, flow_id, to_target_tx, send_credits.clone()).await?;
+
+    let (tx, mut rx) = mpsc::channel::<MuxMessage>(2000);
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlMessage>(16);
+    let _relay = Session::spawn_flow_relay(
+        flow_id,
+        read_half,
+        flows.clone(),
+        tx,
+        control_tx,
+        send_credits,
+        test_peer_addr(),
+    );
+
+    // Target sends more than the window; the relay drains exactly the
+    // window and then stalls at zero credits.
+    let window = INITIAL_FLOW_WINDOW as usize;
+    tokio::spawn(async move { peer.write_all(&vec![0xCDu8; window + 8190]).await });
+
+    let mut received = 0usize;
+    while received < window {
+        match rx.recv().await {
+            Some(MuxMessage::Data { data, .. }) => received += data.len(),
+            other => panic!("unexpected relay output: {:?}", other.map(|_| ())),
+        }
+    }
+    assert_eq!(received, window);
+
+    // Never grant credits: the valve must fire and close the flow. Under
+    // the paused clock the 60s timeout auto-advances.
+    let msg = control_rx
+        .recv()
+        .await
+        .expect("stall valve must send CloseFlow");
+    assert_eq!(msg, ControlMessage::CloseFlow { flow_id });
+    assert!(
+        flows.lock().await.is_empty(),
+        "stalled flow must be removed from the flow map"
+    );
+
+    Ok(())
+}
+
+/// Regression: removing a flow (the CloseFlow path) must abort a relay
+/// parked at zero credits immediately. Before `remove_flow` aborted the
+/// flow's tasks, a parked relay lingered until the 60s stall valve fired —
+/// logging a spurious stall warning and holding the target connection open
+/// long after the client had closed the flow cleanly.
+#[tokio::test(start_paused = true)]
+async fn test_remove_flow_aborts_parked_relay() -> anyhow::Result<()> {
+    let (_peer, target) = tcp_pair().await?;
+    let (read_half, _write_half) = target.into_split();
+
+    let flows: FlowMap = Arc::new(Mutex::new(HashMap::new()));
+    let (to_target_tx, _to_target_rx) = mpsc::channel::<Bytes>(1);
+    let send_credits = Arc::new(FlowSendCredits::new());
+    let flow_id = 15u32;
+
+    let (tx, _data_rx) = mpsc::channel::<MuxMessage>(8);
+    let (control_tx, _control_rx) = mpsc::channel::<ControlMessage>(8);
+    let relay = Session::spawn_flow_relay(
+        flow_id,
+        read_half,
+        flows.clone(),
+        tx,
+        control_tx,
+        send_credits.clone(),
+        test_peer_addr(),
+    );
+    // Store the task abort handles in the flow, as the CreateFlow path does.
+    let writer_task = tokio::spawn(std::future::pending::<()>()).abort_handle();
+    flows.lock().await.insert(
+        flow_id,
+        Arc::new(ServerFlow {
+            to_target_tx,
+            send_credits: send_credits.clone(),
+            relay_task: relay.abort_handle(),
+            writer_task,
+        }),
+    );
+
+    // Drain the credit window so the relay parks in wait_for_credit_or_stall.
+    send_credits.try_consume(send_credits.available());
+    assert_eq!(send_credits.available(), 0);
+    tokio::task::yield_now().await;
+
+    // Remove the flow via the same helper the CloseFlow arm uses.
+    let start = tokio::time::Instant::now();
+    crate::handler::remove_flow(&flows, flow_id).await;
+    assert!(flows.lock().await.is_empty(), "flow must be removed");
+
+    // The parked relay is aborted promptly — far below the 60s stall valve.
+    let join = tokio::time::timeout(Duration::from_secs(5), relay).await?;
+    let err = join.expect_err("parked relay must be aborted, not finish cleanly");
+    assert!(err.is_cancelled(), "relay must die via abort");
+    assert!(
+        start.elapsed() < FLOW_CREDIT_STALL_TIMEOUT,
+        "relay survived to the stall valve"
+    );
+
+    Ok(())
+}
+
+/// The WebSocket sender must drain control frames ahead of queued bulk data,
+/// so WindowUpdate / CloseFlow / FlowCreated are never stuck behind a bulk
+/// flow's backlog.
+#[tokio::test]
+async fn test_ws_sender_prioritizes_control() -> anyhow::Result<()> {
+    use futures_util::StreamExt as _;
+    use rvpn_core::crypto::ratchet::RatchetMessage;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Loopback WebSocket pair: run_ws_sender ↔ test client.
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let ws_addr = ws_listener.local_addr()?;
+    let accept_task = tokio::spawn(async move {
+        let (stream, _) = ws_listener.accept().await.unwrap();
+        tokio_tungstenite::accept_async(stream).await.unwrap()
+    });
+    let (client_ws, _resp) =
+        tokio_tungstenite::connect_async(format!("ws://{}/", ws_addr)).await?;
+    let server_ws = accept_task.await?;
+
+    let (ws_write, _server_read) = server_ws.split();
+    let (_client_sink, mut client_stream) = client_ws.split();
+
+    // Paired ratchets: server encrypts as Bob, test decrypts as Alice.
+    let secret = [7u8; 32];
+    let mut alice = rvpn_core::crypto::DoubleRatchet::init_alice(secret, [0u8; 32]);
+    let bob = std::sync::Arc::new(tokio::sync::Mutex::new(
+        rvpn_core::crypto::DoubleRatchet::init_bob(secret),
+    ));
+
+    let (tx, rx) = mpsc::channel::<MuxMessage>(64);
+    let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(16);
+
+    // Queue bulk data FIRST, then one control frame behind it.
+    for i in 0..8u8 {
+        tx.send(MuxMessage::Data {
+            flow_id: 1,
+            data: vec![i; 1000],
+        })
+        .await?;
+    }
+    control_tx
+        .send(ControlMessage::CloseFlow { flow_id: 2 })
+        .await?;
+
+    let ws_write = std::sync::Arc::new(tokio::sync::Mutex::new(ws_write));
+    let sender = tokio::spawn(Session::run_ws_sender(
+        rx,
+        control_rx,
+        bob,
+        ws_write,
+        std::sync::Arc::new(tokio::sync::Mutex::new(())),
+    ));
+
+    // The first frame on the wire must be the control frame (AAD 0x02),
+    // even though eight data frames were queued before it.
+    let first = tokio::time::timeout(Duration::from_secs(5), client_stream.next())
+        .await?
+        .expect("ws closed before first frame")?;
+    let Message::Binary(data) = first else {
+        panic!("expected binary frame");
+    };
+    let ratchet_msg = RatchetMessage::from_bytes(&data)?;
+    let decrypted = alice.decrypt(&ratchet_msg, &[0x02])?;
+    let unpadded = rvpn_core::protocol::padding::unpad_packet(&decrypted)?;
+    let (frames, consumed) = rvpn_core::protocol::multiplex::parse_frames(&unpadded);
+    assert_eq!(consumed, unpadded.len());
+    assert_eq!(frames.len(), 1);
+    assert!(frames[0].is_control(), "first frame must be control");
+    assert_eq!(
+        frames[0].parse_control()?,
+        ControlMessage::CloseFlow { flow_id: 2 }
+    );
+
+    // The queued data must still arrive afterwards, in order.
+    for i in 0..8u8 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), client_stream.next())
+            .await?
+            .expect("ws closed while draining data")?;
+        let Message::Binary(data) = msg else {
+            panic!("expected binary data frame");
+        };
+        let ratchet_msg = RatchetMessage::from_bytes(&data)?;
+        let decrypted = alice.decrypt(&ratchet_msg, &[0x01])?;
+        let unpadded = rvpn_core::protocol::padding::unpad_packet(&decrypted)?;
+        let (frames, _) = rvpn_core::protocol::multiplex::parse_frames(&unpadded);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].flow_id, 1);
+        assert_eq!(&frames[0].payload[..], &vec![i; 1000][..]);
+    }
+
+    drop(tx);
+    drop(control_tx);
+    tokio::time::timeout(Duration::from_secs(5), sender)
+        .await
+        .map_err(|_| anyhow::anyhow!("run_ws_sender did not exit after channels closed"))??;
+
+    Ok(())
+}
+
+/// Regression: concurrent per-query DNS tasks must enqueue responses in
+/// ratchet message-number order. Without the send_lock in
+/// `DnsHandler::send_encrypted_response`, a response encrypted later could
+/// overtake an earlier one into the writer channel and the client's ratchet
+/// dropped it ("Message too old") — the periodic DNS breakage that ended in
+/// "pending queries with no response for 10s, forcing reconnect".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dns_responses_preserve_wire_order_under_contention() -> anyhow::Result<()> {
+    use rvpn_core::crypto::ratchet::RatchetMessage;
+    use rvpn_core::crypto::DoubleRatchet;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Server encrypts as Bob; the test decrypts as Alice in wire order.
+    let secret = [9u8; 32];
+    let mut alice = DoubleRatchet::init_alice(secret, [0u8; 32]);
+    let bob = Arc::new(tokio::sync::Mutex::new(DoubleRatchet::init_bob(secret)));
+    let send_lock = Arc::new(tokio::sync::Mutex::new(()));
+    // Capacity 1 forces send awaits → maximal interleaving between tasks.
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(1);
+
+    const TASKS: usize = 8;
+    const PER_TASK: usize = 50;
+    const TOTAL: usize = TASKS * PER_TASK;
+
+    let mut handles = Vec::new();
+    for t in 0..TASKS {
+        let bob = Arc::clone(&bob);
+        let send_lock = Arc::clone(&send_lock);
+        let out_tx = out_tx.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..PER_TASK {
+                let payload = format!("query-{}-{}", t, i).into_bytes();
+                crate::handler::DnsHandler::send_encrypted_response(
+                    &bob, &send_lock, &out_tx, &payload,
+                )
+                .await
+                .expect("send_encrypted_response failed");
+            }
+        }));
+    }
+    drop(out_tx);
+
+    let mut wire_numbers = Vec::new();
+    let mut payloads = std::collections::HashSet::new();
+    while let Some(msg) = out_rx.recv().await {
+        let Message::Binary(data) = msg else {
+            panic!("unexpected non-binary message");
+        };
+        let parsed = RatchetMessage::from_bytes(&data)?;
+        wire_numbers.push(parsed.header.message_number);
+        let plain = alice
+            .decrypt(&parsed, &[0x09])
+            .expect("decrypt failed — frame dropped or reordered");
+        payloads.insert(String::from_utf8(plain).expect("payload not utf8"));
+    }
+    for h in handles {
+        h.await.expect("sender task panicked");
+    }
+
+    // Every frame arrived and decrypted, in exact message-number order.
+    assert_eq!(wire_numbers.len(), TOTAL, "frames lost on the wire");
+    let mut sorted = wire_numbers.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        wire_numbers, sorted,
+        "wire order diverged from message-number order"
+    );
+    assert_eq!(wire_numbers[0], 0);
+    assert_eq!(wire_numbers[TOTAL - 1], (TOTAL - 1) as u32);
+    assert_eq!(payloads.len(), TOTAL, "payloads lost or duplicated");
     Ok(())
 }

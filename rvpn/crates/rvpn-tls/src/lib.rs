@@ -15,6 +15,12 @@
 
 pub mod tls_fingerprint;
 
+#[cfg(any(
+    feature = "rustls",
+    all(feature = "boring", not(target_os = "android"))
+))]
+pub mod resumption;
+
 #[cfg(feature = "boring")]
 pub mod tls_boring;
 
@@ -24,13 +30,24 @@ pub mod tls_rustls;
 #[cfg(feature = "native-tls")]
 pub mod tls_native;
 
-pub use tls_fingerprint::{TlsFingerprint, fingerprint_from_str};
+pub use tls_fingerprint::{fingerprint_from_str, TlsFingerprint};
+
+#[cfg(any(
+    feature = "rustls",
+    all(feature = "boring", not(target_os = "android"))
+))]
+pub use resumption::ResumptionStore;
 
 #[cfg(feature = "boring")]
-pub use tls_boring::{ChromeTlsStream, connect_chrome_like};
+pub use tls_boring::{connect_chrome_like, ChromeTlsStream};
+
+#[cfg(all(feature = "boring", not(target_os = "android")))]
+pub use tls_boring::connect_chrome_like_with_resumption;
 
 #[cfg(feature = "rustls")]
-pub use tls_rustls::{RustlsTlsStream, connect_rustls};
+pub use tls_rustls::{
+    build_client_config_with_store, connect_rustls, connect_rustls_with_store, RustlsTlsStream,
+};
 
 #[cfg(feature = "native-tls")]
-pub use tls_native::{NativeTlsStream, connect_native};
+pub use tls_native::{connect_native, NativeTlsStream};

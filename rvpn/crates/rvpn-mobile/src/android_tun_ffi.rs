@@ -11,14 +11,15 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 // Pending state callback - stored here because it's called before TUN client is created
-type StateCallbackType = Option<unsafe extern "C" fn(state: i32, ip: *const c_char, msg: *const c_char)>;
+type StateCallbackType =
+    Option<unsafe extern "C" fn(state: i32, ip: *const c_char, msg: *const c_char)>;
 static PENDING_STATE_CALLBACK: Mutex<StateCallbackType> = Mutex::new(None);
 
 // JNI types are only available on Android
 #[cfg(target_os = "android")]
-use jni::JNIEnv;
+use jni::sys::{jclass, jobject, jstring};
 #[cfg(target_os = "android")]
-use jni::sys::{jclass, jstring, jobject};
+use jni::JNIEnv;
 #[cfg(target_os = "android")]
 use jni_sys::JNIEnv as RawJNIEnv;
 
@@ -28,7 +29,8 @@ use jni_sys::JNIEnv as RawJNIEnv;
 unsafe fn make_env(env_ptr: *mut RawJNIEnv) -> JNIEnv<'static> {
     // Safety: The JVM guarantees the pointer is valid during the JNI call.
     // We use 'static lifetime because the env pointer is only valid for this call.
-    JNIEnv::from_raw(env_ptr as *mut _).expect("JNIEnv::from_raw failed - NULL or invalid env pointer")
+    JNIEnv::from_raw(env_ptr as *mut _)
+        .expect("JNIEnv::from_raw failed - NULL or invalid env pointer")
 }
 
 // Raw Android log functions for debugging (works in release builds)
@@ -66,28 +68,38 @@ type JClass = *const u8;
 #[cfg(not(target_os = "android"))]
 type JString = *const u8;
 
-use crate::ffi::TunConfig;
 use crate::android_tun::AndroidTunClient;
 #[cfg(feature = "dns")]
 use crate::dns_server::DnsServer;
 #[cfg(feature = "dns")]
 use crate::doh_client::DohClient;
+use crate::ffi::TunConfig;
 #[cfg(feature = "dns")]
 use crate::flow_connector::FlowConnectorConfig;
 use base64::Engine;
-use rvpn_split_tunnel::SplitTunnel;
-use rvpn_split_tunnel::DnsResolver;
 use rvpn_core::crypto::IdentityKey;
+use rvpn_split_tunnel::DnsResolver;
+use rvpn_split_tunnel::SplitTunnel;
 
 // ============================================================================
 // Global State
 // ============================================================================
 
 // Use Mutex<Option> instead of OnceCell so we can clear and recreate on reconnect.
-static TUN_CLIENT: parking_lot::Mutex<Option<Arc<AndroidTunClient>>> = parking_lot::Mutex::new(None);
-static TUN_RUNTIME: parking_lot::Mutex<Option<Arc<tokio::runtime::Runtime>>> = parking_lot::Mutex::new(None);
+static TUN_CLIENT: parking_lot::Mutex<Option<Arc<AndroidTunClient>>> =
+    parking_lot::Mutex::new(None);
+// The tokio Runtime is owned HERE (the FFI/lifecycle boundary), never by the
+// client or any session: tasks spawned on it capture Arc<AndroidServerSession>,
+// and if the Runtime were transitively reachable from those Arcs, dropping the
+// last ref on a worker thread would panic in BlockingPool::shutdown (the iOS
+// crash of 2026-07-03 — see the runtime-ownership section in AGENTS.md).
+// rvpnTunDestroy drops TUN_CLIENT first, then this, from the Kotlin calling
+// thread (outside any tokio context), which is safe.
+static TUN_RUNTIME: parking_lot::Mutex<Option<tokio::runtime::Runtime>> =
+    parking_lot::Mutex::new(None);
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
-static TRACING_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRACING_INITIALIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // ============================================================================
 // Core Runtime Functions
@@ -103,7 +115,12 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnInitialize() -> c_in
     // Instead, we use tracing-log to bridge tracing to the log crate,
     // which outputs to stderr → logcat System.err on Android.
     if TRACING_INITIALIZED
-        .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
         .is_err()
     {
         return SUCCESS;
@@ -194,7 +211,10 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnNetworkChanged(
     _class: jclass,
     has_internet: c_int,
 ) -> c_int {
-    logcat_info!("[Android_TUN_FFI] rvpnNetworkChanged(has_internet={}) called", has_internet);
+    logcat_info!(
+        "[Android_TUN_FFI] rvpnNetworkChanged(has_internet={}) called",
+        has_internet
+    );
 
     // Only request a reconnect when internet is available. On the loss
     // side, letting the read/keepalive timeouts fire naturally is fine —
@@ -327,7 +347,9 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnWriteStringTo
     let rust_str = match jstring_to_rust(env_ptr, rust_string) {
         Some(s) => s,
         None => {
-            logcat_error!("[Android_TUN_FFI] rvpnWriteStringToBuffer: failed to get string from JNI");
+            logcat_error!(
+                "[Android_TUN_FFI] rvpnWriteStringToBuffer: failed to get string from JNI"
+            );
             return -1;
         }
     };
@@ -338,7 +360,8 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnWriteStringTo
     if total_len > buffer_len as usize {
         logcat_error!(
             "[Android_TUN_FFI] rvpnWriteStringToBuffer: string too large ({} > {})",
-            total_len, buffer_len
+            total_len,
+            buffer_len
         );
         *out_len = -1;
         return -1;
@@ -414,6 +437,11 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnStart(
         stealth_fingerprint: None,
         server_identity_pin: mobile_config.server_fingerprint,
         country_ips_file: mobile_config.country_ips_file,
+        // The legacy MobileConfig format predates multi-server routing;
+        // profiles with exit servers go through rvpnTunCreate (full TunConfig
+        // JSON) instead.
+        extra_servers: Vec::new(),
+        routing: Default::default(),
     };
 
     let tun_json = match serde_json::to_string(&tun_config) {
@@ -472,7 +500,10 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<AndroidTunClient>) -> anyho
     let server_port = client.server_port();
     let base_path = client.server_path();
 
-    let dns_path = format!("{}/dns", base_path.trim_end_matches("/tun").trim_end_matches('/'));
+    let dns_path = format!(
+        "{}/dns",
+        base_path.trim_end_matches("/tun").trim_end_matches('/')
+    );
 
     let flow_config = FlowConnectorConfig {
         server_host: server_host.clone(),
@@ -487,7 +518,52 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<AndroidTunClient>) -> anyho
     doh_client.clone().start_cleanup_task();
     doh_client.start().await?;
 
-    logcat_info!("[Android_TUN_FFI] DoH client started, connecting to {}/dns", base_path);
+    logcat_info!(
+        "[Android_TUN_FFI] DoH client started, connecting to {}/dns",
+        base_path
+    );
+
+    // Multi-server: one extra DoH client per secondary exit, each with its
+    // own persistent /dns WebSocket to that exit (same X3DH + ratchet
+    // pattern, per-exit prekey bundle). A failed extra exit must not take
+    // down the default proxy — log and continue without it (routed queries
+    // for that exit will ServFail rather than silently use the default).
+    let mut extra_doh_clients: std::collections::HashMap<String, Arc<DohClient>> =
+        std::collections::HashMap::new();
+    let extra_dns_info = client.extra_session_dns_info();
+    // The exit servers' own hostnames must always bypass the tunnel in the
+    // DNS layer — the reconnect path resolves them while the tunnel is down.
+    let mut server_hostnames: Vec<String> = vec![client.server_host().to_string()];
+    server_hostnames.extend(extra_dns_info.iter().map(|(_, host, _, _, _)| host.clone()));
+    for (name, host, port, base_path, bundle) in extra_dns_info {
+        let dns_path = format!(
+            "{}/dns",
+            base_path.trim_end_matches("/tun").trim_end_matches('/')
+        );
+        let flow_config = FlowConnectorConfig {
+            server_host: host,
+            server_port: port,
+            server_path: dns_path.clone(),
+            tls_fingerprint: client.tls_fingerprint(),
+            identity_key: Arc::new(client.identity_key().clone()),
+            server_bundle: bundle,
+        };
+        let doh = Arc::new(DohClient::new(flow_config, dns_path));
+        doh.clone().start_cleanup_task();
+        match doh.start().await {
+            Ok(()) => {
+                logcat_info!("[Android_TUN_FFI] DoH client for exit '{}' started", name);
+                extra_doh_clients.insert(name, doh);
+            }
+            Err(e) => {
+                logcat_error!(
+                    "[Android_TUN_FFI] DoH client for exit '{}' failed to start: {}",
+                    name,
+                    e
+                );
+            }
+        }
+    }
 
     let split_tunnel_config = rvpn_split_tunnel::SplitTunnelConfig {
         enabled: true,
@@ -504,17 +580,37 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<AndroidTunClient>) -> anyho
         split_tunnel_config.block_ads
     );
 
-    let dns_resolver = std::sync::Arc::new(DnsResolver::new(true, 14400, 1000, false, true, vec![]));
+    let dns_resolver =
+        std::sync::Arc::new(DnsResolver::new(true, 14400, 1000, false, true, vec![]));
     dns_resolver.start_cleanup_task();
     let split_tunnel = SplitTunnel::new(split_tunnel_config, dns_resolver).await?;
 
-    let dns_server = Arc::new(DnsServer::with_doh(
+    let mut dns_server = DnsServer::with_doh(
         split_tunnel,
         doh_client,
         client.get_dns_bind_addr().to_string(),
-    ));
+    );
+    dns_server.set_server_hostnames(server_hostnames);
 
-    logcat_info!("[Android_TUN_FFI] DNS server created, starting on {}", client.get_dns_bind_addr());
+    // Wire multi-server routing into the DNS layer. The pre-warm hook holds
+    // a Weak<AndroidTunClient> so the DNS proxy task never keeps the client
+    // (or transitively the runtime's tasks) alive after rvpnTunDestroy.
+    if let (Some(router), Some(route_map)) = (client.router(), client.route_map()) {
+        let weak = Arc::downgrade(client);
+        let prewarm: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |exit: &str| {
+            if let Some(client) = weak.upgrade() {
+                client.ensure_session_started(exit);
+            }
+        });
+        dns_server.set_multi_exit(router, extra_doh_clients, route_map, prewarm);
+        logcat_info!("[Android_TUN_FFI] DNS proxy: multi-server exit routing enabled");
+    }
+    let dns_server = Arc::new(dns_server);
+
+    logcat_info!(
+        "[Android_TUN_FFI] DNS server created, starting on {}",
+        client.get_dns_bind_addr()
+    );
 
     dns_server.run().await
 }
@@ -580,8 +676,12 @@ fn create_tun_client_impl(json_str: &str) -> c_int {
 
     let config: TunConfig = match serde_json::from_str::<TunConfig>(json_str) {
         Ok(c) => {
-            logcat_info!("Config parsed: server={}, identity={}, prekey={}",
-                c.server_address, c.identity_key_path, c.prekey_bundle_path);
+            logcat_info!(
+                "Config parsed: server={}, identity={}, prekey={}",
+                c.server_address,
+                c.identity_key_path,
+                c.prekey_bundle_path
+            );
             c
         }
         Err(e) => {
@@ -612,14 +712,23 @@ fn create_tun_client_impl(json_str: &str) -> c_int {
     // Check if identity key file exists
     if !std::path::Path::new(&config.identity_key_path).exists() {
         logcat_error!("Identity key file not found: {}", config.identity_key_path);
-        set_last_error(&format!("Identity key file not found: {}", config.identity_key_path));
+        set_last_error(&format!(
+            "Identity key file not found: {}",
+            config.identity_key_path
+        ));
         return ERROR_INVALID_CONFIG;
     }
 
     // Check if prekey bundle file exists
     if !std::path::Path::new(&config.prekey_bundle_path).exists() {
-        logcat_error!("Prekey bundle file not found: {}", config.prekey_bundle_path);
-        set_last_error(&format!("Prekey bundle file not found: {}", config.prekey_bundle_path));
+        logcat_error!(
+            "Prekey bundle file not found: {}",
+            config.prekey_bundle_path
+        );
+        set_last_error(&format!(
+            "Prekey bundle file not found: {}",
+            config.prekey_bundle_path
+        ));
         return ERROR_INVALID_CONFIG;
     }
 
@@ -632,8 +741,26 @@ fn create_tun_client_impl(json_str: &str) -> c_int {
 
     // Use catch_unwind to prevent panics from crossing the FFI boundary
     logcat_info!("Calling AndroidTunClient::new...");
+
+    // Create the tokio runtime HERE (FFI/lifecycle boundary) and hand the
+    // client only a Handle — see the TUN_RUNTIME comment above.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("rvpn-android-tun")
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            logcat_error!("Failed to create Tokio runtime: {}", e);
+            set_last_error(&format!("Failed to create Tokio runtime: {}", e));
+            return ERROR_INVALID_CONFIG;
+        }
+    };
+    let handle = runtime.handle().clone();
+
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        AndroidTunClient::new(&config)
+        AndroidTunClient::new(&config, handle)
     }));
 
     let client = match result {
@@ -677,7 +804,9 @@ fn create_tun_client_impl(json_str: &str) -> c_int {
         }
     };
 
-    let _ = TUN_RUNTIME.lock().insert(client.runtime().clone());
+    // Store the runtime at the FFI boundary (dropped by rvpnTunDestroy AFTER
+    // the client, so no tokio worker ever transitively drops it).
+    let _ = TUN_RUNTIME.lock().insert(runtime);
     logcat_info!("[Android_TUN_FFI] AndroidTunClient created");
 
     if TUN_CLIENT.lock().replace(client).is_some() {
@@ -711,18 +840,14 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunStart() -> c_int 
     };
     logcat_info!("[Android_TUN_FFI] rvpnTunStart() got client");
 
-    let runtime = match TUN_RUNTIME.lock().clone() {
-        Some(rt) => rt.clone(),
-        None => {
-            logcat_error!("[Android_TUN_FFI] Runtime not initialized");
-            return ERROR_NOT_INITIALIZED;
-        }
-    };
-    logcat_info!("[Android_TUN_FFI] rvpnTunStart() got runtime");
+    if TUN_RUNTIME.lock().is_none() {
+        logcat_error!("[Android_TUN_FFI] Runtime not initialized");
+        return ERROR_NOT_INITIALIZED;
+    }
 
     if client.is_dns_proxy_enabled() {
         let dns_client = client.clone();
-        runtime.spawn(async move {
+        client.runtime_handle().spawn(async move {
             logcat_info!("[Android_TUN_FFI] Starting DNS proxy task...");
             if let Err(e) = start_dns_proxy_for_direct_tun(&dns_client).await {
                 logcat_error!("[Android_TUN_FFI] DNS proxy error: {}", e);
@@ -765,18 +890,12 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunGetIp(
 ) -> jobject {
     let env = make_env(env_ptr);
 
-    let runtime = match TUN_RUNTIME.lock().clone() {
-        Some(rt) => rt.clone(),
-        None => return env.new_string("").unwrap_or_default().as_raw(),
-    };
     let client = match TUN_CLIENT.lock().clone() {
         Some(c) => c.clone(),
         None => return env.new_string("").unwrap_or_default().as_raw(),
     };
 
-    let ip = runtime.block_on(async { client.get_tunnel_ip().await });
-
-    match ip {
+    match client.get_tunnel_ip() {
         Some(ip_str) => env.new_string(&ip_str).unwrap_or_default().as_raw(),
         None => env.new_string("").unwrap_or_default().as_raw(),
     }
@@ -806,6 +925,36 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunGetServerI
         .as_raw()
 }
 
+/// Return the canonical TOFU pin (`ik:1:<base32>`) of a NAMED exit server
+/// (`"default"` or a name from `extraServers`). Lets the app implement
+/// per-exit TOFU pinning for multi-server profiles: read each exit's pin
+/// after first connect, persist it, and pass it back as that exit's
+/// `serverFingerprint`. Mirrors iOS `rvpn_tun_get_server_identity_for`.
+///
+/// Returns an empty JNI string when no client exists yet, the name is
+/// invalid, or no session exists under that name.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunGetServerIdentityFor(
+    env_ptr: *mut jni_sys::JNIEnv,
+    _class: jclass,
+    name: jstring,
+) -> jobject {
+    let env = make_env(env_ptr);
+
+    let name = match jstring_to_rust(env_ptr, name) {
+        Some(s) => s,
+        None => return env.new_string("").unwrap_or_default().as_raw(),
+    };
+    let client = match TUN_CLIENT.lock().clone() {
+        Some(c) => c.clone(),
+        None => return env.new_string("").unwrap_or_default().as_raw(),
+    };
+
+    let pin = client.server_identity_pin_for(&name).unwrap_or_default();
+    env.new_string(&pin).unwrap_or_default().as_raw()
+}
+
 /// Write the tunnel IP into a pre-allocated buffer (alternative buffer-based API).
 ///
 /// # Safety
@@ -821,21 +970,12 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunGetIpBuffe
         return -1;
     }
 
-    let runtime = match TUN_RUNTIME.lock().clone() {
-        Some(rt) => rt.clone(),
-        None => return -1,
-    };
-
     let client = match TUN_CLIENT.lock().clone() {
         Some(c) => c.clone(),
         None => return -1,
     };
 
-    let ip = runtime.block_on(async {
-        client.get_tunnel_ip().await
-    });
-
-    match ip {
+    match client.get_tunnel_ip() {
         Some(ip_str) => {
             let bytes = ip_str.as_bytes();
             let total_len = bytes.len() + 1; // +1 for null terminator
@@ -860,21 +1000,12 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunGetIpBuffe
 
 #[no_mangle]
 pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunGetMtu() -> c_int {
-    let runtime = match TUN_RUNTIME.lock().clone() {
-        Some(rt) => rt.clone(),
-        None => return 0,
-    };
-
     let client = match TUN_CLIENT.lock().clone() {
         Some(c) => c.clone(),
         None => return 0,
     };
 
-    let mtu = runtime.block_on(async {
-        client.get_mtu().await
-    });
-
-    mtu as c_int
+    client.get_mtu() as c_int
 }
 
 #[no_mangle]
@@ -928,11 +1059,16 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunReadPacket
             let java_array = jni::objects::JByteArray::from_raw(buffer);
             let len = env.get_array_length(&java_array).unwrap_or(0);
             if packet_len > len {
-                logcat_error!("[Android_TUN_FFI] Packet too large for buffer: {} > {}", packet_len, len);
+                logcat_error!(
+                    "[Android_TUN_FFI] Packet too large for buffer: {} > {}",
+                    packet_len,
+                    len
+                );
                 return ERROR_INVALID_CONFIG;
             }
-            let _ = env.set_byte_array_region(&java_array, 0, 
-                unsafe { std::slice::from_raw_parts(packet.as_ptr() as *const i8, packet_len as usize) });
+            let _ = env.set_byte_array_region(&java_array, 0, unsafe {
+                std::slice::from_raw_parts(packet.as_ptr() as *const i8, packet_len as usize)
+            });
 
             packet_len
         }
@@ -961,7 +1097,10 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunStop() -> c_int {
 pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunDestroy() {
     logcat_info!("[Android_TUN_FFI] rvpnTunDestroy() called");
     Java_com_rvpn_client_core_RustVPNCore_rvpnTunStop();
-    // Clear the client and runtime so rvpnTunCreate() can create fresh ones
+    // Clear the client and runtime so rvpnTunCreate() can create fresh ones.
+    // Order matters: the client (and its sessions' Arcs) first, then the
+    // Runtime — dropping the Runtime here, on the Kotlin calling thread,
+    // runs BlockingPool::shutdown outside any tokio context, which is safe.
     *TUN_CLIENT.lock() = None;
     *TUN_RUNTIME.lock() = None;
     logcat_info!("[Android_TUN_FFI] TUN client and runtime cleared");
@@ -1023,7 +1162,11 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnGetBypassIpsF
     }
 
     let result_json = serde_json::to_string(&all_cidrs).unwrap_or_else(|_| "[]".to_string());
-    logcat_info!("Found {} bypass IPs for {} countries", all_cidrs.len(), country_codes.len());
+    logcat_info!(
+        "Found {} bypass IPs for {} countries",
+        all_cidrs.len(),
+        country_codes.len()
+    );
 
     env.new_string(&result_json).unwrap_or_default().as_raw()
 }
@@ -1060,7 +1203,10 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnGetBypassIpsF
     let country_codes: Vec<String> = match serde_json::from_str(&json_str) {
         Ok(codes) => codes,
         Err(e) => {
-            logcat_error!("[Android_TUN_FFI] Failed to parse country codes JSON: {}", e);
+            logcat_error!(
+                "[Android_TUN_FFI] Failed to parse country codes JSON: {}",
+                e
+            );
             write_empty_json_to_buffer(buffer, buffer_len, out_len);
             return -1;
         }
@@ -1081,7 +1227,11 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnGetBypassIpsF
         Err(_) => "[]".to_string(),
     };
 
-    logcat_info!("[Android_TUN_FFI] Found {} bypass IPs for {} countries", all_cidrs.len(), country_codes.len());
+    logcat_info!(
+        "[Android_TUN_FFI] Found {} bypass IPs for {} countries",
+        all_cidrs.len(),
+        country_codes.len()
+    );
 
     write_string_to_buffer(buffer, buffer_len, &result_json, out_len)
 }
@@ -1123,7 +1273,11 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnGetBypassDoma
     }
 
     let result_json = serde_json::to_string(&all_domains).unwrap_or_else(|_| "[]".to_string());
-    logcat_info!("Found {} bypass domains for {} countries", all_domains.len(), country_codes.len());
+    logcat_info!(
+        "Found {} bypass domains for {} countries",
+        all_domains.len(),
+        country_codes.len()
+    );
 
     env.new_string(&result_json).unwrap_or_default().as_raw()
 }
@@ -1161,7 +1315,10 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnGetBypassDoma
     let country_codes: Vec<String> = match serde_json::from_str(&json_str) {
         Ok(codes) => codes,
         Err(e) => {
-            logcat_error!("[Android_TUN_FFI] Failed to parse country codes JSON: {}", e);
+            logcat_error!(
+                "[Android_TUN_FFI] Failed to parse country codes JSON: {}",
+                e
+            );
             write_empty_json_to_buffer(buffer, buffer_len, out_len);
             return -1;
         }
@@ -1182,7 +1339,11 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnGetBypassDoma
         Err(_) => "[]".to_string(),
     };
 
-    logcat_info!("[Android_TUN_FFI] Found {} bypass domains for {} countries", all_domains.len(), country_codes.len());
+    logcat_info!(
+        "[Android_TUN_FFI] Found {} bypass domains for {} countries",
+        all_domains.len(),
+        country_codes.len()
+    );
 
     write_string_to_buffer(buffer, buffer_len, &result_json, out_len)
 }
@@ -1379,12 +1540,18 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnValidateIdent
         return -1;
     }
 
-    if base64::engine::general_purpose::STANDARD.decode(lines[1]).is_err() {
+    if base64::engine::general_purpose::STANDARD
+        .decode(lines[1])
+        .is_err()
+    {
         set_last_error("Invalid identity: bad public key base64");
         return -1;
     }
 
-    if base64::engine::general_purpose::STANDARD.decode(lines[2]).is_err() {
+    if base64::engine::general_purpose::STANDARD
+        .decode(lines[2])
+        .is_err()
+    {
         set_last_error("Invalid identity: bad private key base64");
         return -1;
     }

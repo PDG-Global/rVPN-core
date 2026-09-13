@@ -355,20 +355,30 @@ impl DohClient {
         let url = format!("wss://{}:{}{}", config.server_host, config.server_port, dns_path);
         info!("[DohClient] Connecting to {} (via IP {})", url, server_ip);
 
-        // TLS backend depends on platform feature
+        // TLS backend depends on platform feature. Both arms pass the
+        // per-exit resumption store (when the caller provided one — the
+        // direct-TUN DNS proxy shares the exit's tunnel-session store) so
+        // the persistent /dns WebSocket's reconnects resume via PSK instead
+        // of paying a full handshake.
         #[cfg(not(feature = "android-direct-tun"))]
         let (ws_stream, _) = {
             let tls_stream = {
                 #[cfg(feature = "ios-direct-tun")]
-                let s = rvpn_tls::connect_rustls(&config.server_host, config.server_port, Some(&config.server_host))
-                    .await
-                    .context("DNS TLS handshake failed")?;
+                let s = rvpn_tls::connect_rustls_with_store(
+                    &config.server_host,
+                    config.server_port,
+                    Some(&config.server_host),
+                    config.resumption.as_ref(),
+                )
+                .await
+                .context("DNS TLS handshake failed")?;
                 #[cfg(not(feature = "ios-direct-tun"))]
-                let s = rvpn_tls::connect_chrome_like(
+                let s = rvpn_tls::connect_chrome_like_with_resumption(
                     &config.server_host,
                     config.server_port,
                     rvpn_tls::TlsFingerprint::Chrome,
                     Some(&config.server_host),
+                    config.resumption.as_ref(),
                 )
                 .await
                 .context("DNS TLS handshake failed")?;

@@ -2,6 +2,45 @@
 
 All notable changes to rVPN are documented in this file.
 
+## [1.3.5] — 2026-09-13
+
+Patch release: seamless mobile roaming, pooled multiplexing with TLS
+session resumption, and per-instance decoy login pages.
+
+### Added
+
+- **Pooled multiplex mode (client).** Many flows now share a small set of
+  long-lived WebSocket connections instead of one connection per flow, with
+  credit-based per-flow flow control (256 KiB initial window) and strict
+  wire ordering — every encrypt→send path on a shared ratchet is
+  serialized, since the Double Ratchet drops reordered frames.
+- **TLS 1.3 session resumption (client + mobile).** Reconnects offer the
+  cached session ticket (1-RTT PSK), skipping the certificate flight.
+- **Per-instance decoy login pages (server).** Non-VPN HTTPS requests are
+  served a realistic, randomly chosen login page — webmail, NAS, photo
+  sharing, and more — generated per server instance, so no two servers
+  present the same face to a prober.
+- **Multi-server Direct TUN routing (mobile).** Profiles can carry extra
+  exit servers, each with its own route domains and route IPs. Each exit
+  resolves names through its own in-tunnel DNS-over-HTTPS channel, and
+  every answer teaches the router which exit owns those IPs. Shipped in the
+  iOS / macOS / Android apps as v1.2.9.
+
+### Fixed
+
+- **Sticky TUN IP leases across reconnects (server).** Tunnel IPs are now
+  leased by the client's X25519 identity key instead of its source IP and
+  port. Roaming between Wi-Fi and cellular hands back the same tunnel
+  address — previously the new connection got a fresh IP while the OS kept
+  routing to the old one, leaving the tunnel "connected" but passing no
+  traffic until a manual reconnect.
+- **Pooled-tunnel reliability (multiplex).** Flow-control, wire-order, and
+  drain-handling fixes; pooled TCP connections are validated before reuse,
+  and control frames travel on a priority channel so bulk data can't delay
+  flow lifecycle or credit grants.
+- **Ad-block false positive.** The blocklist no longer swallows
+  graph.instagram.com.
+
 ## [1.3.4] — 2026-08-24
 
 Patch release: DNS resilience and correctness, and a permanent fix for

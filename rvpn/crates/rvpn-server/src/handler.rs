@@ -25,7 +25,9 @@ use crate::config::{ServerConfig, TunNetworkConfig};
 use crate::TunWriter;
 use rvpn_core::crypto::ratchet::RatchetMessage;
 use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHResponder};
-use rvpn_core::protocol::multiplex::ControlMessage;
+use rvpn_core::protocol::multiplex::{
+    ControlMessage, FlowSendCredits, FLOW_CREDIT_STALL_TIMEOUT,
+};
 use rvpn_core::protocol::HandshakeMessage;
 use rvpn_core::protocol::{AuthMethod, PayloadType, ProtocolVersion};
 
@@ -1615,21 +1617,98 @@ impl TunHandler {
 }
 
 /// Message for sending data back to the WebSocket
-enum MuxMessage {
+pub(crate) enum MuxMessage {
     Data { flow_id: u32, data: Vec<u8> },
     Control(ControlMessage),
 }
 
-type FlowMap = Arc<Mutex<HashMap<u32, Arc<Mutex<OwnedWriteHalf>>>>>;
+/// Capacity of the per-flow uplink (client → target) write queue.
+///
+/// Bounded on purpose: with credit-based flow control a well-behaved client
+/// has at most INITIAL_FLOW_WINDOW bytes in flight, so 64 messages (~512 KB
+/// of 8 KB frames) can only fill when the client is over-sending beyond its
+/// credits. A full queue closes the flow instead of blocking the WebSocket
+/// receive loop (head-of-line blocking of every other flow).
+const FLOW_UPLINK_QUEUE_CAP: usize = 64;
+
+/// Capacity of the session-wide control channel. Control frames (FlowCreated,
+/// CloseFlow, WindowUpdate, Pong) are small and latency-critical; they are
+/// drained ahead of data frames by the WebSocket sender.
+const CONTROL_CHANNEL_CAP: usize = 256;
+
+/// Server-side state for one multiplexed flow.
+pub(crate) struct ServerFlow {
+    /// Uplink (client → target) write queue. Drained by the per-flow writer
+    /// task (`spawn_flow_writer`), which owns the target socket's write half
+    /// and grants WindowUpdate credits to the client after each write.
+    pub(crate) to_target_tx: tokio::sync::mpsc::Sender<Bytes>,
+    /// Downlink (target → client) send credits. Granted by client
+    /// WindowUpdate control messages; consumed one byte per payload byte the
+    /// flow's read relay (`spawn_flow_relay`) sends to the client.
+    pub(crate) send_credits: Arc<FlowSendCredits>,
+    /// Abort handle for the flow's read relay task. Aborted whenever the
+    /// flow is removed from the map so a relay parked at zero credits in
+    /// `wait_for_credit_or_stall` dies with its flow instead of lingering
+    /// (and holding the target connection open) until the stall valve fires.
+    pub(crate) relay_task: tokio::task::AbortHandle,
+    /// Abort handle for the flow's uplink writer task (see `relay_task`).
+    pub(crate) writer_task: tokio::task::AbortHandle,
+}
+
+pub(crate) type FlowMap = Arc<Mutex<HashMap<u32, Arc<ServerFlow>>>>;
+
+/// Remove a flow from the map and abort its relay and writer tasks.
+///
+/// Every flow-removal path goes through here so the flow's spawned tasks
+/// die with the flow: without the abort, a relay parked at zero credits in
+/// `wait_for_credit_or_stall` would linger (and hold the target socket open)
+/// until the 60s stall valve fired, then log a stall warning for a flow the
+/// client had already closed cleanly.
+///
+/// The two exceptions are the internal removals inside the relay and writer
+/// tasks themselves: those abort only the SIBLING task, because aborting the
+/// currently executing task would cancel its own remaining cleanup (the
+/// CloseFlow notification) at the next await point.
+pub(crate) async fn remove_flow(flows: &FlowMap, flow_id: u32) -> Option<Arc<ServerFlow>> {
+    let flow = flows.lock().await.remove(&flow_id);
+    if let Some(flow) = &flow {
+        flow.relay_task.abort();
+        flow.writer_task.abort();
+    }
+    flow
+}
 
 /// Pending per-flow data buffered before a flow is established.
 /// Maps flow ID to a queue of (payload, sequence_number, age).
 type PendingFlows = tokio::sync::Mutex<std::collections::HashMap<u32, Vec<(Vec<u8>, u64, Duration)>>>;
 
 /// Pre-created TCP connections ready for immediate use.
-/// Key: "target:port", Value: queue of fresh TcpStreams.
+/// Key: "target:port", Value: queue of (insertion time, TcpStream).
 /// Avoids repeated DNS resolution + TCP connect to the same CDN hosts.
-type TcpPool = Arc<Mutex<HashMap<String, VecDeque<tokio::net::TcpStream>>>>;
+type TcpPool = Arc<Mutex<HashMap<String, VecDeque<(std::time::Instant, tokio::net::TcpStream)>>>>;
+
+/// Maximum time a pooled connection may sit idle before it is considered
+/// dead. Servers and middleboxes drop idle TCP aggressively (CDN idle
+/// timeouts are typically 30–120s, NATs often less), so entries older than
+/// this are never handed to a new flow.
+const TCP_POOL_MAX_IDLE: Duration = Duration::from_secs(30);
+
+/// Check whether a pooled connection is still usable without consuming data.
+///
+/// A closed connection is readable at EOF (`try_read` → `Ok(0)`). A live but
+/// idle one returns `WouldBlock`. Any data actually arriving on a pooled
+/// pre-connection would be a protocol surprise (we never wrote to it), so
+/// `Ok(n > 0)` is treated as unusable rather than risking byte loss.
+fn tcp_pool_entry_usable(inserted: std::time::Instant, stream: &tokio::net::TcpStream) -> bool {
+    if inserted.elapsed() > TCP_POOL_MAX_IDLE {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    match stream.try_read(&mut probe) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+        _ => false,
+    }
+}
 
 /// Individual multiplexed session handler
 #[allow(dead_code)]
@@ -1642,6 +1721,10 @@ pub struct MultiplexerSession<S> {
     peer_addr: SocketAddr,
     tx: tokio::sync::mpsc::Sender<MuxMessage>,
     rx: Option<tokio::sync::mpsc::Receiver<MuxMessage>>,
+    /// Separate channel for control frames so the WebSocket sender can
+    /// prioritize them over queued bulk data.
+    control_tx: tokio::sync::mpsc::Sender<ControlMessage>,
+    control_rx: Option<tokio::sync::mpsc::Receiver<ControlMessage>>,
     /// Channel for sending TO TUN (write path)
     /// process_incoming_frame_static sends to this, TUN device receives via tun_write_rx
     tun_write_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -1649,6 +1732,12 @@ pub struct MultiplexerSession<S> {
     tun_server: Option<Arc<dyn TunWriter>>,
     tun_config: TunNetworkConfig,
     tcp_pool: TcpPool,
+    /// Client's X25519 identity key from the X3DH handshake. Used as the
+    /// stable TUN IP-pool lease key: peer_addr changes on every reconnect,
+    /// so keying leases by identity lets a reconnecting client reclaim its
+    /// previous tunnel IP (its utun interface keeps that address across a
+    /// lightweight reconnect).
+    client_identity: Option<[u8; 32]>,
 }
 
 impl<S> MultiplexerSession<S>
@@ -1664,6 +1753,7 @@ where
         tun_config: TunNetworkConfig,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2000);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(CONTROL_CHANNEL_CAP);
         // TUN write channel: process_incoming_frame_static sends to this, TUN device receives
         let (tun_write_tx, tun_write_rx) = tokio::sync::mpsc::channel(2000);
         Self {
@@ -1675,11 +1765,32 @@ where
             peer_addr,
             tx,
             rx: Some(rx),
+            control_tx,
+            control_rx: Some(control_rx),
             tun_write_tx,
             tun_write_rx: Some(tun_write_rx),
             tun_server,
             tun_config,
             tcp_pool: Arc::new(Mutex::new(HashMap::new())),
+            client_identity: None,
+        }
+    }
+
+    /// Stable identifier for TUN IP-pool leases: the client's X25519
+    /// identity key from the X3DH handshake. peer_addr changes on every
+    /// reconnect, so keying by peer_addr never lets the sticky-lease logic
+    /// stick — every reconnect used to burn a fresh pool IP and silently
+    /// blackhole the client's downlink (the utun interface keeps the first
+    /// assigned address across a lightweight reconnect). Falls back to
+    /// peer_addr if the handshake never completed (defensive; TUN
+    /// allocation only runs after a successful handshake).
+    fn tun_client_id(&self) -> String {
+        match self.client_identity {
+            Some(ik) => {
+                let hex: String = ik.iter().map(|b| format!("{:02x}", b)).collect();
+                format!("ik:{}", hex)
+            }
+            None => self.peer_addr.to_string(),
         }
     }
 
@@ -1706,8 +1817,9 @@ where
             info!("TUN_MODE: tun_config.enabled=true for client {}", self.peer_addr);
             if let Some(ref tun_server) = self.tun_server {
                 info!("TUN_MODE: tun_server is Some, proceeding with allocation for {}", self.peer_addr);
-                // Allocate IP from pool
-                let client_id = self.peer_addr.to_string();
+                // Allocate IP from pool, keyed by client identity so a
+                // reconnecting client reclaims its previous tunnel IP
+                let client_id = self.tun_client_id();
                 match tun_server.allocate_ip(client_id).await {
                     Ok(allocated_ip) => {
                         info!(
@@ -1777,12 +1889,17 @@ where
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let peer_addr = self.peer_addr;
         let tx = self.tx.clone();
+        let control_tx = self.control_tx.clone();
         let dns_cache = self.dns_cache.clone();
         let tun_server = self.tun_server.clone();
         let tun_config = self.tun_config.clone();
         let tun_write_tx = self.tun_write_tx.clone();
+        // Captured before self.ws is moved by split(); used by the TUN
+        // cleanup at the end of this function.
+        let tun_client_id = self.tun_client_id();
         let (ws_write, mut ws_read) = self.ws.split();
-        let mut rx = self.rx.take().expect("rx should be present");
+        let rx = self.rx.take().expect("rx should be present");
+        let control_rx = self.control_rx.take().expect("control_rx should be present");
         let mut tun_write_rx = self
             .tun_write_rx
             .take()
@@ -1799,6 +1916,19 @@ where
         let ratchet_for_sender = ratchet.clone();
         let ratchet_for_tun = ratchet.clone();
 
+        // Send-order serializer: the Double Ratchet assigns message numbers
+        // at encrypt time, so wire order MUST match encrypt order. Both
+        // run_ws_sender (mux data + control) and run_tun_response_loop
+        // (TUN downlink batches) encrypt with this session ratchet and send
+        // via ws_write; without serialization a later-encrypted frame from
+        // one task can overtake an earlier-encrypted frame from the other,
+        // and the client's ratchet drops it ("Message too old"). Hold the
+        // send lock across encrypt→enqueue, but never hold the ratchet lock
+        // across the send await.
+        let send_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let send_lock_for_sender = send_lock.clone();
+        let send_lock_for_tun = send_lock.clone();
+
         // Create channel for TUN response packets
         // TunServer sends raw packets here, we encrypt and send via WebSocket
         let (tun_response_tx, tun_response_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
@@ -1808,7 +1938,7 @@ where
             info!("About to register client {} with TUN server", allocated_ip);
             if let Some(ref ts) = tun_server {
                 info!("tun_server is Some, calling register_client for {}", allocated_ip);
-                match ts.register_client(allocated_ip, tun_response_tx).await {
+                match ts.register_client(allocated_ip, tun_response_tx.clone()).await {
                     Ok(()) => {
                         info!("Successfully registered client {} with TUN server", allocated_ip);
                     }
@@ -1829,67 +1959,32 @@ where
         // Task to receive TUN response packets, batch, encrypt, and send via
         // WebSocket. See run_tun_response_loop for batching rationale and the
         // ratchet-lock/ws_write-lock discipline.
-        let tun_response_task =
-            Self::run_tun_response_loop(ratchet_for_tun, tun_response_rx, ws_write_for_tun);
+        let tun_response_task = Self::run_tun_response_loop(
+            ratchet_for_tun,
+            tun_response_rx,
+            ws_write_for_tun,
+            send_lock_for_tun,
+        );
 
         // Task to receive from flows and send to WebSocket.
         // Locks are held briefly: ratchet only during encrypt, ws_write only
         // during send. This prevents a slow WebSocket write from blocking
         // other tasks that need the ratchet (like the receive path).
-        let ws_sender = async move {
-            while let Some(msg) = rx.recv().await {
-                // Step 1: Build plaintext frame (no locks needed)
-                let (plaintext, aad) = match &msg {
-                    MuxMessage::Data { flow_id, data } => {
-                        let mut pt = Vec::with_capacity(6 + data.len());
-                        pt.extend_from_slice(&flow_id.to_be_bytes());
-                        pt.extend_from_slice(&(data.len() as u16).to_be_bytes());
-                        pt.extend_from_slice(data);
-                        (pt, vec![0x01u8])
-                    }
-                    MuxMessage::Control(control) => {
-                        let frame = match rvpn_core::protocol::MultiplexedFrame::new_control(control) {
-                            Ok(f) => f,
-                            Err(e) => { error!("Failed to create control frame: {}", e); break; }
-                        };
-                        let encoded = match frame.encode() {
-                            Ok(e) => e,
-                            Err(e) => { error!("Failed to encode control frame: {}", e); break; }
-                        };
-                        (encoded.to_vec(), vec![0x02u8])
-                    }
-                };
-
-                // Step 2: Pad (no locks needed)
-                let padded = match rvpn_core::protocol::padding::pad_packet(&plaintext) {
-                    Ok(p) => p,
-                    Err(e) => { error!("Padding failed: {}", e); break; }
-                };
-
-                // Step 3: Encrypt — hold ratchet lock only during this fast operation
-                let serialized = {
-                    let mut ratchet_guard = ratchet_for_sender.lock().await;
-                    match ratchet_guard.encrypt(&padded, &aad) {
-                        Ok(message) => match message.to_bytes() {
-                            Ok(bytes) => bytes,
-                            Err(e) => { error!("Serialization failed: {}", e); break; }
-                        },
-                        Err(e) => { error!("Encryption failed: {}", e); break; }
-                    }
-                };
-                // ratchet_guard dropped here — other tasks can encrypt now
-
-                // Step 4: Send — hold ws_write lock only during this async send
-                {
-                    let mut ws_write_guard = ws_write_for_sender.lock().await;
-                    if let Err(e) = ws_write_guard.send(Message::Binary(serialized)).await {
-                        error!("WebSocket send failed: {:?}", e);
-                        break;
-                    }
-                }
-                // ws_write_guard dropped here — tun_response_task / ping_task can send now
-            }
-        };
+        // Control frames are drained ahead of queued data frames so a bulk
+        // flow's backlog cannot delay flow lifecycle and WindowUpdate frames.
+        // NOTE on ordering safety: encryption happens HERE, in this single
+        // sender task, after dequeue — so the biased select can never put a
+        // later-encrypted frame ahead of an earlier-encrypted one (message
+        // numbers are assigned in dequeue order). The send_lock is only
+        // needed to serialize against the OTHER encrypting task
+        // (run_tun_response_loop).
+        let ws_sender = Self::run_ws_sender(
+            rx,
+            control_rx,
+            ratchet_for_sender,
+            ws_write_for_sender,
+            send_lock_for_sender,
+        );
 
         // Task to consume packets from tun_write_rx and write to TUN device
         // process_incoming_frame_static sends to tun_write_tx, we forward to tun_server
@@ -1921,6 +2016,7 @@ where
         // from blocking the entire receive path.
         let ws_receiver = {
             let tx = tx.clone();
+            let control_tx = control_tx.clone();
             let flows = flows.clone();
             let ratchet = ratchet.clone();
             let tun_server_for_receiver = tun_server.clone();
@@ -1976,6 +2072,7 @@ where
                                             aad_type,
                                             &flows,
                                             &tx,
+                                            &control_tx,
                                             &tun_write_tx,
                                             peer_addr,
                                             &dns_cache,
@@ -2071,9 +2168,15 @@ where
             }
         }
 
-        // Clean up flows
+        // Clean up flows: abort every flow's relay/writer tasks (a relay
+        // parked at zero credits would otherwise outlive the session until
+        // the stall valve fired), then drop the map entries.
         let mut flows_guard = flows.lock().await;
         let count = flows_guard.len();
+        for flow in flows_guard.values() {
+            flow.relay_task.abort();
+            flow.writer_task.abort();
+        }
         flows_guard.clear();
         if count > 0 {
             info!("Cleaned up {} flows for {}", count, peer_addr);
@@ -2082,18 +2185,126 @@ where
         // Clean up connection pool
         self.tcp_pool.lock().await.clear();
 
-        // Release IP lease and unregister client from TUN server
-        // This prevents IP pool exhaustion when sessions end
+        // Unregister client from TUN server. The lease itself is kept
+        // (sticky per client identity) so a fast reconnect reclaims the same
+        // tunnel IP; the sender check inside unregister_client ensures this
+        // stale teardown cannot evict a newer connection's registration.
         if let Some(ref ts) = tun_server {
             if let Some(client_ip) = allocated_ip_for_tun {
-                let client_id = peer_addr.to_string();
-                if let Err(e) = ts.unregister_client(client_ip, &client_id).await {
+                if let Err(e) = ts
+                    .unregister_client(client_ip, &tun_client_id, tun_response_tx)
+                    .await
+                {
                     warn!("Failed to unregister client {} from TUN server: {}", client_ip, e);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Drain flow data and control frames to the WebSocket.
+    ///
+    /// Control frames are drained FIRST (biased select): with credit-based
+    /// flow control the shared data queue is bounded per flow, but a bulk
+    /// flow can still have its full window queued — priority for control
+    /// frames keeps flow lifecycle (CreateFlow/CloseFlow) and WindowUpdate
+    /// credit grants from queueing behind bulk data.
+    pub(crate) async fn run_ws_sender(
+        mut rx: tokio::sync::mpsc::Receiver<MuxMessage>,
+        mut control_rx: tokio::sync::mpsc::Receiver<ControlMessage>,
+        ratchet: std::sync::Arc<tokio::sync::Mutex<DoubleRatchet>>,
+        ws_write: std::sync::Arc<
+            tokio::sync::Mutex<
+                futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
+            >,
+        >,
+        send_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let mut control_open = true;
+        loop {
+            // Biased select: control frames are drained FIRST. With
+            // credit-based flow control the shared data queue is bounded per
+            // flow, but a bulk flow can still have its full window queued —
+            // priority for control frames keeps flow lifecycle
+            // (CreateFlow/CloseFlow) and WindowUpdate credit grants from
+            // queueing behind bulk data.
+            let msg = if control_open {
+                tokio::select! {
+                    biased;
+                    control = control_rx.recv() => match control {
+                        Some(c) => Some(MuxMessage::Control(c)),
+                        // Control senders all dropped: keep draining data.
+                        None => {
+                            control_open = false;
+                            continue;
+                        }
+                    },
+                    data = rx.recv() => data,
+                }
+            } else {
+                rx.recv().await
+            };
+            let Some(msg) = msg else { break };
+
+            // Step 1: Build plaintext frame (no locks needed)
+            let (plaintext, aad) = match &msg {
+                MuxMessage::Data { flow_id, data } => {
+                    let mut pt = Vec::with_capacity(6 + data.len());
+                    pt.extend_from_slice(&flow_id.to_be_bytes());
+                    pt.extend_from_slice(&(data.len() as u16).to_be_bytes());
+                    pt.extend_from_slice(data);
+                    (pt, vec![0x01u8])
+                }
+                MuxMessage::Control(control) => {
+                    let frame = match rvpn_core::protocol::MultiplexedFrame::new_control(control) {
+                        Ok(f) => f,
+                        Err(e) => { error!("Failed to create control frame: {}", e); break; }
+                    };
+                    let encoded = match frame.encode() {
+                        Ok(e) => e,
+                        Err(e) => { error!("Failed to encode control frame: {}", e); break; }
+                    };
+                    (encoded.to_vec(), vec![0x02u8])
+                }
+            };
+
+            // Step 2: Pad (no locks needed)
+            let padded = match rvpn_core::protocol::padding::pad_packet(&plaintext) {
+                Ok(p) => p,
+                Err(e) => { error!("Padding failed: {}", e); break; }
+            };
+
+            // Serialize encrypt→enqueue against the other ratchet-encrypting
+            // task (run_tun_response_loop): the ratchet assigns message
+            // numbers at encrypt time, so wire order must match encrypt
+            // order or the client drops a frame ("Message too old").
+            let _send_guard = send_lock.lock().await;
+
+            // Step 3: Encrypt — hold ratchet lock only during this fast operation
+            let serialized = {
+                let mut ratchet_guard = ratchet.lock().await;
+                match ratchet_guard.encrypt(&padded, &aad) {
+                    Ok(message) => match message.to_bytes() {
+                        Ok(bytes) => bytes,
+                        Err(e) => { error!("Serialization failed: {}", e); break; }
+                    },
+                    Err(e) => { error!("Encryption failed: {}", e); break; }
+                }
+            };
+            // ratchet_guard dropped here — other tasks can decrypt now
+
+            // Step 4: Send — hold ws_write lock only during this async send
+            {
+                let mut ws_write_guard = ws_write.lock().await;
+                if let Err(e) = ws_write_guard.send(Message::Binary(serialized)).await {
+                    error!("WebSocket send failed: {:?}", e);
+                    break;
+                }
+            }
+            // ws_write_guard dropped here — tun_response_task / ping_task can send now
+            drop(_send_guard);
+        }
     }
 
     #[allow(dead_code)]
@@ -2201,6 +2412,7 @@ where
                 futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
             >,
         >,
+        send_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     ) {
         // Reused across batches: capacity is retained after clear(), so this
         // allocates once at steady state instead of per batch.
@@ -2247,6 +2459,10 @@ where
                 }
             }
 
+            // Hold send_lock across encrypt+send so wire order matches ratchet
+            // message-number order against run_ws_sender (see run_ws_sender).
+            let _send_guard = send_lock.lock().await;
+
             // Step 1: Encrypt — hold the ratchet lock only during this fast
             // operation.
             let encrypted = {
@@ -2273,6 +2489,7 @@ where
                     frame_count, byte_count
                 );
             }
+            drop(_send_guard);
 
             if disconnected {
                 break;
@@ -2422,7 +2639,8 @@ where
             );
             // Dead code path — pass empty pool (this function is #[allow(dead_code)])
             let dummy_pool: TcpPool = Arc::new(Mutex::new(HashMap::new()));
-            Self::handle_control(payload, flows, tx, peer_addr, dns_cache, tun_config, pending_flows, &dummy_pool).await
+            let (dummy_control_tx, _dummy_control_rx) = tokio::sync::mpsc::channel(1);
+            Self::handle_control(payload, flows, tx, &dummy_control_tx, peer_addr, dns_cache, tun_config, pending_flows, &dummy_pool).await
         } else {
             // Data for existing flow
             info!(
@@ -2442,7 +2660,8 @@ where
             );
 
             if flow_exists {
-                Self::handle_flow_data(flow_id, payload, flows).await
+                let (dummy_control_tx, _dummy_control_rx) = tokio::sync::mpsc::channel(1);
+                Self::handle_flow_data(flow_id, payload, flows, &dummy_control_tx).await
             } else if tun_config.enabled {
                 // TUN mode: write packet directly to TUN interface instead of creating TCP flow
                 // Extract source IP from packet to identify the client for response routing
@@ -2874,6 +3093,9 @@ where
                     }
                 };
 
+                // Remember the client identity for TUN IP-pool lease keying
+                self.client_identity = Some(client_identity);
+
                 // Perform X3DH agreement
                 let shared_secret =
                     match responder.agree(&client_identity, &client_ephemeral, false) {
@@ -2942,6 +3164,7 @@ where
         data: &[u8],
         flows: &FlowMap,
         tx: &tokio::sync::mpsc::Sender<MuxMessage>,
+        control_tx: &tokio::sync::mpsc::Sender<ControlMessage>,
         peer_addr: SocketAddr,
         dns_cache: &DnsCache,
         tun_config: &TunNetworkConfig,
@@ -2992,10 +3215,10 @@ where
                         flow_id, peer_addr, flow_count, MAX_FLOWS_PER_SESSION
                     );
                     // Send FlowFailed back to client
-                    let _ = tx.send(MuxMessage::Control(ControlMessage::FlowFailed {
+                    let _ = control_tx.send(ControlMessage::FlowFailed {
                         flow_id,
                         error: format!("Too many flows: {} (limit {})", flow_count, MAX_FLOWS_PER_SESSION),
-                    })).await;
+                    }).await;
                     return Ok(());
                 }
 
@@ -3012,7 +3235,21 @@ where
                 let stream = {
                     let mut pool = tcp_pool.lock().await;
                     if let Some(queue) = pool.get_mut(&connect_target) {
-                        queue.pop_front()
+                        // Pop until we find a live connection; discard corpses
+                        // (idle-timeout kills, RSTs) instead of handing a dead
+                        // socket to the new flow.
+                        let mut found = None;
+                        while let Some((inserted, s)) = queue.pop_front() {
+                            if tcp_pool_entry_usable(inserted, &s) {
+                                found = Some(s);
+                                break;
+                            }
+                            debug!(
+                                "CONTROL: [CreateFlow] Discarding stale pooled connection for {}",
+                                connect_target
+                            );
+                        }
+                        found
                     } else {
                         None
                     }
@@ -3053,7 +3290,9 @@ where
                             match Self::connect_with_dns_cache(&target_clone, &dns_clone, &tun_clone).await {
                                 Ok(s) => {
                                     let mut pool = pool_clone.lock().await;
-                                    pool.entry(target_clone).or_default().push_back(s);
+                                    pool.entry(target_clone)
+                                        .or_default()
+                                        .push_back((std::time::Instant::now(), s));
                                 }
                                 Err(e) => {
                                     debug!("Pre-connect failed for {}: {}", target_clone, e);
@@ -3071,9 +3310,46 @@ where
                         );
                         let (read_half, write_half) = stream.into_split();
 
+                        // Uplink (client → target) goes through a bounded
+                        // per-flow queue drained by a dedicated writer task,
+                        // so a slow target can never head-of-line-block the
+                        // WebSocket receive loop. The writer grants the
+                        // client WindowUpdate credits after each write.
+                        let (to_target_tx, to_target_rx) =
+                            tokio::sync::mpsc::channel::<Bytes>(FLOW_UPLINK_QUEUE_CAP);
+                        let send_credits = Arc::new(FlowSendCredits::new());
+
+                        // Spawn the flow's tasks FIRST so their abort handles
+                        // can be stored in the ServerFlow: every removal path
+                        // (CloseFlow, over-send, teardown) aborts them with
+                        // the flow via remove_flow.
+                        let writer_task = Self::spawn_flow_writer(
+                            flow_id,
+                            write_half,
+                            to_target_rx,
+                            flows.clone(),
+                            control_tx.clone(),
+                            peer_addr,
+                        );
+                        let relay_task = Self::spawn_flow_relay(
+                            flow_id,
+                            read_half,
+                            flows.clone(),
+                            tx.clone(),
+                            control_tx.clone(),
+                            Arc::clone(&send_credits),
+                            peer_addr,
+                        );
+
                         // Store the flow
+                        let flow = Arc::new(ServerFlow {
+                            to_target_tx,
+                            send_credits,
+                            relay_task: relay_task.abort_handle(),
+                            writer_task: writer_task.abort_handle(),
+                        });
                         let mut flows_guard = flows.lock().await;
-                        flows_guard.insert(flow_id, Arc::new(Mutex::new(write_half)));
+                        flows_guard.insert(flow_id, Arc::clone(&flow));
                         let flow_count = flows_guard.len();
                         drop(flows_guard);
 
@@ -3083,30 +3359,19 @@ where
                         );
 
                         // Send FlowCreated ACK
-                        let ack = MuxMessage::Control(ControlMessage::FlowCreated {
-                            flow_id,
-                            local_port: None,
-                        });
-
-                        if let Err(e) = tx.send(ack).await {
+                        if let Err(e) = control_tx
+                            .send(ControlMessage::FlowCreated {
+                                flow_id,
+                                local_port: None,
+                            })
+                            .await
+                        {
                             error!(
                                 "CONTROL: [CreateFlow] Failed to send FlowCreated for flow_id={}: {}",
                                 flow_id, e
                             );
                         }
 
-                        // Spawn task to relay data from target back to client
-                        info!(
-                            "CONTROL: [CreateFlow] Spawning relay task for flow_id={}",
-                            flow_id
-                        );
-                        Self::spawn_flow_relay(
-                            flow_id,
-                            read_half,
-                            flows.clone(),
-                            tx.clone(),
-                            peer_addr,
-                        );
                         info!(
                             "CONTROL: [CreateFlow] Flow {} created successfully for {}",
                             flow_id, peer_addr
@@ -3129,7 +3394,7 @@ where
                                 );
                             }
                             for (data, _frame_num, _elapsed) in pending.into_iter().take(MAX_FLUSH_FRAMES) {
-                                if let Err(e) = Self::handle_flow_data(flow_id, &data, flows).await {
+                                if let Err(e) = Self::handle_flow_data(flow_id, &data, flows, control_tx).await {
                                     debug!("Failed to flush pending data for flow {}: {}", flow_id, e);
                                 }
                             }
@@ -3146,11 +3411,11 @@ where
                             "CONTROL: [CreateFlow] Connection failed for flow_id={} to {}:{}: {}",
                             flow_id, target, port, e
                         );
-                        let err = MuxMessage::Control(ControlMessage::FlowFailed {
+                        let err = ControlMessage::FlowFailed {
                             flow_id,
                             error: e.to_string(),
-                        });
-                        let _ = tx.send(err).await;
+                        };
+                        let _ = control_tx.send(err).await;
                         error!(
                             "CONTROL: [CreateFlow] FlowFailed sent for flow_id={}",
                             flow_id
@@ -3160,8 +3425,10 @@ where
             }
             ControlMessage::CloseFlow { flow_id } => {
                 info!("Closing flow {} for {}", flow_id, peer_addr);
-                let mut flows_guard = flows.lock().await;
-                if flows_guard.remove(&flow_id).is_some() {
+                // remove_flow aborts the flow's relay/writer tasks, so a
+                // relay parked at zero credits dies now instead of lingering
+                // until the stall valve fires.
+                if remove_flow(flows, flow_id).await.is_some() {
                     info!("Flow {} closed for {}", flow_id, peer_addr);
                 }
             }
@@ -3180,7 +3447,7 @@ where
             }
             ControlMessage::Ping { timestamp } => {
                 trace!("Received ping from {}: {}, sending pong", peer_addr, timestamp);
-                let _ = tx.send(MuxMessage::Control(ControlMessage::Pong { timestamp })).await;
+                let _ = control_tx.send(ControlMessage::Pong { timestamp }).await;
             }
             ControlMessage::Pong { timestamp } => {
                 trace!("Received pong from {}: {}", peer_addr, timestamp);
@@ -3189,12 +3456,24 @@ where
                 flow_id,
                 window_size,
             } => {
-                trace!(
-                    "Received window update for flow {} from {}: {}",
-                    flow_id,
-                    peer_addr,
-                    window_size
-                );
+                // Client consumed `window_size` bytes of this flow's downlink
+                // data — grant the credits back to the flow's read relay.
+                let flow = {
+                    let flows_guard = flows.lock().await;
+                    flows_guard.get(&flow_id).cloned()
+                };
+                if let Some(flow) = flow {
+                    trace!(
+                        "WindowUpdate for flow {} from {}: +{} credits",
+                        flow_id, peer_addr, window_size
+                    );
+                    flow.send_credits.grant(window_size as u64);
+                } else {
+                    trace!(
+                        "WindowUpdate for unknown flow {} from {}",
+                        flow_id, peer_addr
+                    );
+                }
             }
         }
 
@@ -3202,31 +3481,125 @@ where
     }
 
     /// Handle data for an existing flow
-    async fn handle_flow_data(flow_id: u32, data: &[u8], flows: &FlowMap) -> Result<()> {
-        let write_half = {
+    ///
+    /// Enqueues the payload into the flow's bounded uplink queue; the
+    /// per-flow writer task (`spawn_flow_writer`) performs the actual target
+    /// socket write and grants WindowUpdate credits back to the client.
+    /// Never blocks the WebSocket receive loop: a full queue means the
+    /// client is over-sending beyond its credits, so the flow is closed.
+    pub(crate) async fn handle_flow_data(
+        flow_id: u32,
+        data: &[u8],
+        flows: &FlowMap,
+        control_tx: &tokio::sync::mpsc::Sender<ControlMessage>,
+    ) -> Result<()> {
+        let flow = {
             let flows_guard = flows.lock().await;
             flows_guard.get(&flow_id).cloned()
         };
 
-        if let Some(write_half) = write_half {
-            trace!("DATA: Writing {} bytes to flow {}", data.len(), flow_id);
-            let mut writer_guard = write_half.lock().await;
-            writer_guard
-                .write_all(data)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to write to flow {}: {}", flow_id, e))?;
-            trace!(
-                "DATA: Successfully wrote {} bytes to flow {}",
-                data.len(),
-                flow_id
-            );
-            Ok(())
+        if let Some(flow) = flow {
+            trace!("DATA: Queuing {} bytes for flow {}", data.len(), flow_id);
+            match flow
+                .to_target_tx
+                .try_send(Bytes::copy_from_slice(data))
+            {
+                Ok(()) => Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // The queue is bounded well above the credit window, so a
+                    // full queue means the client is sending beyond its
+                    // credits. Close the flow rather than blocking the
+                    // receive loop (which would stall every other flow).
+                    warn!(
+                        "Flow {} uplink queue full — client over-sending beyond credits, closing flow",
+                        flow_id
+                    );
+                    remove_flow(flows, flow_id).await;
+                    let _ = control_tx
+                        .send(ControlMessage::CloseFlow { flow_id })
+                        .await;
+                    Err(anyhow::anyhow!("Flow {} uplink queue full", flow_id))
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Err(anyhow::anyhow!("Flow {} writer task gone", flow_id))
+                }
+            }
         } else {
             // This should be handled in process_incoming_frame with detailed logging
             // But we keep this as a fallback
             error!("DATA: Received data for unknown flow {} (this shouldn't happen with proper ordering checks)", flow_id);
             Err(anyhow::anyhow!("Unknown flow ID: {}", flow_id))
         }
+    }
+
+    /// Spawn the per-flow uplink writer task.
+    ///
+    /// Owns the target socket's write half: drains the flow's bounded uplink
+    /// queue with `write_all`, then grants the client `WindowUpdate` credits
+    /// for each consumed byte so the client-side send loop can continue.
+    /// Moving target writes out of the WebSocket receive loop removes the
+    /// head-of-line blocking where one slow target stalled every flow.
+    pub(crate) fn spawn_flow_writer(
+        flow_id: u32,
+        mut write_half: OwnedWriteHalf,
+        mut to_target_rx: tokio::sync::mpsc::Receiver<Bytes>,
+        flows: FlowMap,
+        control_tx: tokio::sync::mpsc::Sender<ControlMessage>,
+        peer_addr: SocketAddr,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut write_failed = false;
+            while let Some(data) = to_target_rx.recv().await {
+                let n = data.len();
+                if let Err(e) = write_half.write_all(&data).await {
+                    debug!(
+                        "Target write failed for flow {} ({}): {}",
+                        flow_id, peer_addr, e
+                    );
+                    write_failed = true;
+                    break;
+                }
+                // Grant the client credits for the bytes just consumed.
+                if control_tx
+                    .send(ControlMessage::WindowUpdate {
+                        flow_id,
+                        window_size: n as u32,
+                    })
+                    .await
+                    .is_err()
+                {
+                    // Session is gone — nothing left to do.
+                    return;
+                }
+            }
+
+            if write_failed {
+                // Detach the flow so new uplink data stops queuing, then tell
+                // the client. Dropping the write half half-closes the target
+                // socket; the read relay exits on the ensuing EOF/error.
+                //
+                // Abort the SIBLING relay task (a relay parked at zero
+                // credits would otherwise linger until the stall valve), but
+                // NOT this writer: self-abort would cancel the CloseFlow
+                // send below at its await point.
+                let removed = {
+                    let flow = flows.lock().await.remove(&flow_id);
+                    if let Some(flow) = &flow {
+                        flow.relay_task.abort();
+                    }
+                    flow.is_some()
+                };
+                if removed {
+                    info!(
+                        "Flow {} closed after target write failure for {}",
+                        flow_id, peer_addr
+                    );
+                    let _ = control_tx
+                        .send(ControlMessage::CloseFlow { flow_id })
+                        .await;
+                }
+            }
+        })
     }
 
     /// Decrypt and parse an incoming WebSocket message.
@@ -3303,7 +3676,8 @@ where
     }
 
     /// Dispatch a decrypted frame to the appropriate handler.
-    /// May block on TCP write for data frames, but the ratchet lock is NOT held.
+    /// Data frames are enqueued to the flow's uplink writer task (never
+    /// blocking on a target TCP write); the ratchet lock is NOT held.
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_decrypted_frame(
         flow_id: u32,
@@ -3311,6 +3685,7 @@ where
         _aad_type: u8,
         flows: &FlowMap,
         tx: &tokio::sync::mpsc::Sender<MuxMessage>,
+        control_tx: &tokio::sync::mpsc::Sender<ControlMessage>,
         _tun_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
         peer_addr: SocketAddr,
         dns_cache: &DnsCache,
@@ -3327,7 +3702,7 @@ where
                 "FRAME: [#{:05}] RECEIVED CONTROL frame from {} after {:.3}s",
                 frame_number, peer_addr, elapsed.as_secs_f64()
             );
-            Self::handle_control(payload, flows, tx, peer_addr, dns_cache, tun_config, pending_flows, tcp_pool).await
+            Self::handle_control(payload, flows, tx, control_tx, peer_addr, dns_cache, tun_config, pending_flows, tcp_pool).await
         } else {
             // Data for existing flow
             info!(
@@ -3335,15 +3710,13 @@ where
                 frame_number, flow_id, peer_addr, elapsed.as_secs_f64(), payload.len()
             );
 
-            let flow_write = {
+            let flow_exists = {
                 let guard = flows.lock().await;
-                guard.get(&flow_id).cloned()
+                guard.contains_key(&flow_id)
             };
 
-            if let Some(write_half) = flow_write {
-                let mut writer = write_half.lock().await;
-                writer.write_all(payload).await
-                    .map_err(|e| anyhow::anyhow!("Write to target failed for flow {}: {}", flow_id, e))?;
+            if flow_exists {
+                Self::handle_flow_data(flow_id, payload, flows, control_tx).await?;
             } else if tun_config.enabled {
                 // TUN mode: write packet directly to TUN interface
                 info!(
@@ -3415,11 +3788,22 @@ where
 
     /// Spawn a task to relay data from target back to client.
     /// Returns a JoinHandle so the caller can abort it on session end.
-    fn spawn_flow_relay(
+    ///
+    /// Flow control: the relay may only read from the target socket while it
+    /// holds downlink credits (granted by client WindowUpdate messages as the
+    /// client's local consumer drains the flow). At zero credits the read
+    /// stops and kernel TCP backpressure throttles the target. If credits
+    /// stay at zero for FLOW_CREDIT_STALL_TIMEOUT the flow is closed — a
+    /// safety valve for peers built before flow control that never send
+    /// WindowUpdate (client and server are deployed together, so this is
+    /// purely defensive).
+    pub(crate) fn spawn_flow_relay(
         flow_id: u32,
         mut read_half: OwnedReadHalf,
         flows: FlowMap,
         tx: tokio::sync::mpsc::Sender<MuxMessage>,
+        control_tx: tokio::sync::mpsc::Sender<ControlMessage>,
+        send_credits: Arc<FlowSendCredits>,
         peer_addr: SocketAddr,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -3427,18 +3811,61 @@ where
             let mut buf = [0u8; 8190];
 
             loop {
-                let read_result = match read_half.read(&mut buf).await {
+                // Credit gate: stop reading the target when the client's
+                // receive window is exhausted.
+                if send_credits.available() == 0 {
+                    match send_credits
+                        .wait_for_credit_or_stall(FLOW_CREDIT_STALL_TIMEOUT)
+                        .await
+                    {
+                        rvpn_core::protocol::multiplex::CreditWait::Granted => {}
+                        // Unreachable today (server never closes gates — flow
+                        // tasks are aborted on removal instead), but if a
+                        // close signal ever lands here it is normal teardown,
+                        // not a stall.
+                        rvpn_core::protocol::multiplex::CreditWait::Closed => {
+                            debug!("Flow {} closed while parked at zero credits", flow_id);
+                            break;
+                        }
+                        rvpn_core::protocol::multiplex::CreditWait::Stalled => {
+                            warn!(
+                                "Flow {} downlink stalled at zero credits for {:?} — closing (peer may not implement flow control)",
+                                flow_id, FLOW_CREDIT_STALL_TIMEOUT
+                            );
+                            // Abort the SIBLING writer task, NOT this relay:
+                            // self-abort would cancel the CloseFlow send below at
+                            // its await point.
+                            if let Some(flow) = flows.lock().await.remove(&flow_id) {
+                                flow.writer_task.abort();
+                            }
+                            let _ = control_tx
+                                .send(ControlMessage::CloseFlow { flow_id })
+                                .await;
+                            break;
+                        }
+                    }
+                }
+                // Cap the read at the remaining window. This task is the
+                // gate's only consumer and grants only add, so `available`
+                // cannot shrink between this check and the read.
+                let cap = (send_credits.available() as usize).min(buf.len());
+
+                let read_result = match read_half.read(&mut buf[..cap]).await {
                     Ok(0) => {
-                        let mut flows_guard = flows.lock().await;
-                        flows_guard.remove(&flow_id);
+                        // Abort the sibling writer, not this relay (see the
+                        // stall-valve path above).
+                        if let Some(flow) = flows.lock().await.remove(&flow_id) {
+                            flow.writer_task.abort();
+                        }
                         info!("Flow {} closed by remote for {}", flow_id, peer_addr);
                         None
                     }
                     Ok(n) => Some(n),
                     Err(e) => {
                         error!("Read error on flow {} for {}: {}", flow_id, peer_addr, e);
-                        let mut flows_guard = flows.lock().await;
-                        flows_guard.remove(&flow_id);
+                        if let Some(flow) = flows.lock().await.remove(&flow_id) {
+                            flow.writer_task.abort();
+                        }
                         None
                     }
                 };
@@ -3446,11 +3873,14 @@ where
                 let bytes_read = if let Some(n) = read_result {
                     n
                 } else {
-                    let _ = tx
-                        .send(MuxMessage::Control(ControlMessage::CloseFlow { flow_id }))
+                    let _ = control_tx
+                        .send(ControlMessage::CloseFlow { flow_id })
                         .await;
                     break;
                 };
+
+                // Consume credits for the bytes actually read and sent.
+                send_credits.try_consume(bytes_read as u64);
 
                 // Send data back to client via channel
                 let data = buf[..bytes_read].to_vec();
@@ -3574,6 +4004,14 @@ impl DnsHandler {
         let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_DNS_QUERIES));
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(256);
 
+        // Serialize encrypt→enqueue across the per-query tasks: the ratchet
+        // assigns message numbers at encrypt time, so wire order MUST match
+        // encrypt order — a response encrypted later that overtakes an
+        // earlier one into `out_tx` is dropped by the client's ratchet
+        // ("Message too old"), which then stalls until its 10s pending-query
+        // watchdog tears down the connection.
+        let send_lock = Arc::new(Mutex::new(()));
+
         let writer_task = tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
                 if let Err(e) = ws_write.send(msg).await {
@@ -3631,6 +4069,7 @@ impl DnsHandler {
 
                     let ratchet_clone = Arc::clone(&ratchet);
                     let out_tx_clone = out_tx.clone();
+                    let send_lock_clone = Arc::clone(&send_lock);
                     tokio::spawn(async move {
                         let permit = permit; // held until the response is sent
 
@@ -3671,30 +4110,18 @@ impl DnsHandler {
                             }
                         };
 
-                        let encrypted = {
-                            let mut guard = ratchet_clone.lock().await;
-                            match guard.encrypt(&response_bytes, &[0x09]) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    error!("DNS handler: encryption failed: {}", e);
-                                    return;
-                                }
-                            }
-                        };
-
-                        let serialized = match encrypted.to_bytes() {
-                            Ok(b) => b,
-                            Err(e) => {
-                                error!(
-                                    "DNS handler: failed to serialize encrypted response: {}",
-                                    e
-                                );
-                                return;
-                            }
-                        };
-
-                        if out_tx_clone.send(Message::Binary(serialized)).await.is_err() {
-                            debug!("DNS handler: writer channel closed");
+                        if let Err(e) = Self::send_encrypted_response(
+                            &ratchet_clone,
+                            &send_lock_clone,
+                            &out_tx_clone,
+                            &response_bytes,
+                        )
+                        .await
+                        {
+                            error!(
+                                "DNS handler: failed to send response for {}: {}",
+                                query.domain, e
+                            );
                         }
                     });
                 }
@@ -3713,6 +4140,36 @@ impl DnsHandler {
         writer_task.abort();
         info!("DNS handler: connection closed for {}", peer_addr);
         Ok(())
+    }
+
+    /// Encrypt a DNS response and enqueue it on the outbound writer channel.
+    ///
+    /// Holds `send_lock` across encrypt→enqueue: the ratchet assigns message
+    /// numbers at encrypt time, so between the concurrent per-query tasks the
+    /// wire order MUST match encrypt order — otherwise the client's ratchet
+    /// drops the overtaken frame ("Message too old") and the client's
+    /// pending-query watchdog tears down the whole DNS connection.
+    pub(crate) async fn send_encrypted_response(
+        ratchet: &Mutex<DoubleRatchet>,
+        send_lock: &Mutex<()>,
+        out_tx: &tokio::sync::mpsc::Sender<Message>,
+        response_bytes: &[u8],
+    ) -> Result<()> {
+        let _send_guard = send_lock.lock().await;
+        let encrypted = {
+            let mut guard = ratchet.lock().await;
+            guard
+                .encrypt(response_bytes, &[0x09])
+                .map_err(|e| anyhow::anyhow!("encryption failed: {}", e))?
+        };
+        // Ratchet lock released before the channel send await.
+        let serialized = encrypted
+            .to_bytes()
+            .context("failed to serialize encrypted response")?;
+        out_tx
+            .send(Message::Binary(serialized))
+            .await
+            .map_err(|_| anyhow::anyhow!("writer channel closed"))
     }
 
     async fn resolve_domain(query: &ProtoDnsQuery) -> ProtoDnsResponse {
@@ -3911,5 +4368,47 @@ impl DnsHandler {
                 Ok(None)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tcp_pool_tests {
+    use super::*;
+
+    async fn loopback_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn live_idle_connection_is_usable() {
+        let (client, _server) = loopback_pair().await;
+        assert!(tcp_pool_entry_usable(std::time::Instant::now(), &client));
+    }
+
+    #[tokio::test]
+    async fn closed_connection_is_rejected() {
+        let (client, server) = loopback_pair().await;
+        drop(server); // sends FIN
+        // Wait until the FIN is delivered to the client's socket buffer
+        for _ in 0..100 {
+            if !tcp_pool_entry_usable(std::time::Instant::now(), &client) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("connection was never observed as closed");
+    }
+
+    #[tokio::test]
+    async fn over_idle_ttl_is_rejected() {
+        let (client, _server) = loopback_pair().await;
+        let old = std::time::Instant::now()
+            .checked_sub(TCP_POOL_MAX_IDLE + Duration::from_secs(1))
+            .unwrap();
+        assert!(!tcp_pool_entry_usable(old, &client));
     }
 }

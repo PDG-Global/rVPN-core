@@ -38,6 +38,8 @@ pub mod http_proxy;
 pub mod router;
 #[cfg(not(target_os = "android"))]
 pub mod server_pool;
+#[cfg(not(target_os = "android"))]
+pub mod tunnel_pool;
 
 // Backwards compatibility re-exports from rvpn-split-tunnel
 pub mod split_tunnel;

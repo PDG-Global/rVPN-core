@@ -16,12 +16,13 @@ use tracing::{debug, error, info, warn};
 
 use rvpn_core::crypto::{IdentityKey, X3DHPublicBundle};
 
-use crate::config::ServerIdentityConfig;
+use crate::config::{ServerIdentityConfig, Socks5Mode};
 use crate::router::Router;
 use crate::server_pool::ServerPool;
 use crate::socks5_tunnel::{self, Socks5Tunnel};
 use crate::split_tunnel::{SplitTunnel, RoutingDecision};
 use crate::stream_relay::StreamRelay;
+use crate::tunnel_pool::TunnelPools;
 use rvpn_tls::TlsFingerprint;
 
 /// Lightweight handle passed to each connection handler.
@@ -36,12 +37,14 @@ pub struct ProxyHandle {
     pub server_bundle: Arc<X3DHPublicBundle>,
     pub server_identity: ServerIdentityConfig,
     pub split_tunnel: Arc<SplitTunnel>,
-    pub multiplex: bool,
+    /// Tunnel mode: legacy per-flow, single multiplexed pipe, or pooled.
+    pub mode: Socks5Mode,
     pub mux_path: String,
     pub mux_tunnel: Arc<Mutex<Option<Arc<Socks5Tunnel>>>>,
-    /// Registry of all configured servers keyed by name. In non-multiplex
-    /// mode `handle_tunnel_legacy` consults the router below to pick which
-    /// entry to open the per-flow WebSocket against.
+    /// Per-exit tunnel pools; only populated in pooled mode.
+    pub tunnel_pools: Option<Arc<TunnelPools>>,
+    /// Registry of all configured servers keyed by name. In legacy and
+    /// pooled modes the router below picks which exit carries the flow.
     pub pool: Arc<ServerPool>,
     /// Domain/IP → server-name matcher. `choose(host)` returns `"default"`
     /// when nothing overrides.
@@ -153,13 +156,13 @@ pub async fn route_connection(
             info!("Bypassing VPN for {}:{}", target_host, target_port);
             handle_direct_connection(socket, &target_host, target_port).await?;
         }
-        RoutingDecision::Tunnel => {
-            if proxy.multiplex {
-                handle_tunnel_multiplexed(socket, addr, target_addr, proxy).await?;
-            } else {
-                handle_tunnel_legacy(socket, addr, target_addr, proxy).await?;
+        RoutingDecision::Tunnel => match proxy.mode {
+            Socks5Mode::Multiplex => {
+                handle_tunnel_multiplexed(socket, addr, target_addr, proxy).await?
             }
-        }
+            Socks5Mode::Pooled => handle_tunnel_pooled(socket, addr, target_addr, proxy).await?,
+            Socks5Mode::Legacy => handle_tunnel_legacy(socket, addr, target_addr, proxy).await?,
+        },
         RoutingDecision::Block => {
             info!("Blocking ad/tracker: {}:{}", target_host, target_port);
             // Caller should handle sending an error response to the client before
@@ -227,6 +230,12 @@ async fn handle_tunnel_multiplexed(
             // (e.g. server closes connection right after X3DH)
             const MAX_TUNNEL_RETRIES: u32 = 3;
             let mut last_err = None;
+            // The multiplexed tunnel always dials the default exit; its
+            // resumption store lets these retries (and later reconnects)
+            // resume the TLS session instead of doing full handshakes.
+            let default_server = proxy
+                .pool
+                .get_or_default(crate::server_pool::DEFAULT_SERVER_NAME);
             for attempt in 1..=MAX_TUNNEL_RETRIES {
                 let t = match Socks5Tunnel::connect(
                     &proxy.server_host,
@@ -237,6 +246,7 @@ async fn handle_tunnel_multiplexed(
                     &proxy.identity_key,
                     &proxy.server_bundle,
                     Some(&proxy.server_identity),
+                    Some(&default_server.resumption),
                 )
                 .await
                 {
@@ -283,6 +293,34 @@ async fn handle_tunnel_multiplexed(
     socks5_tunnel::handle_multiplexed_connection(socket, addr, target_addr, &tunnel).await
 }
 
+/// Handle tunnel connection — pooled mode (per-exit pool of multiplexed
+/// WebSockets). The router picks the exit; the exit's pool picks the tunnel
+/// (least-loaded, with background pre-warm on failure).
+async fn handle_tunnel_pooled(
+    socket: tokio::net::TcpStream,
+    addr: std::net::SocketAddr,
+    target_addr: &str,
+    proxy: &ProxyHandle,
+) -> Result<()> {
+    let (target_host, _) = parse_target(target_addr)?;
+    let pools = proxy
+        .tunnel_pools
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("pooled mode requires tunnel pools"))?;
+    let exit_name = proxy.router.choose(&target_host);
+    let tunnel = pools
+        .get_or_default(exit_name)
+        .pick_tunnel()
+        .await
+        .with_context(|| format!("Failed to pick pooled tunnel via exit '{}'", exit_name))?;
+
+    if exit_name != crate::server_pool::DEFAULT_SERVER_NAME {
+        debug!("Routing {} → exit '{}' (pooled)", target_host, exit_name);
+    }
+
+    socks5_tunnel::handle_multiplexed_connection(socket, addr, target_addr, &tunnel).await
+}
+
 /// Handle tunnel connection — legacy mode (one WebSocket per flow).
 ///
 /// Consults `proxy.router` to pick which named server should handle this
@@ -313,6 +351,7 @@ async fn handle_tunnel_legacy(
         &proxy.identity_key,
         &server.bundle,
         Some(&server.identity_config),
+        Some(&server.resumption),
     )
     .await
     .with_context(|| format!("Failed to connect StreamRelay to server '{}'", server.name))?;

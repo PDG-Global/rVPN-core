@@ -16,11 +16,14 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 
 use rvpn_core::crypto::X3DHPublicBundle;
+use rvpn_tls::ResumptionStore;
 
 use crate::config::{ClientConfig, ServerEntry, ServerIdentityConfig};
 
 /// The reserved name for the top-level (implicit) server.
-pub const DEFAULT_SERVER_NAME: &str = "default";
+/// Defined in `rvpn-split-tunnel` (shared with the mobile crate); re-exported
+/// here to keep existing `server_pool::DEFAULT_SERVER_NAME` paths working.
+pub use rvpn_split_tunnel::DEFAULT_SERVER_NAME;
 
 /// A resolved server, ready to be handed to `StreamRelay::connect`.
 ///
@@ -35,6 +38,13 @@ pub struct ResolvedServer {
     pub sni_hostname: Option<String>,
     pub bundle: Arc<X3DHPublicBundle>,
     pub identity_config: ServerIdentityConfig,
+    /// TLS session resumption store for this exit server. One store per exit,
+    /// shared (via cheap `Clone`) by every connection this client makes to
+    /// the server — pooled tunnel replacements, legacy per-flow relays,
+    /// multiplexed reconnects — so reconnects resume the cached TLS 1.3
+    /// ticket instead of paying a full handshake. Must outlive individual
+    /// connections, which is why it lives here rather than per connection.
+    pub resumption: ResumptionStore,
 }
 
 /// Registry of all servers keyed by name; `"default"` is always present.
@@ -71,6 +81,7 @@ impl ServerPool {
                 sni_hostname: config.sni_hostname.clone(),
                 bundle: Arc::new(default_bundle),
                 identity_config: config.server_identity.clone(),
+                resumption: ResumptionStore::new(),
             }),
         );
 
@@ -103,6 +114,7 @@ impl ServerPool {
                     sni_hostname: entry.sni_hostname.clone(),
                     bundle: Arc::new(bundle),
                     identity_config,
+                    resumption: ResumptionStore::new(),
                 }),
             );
         }
@@ -132,6 +144,11 @@ impl ServerPool {
     /// Number of extra (non-default) servers.
     pub fn extra_count(&self) -> usize {
         self.servers.len().saturating_sub(1)
+    }
+
+    /// Iterate over all resolved servers, including `"default"`.
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<ResolvedServer>> {
+        self.servers.values()
     }
 }
 
@@ -208,5 +225,56 @@ mod tests {
         assert_eq!(host, "2001:db8::1");
         assert_eq!(port, 8443);
         assert_eq!(path, "/ws");
+    }
+
+    fn test_server(name: &str) -> ResolvedServer {
+        ResolvedServer {
+            name: name.to_string(),
+            host: "exit.example.com".to_string(),
+            port: 443,
+            path: "/api/v1/ws".to_string(),
+            sni_hostname: None,
+            bundle: Arc::new(X3DHPublicBundle {
+                identity_key: [0xab; 32],
+                identity_x25519_key: [0xcd; 32],
+                signed_prekey: [0xef; 32],
+                prekey_signature: [0x12; 64],
+                one_time_prekey: None,
+                identity_key_version: 1,
+                rotation_signature: None,
+            }),
+            identity_config: ServerIdentityConfig::default(),
+            resumption: ResumptionStore::new(),
+        }
+    }
+
+    /// The resumption store rides on `ResolvedServer` (one per exit) and is
+    /// Arc-shared through every clone, so all connect calls a pool entry or
+    /// relay makes against that exit — first connect, failure replacement,
+    /// rotation replacement — see the same TLS session state. Distinct exits
+    /// must never share tickets.
+    #[test]
+    fn resumption_store_shared_across_clones_independent_per_exit() {
+        use rustls::pki_types::ServerName;
+
+        let server = test_server("default");
+        let other = test_server("hk");
+
+        // Each connect call clones the entry's store; a write through one
+        // clone must be visible to the next connect's clone.
+        let first = server.resumption.rustls_session_store();
+        let second = server.resumption.rustls_session_store();
+        let name: ServerName<'static> = ServerName::try_from("exit.example.com").unwrap();
+        first.set_kx_hint(name.clone(), rustls::NamedGroup::X25519);
+        assert_eq!(
+            second.kx_hint(&name),
+            Some(rustls::NamedGroup::X25519),
+            "clones of one exit's store must share session state"
+        );
+        assert_eq!(
+            other.resumption.rustls_session_store().kx_hint(&name),
+            None,
+            "distinct exits must not share session state"
+        );
     }
 }

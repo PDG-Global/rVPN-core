@@ -26,7 +26,7 @@ use rvpn_core::protocol::message::{DnsQuery, DnsResponse};
 
 use crate::dns_cache::DnsResolver;
 use crate::split_tunnel::{RoutingDecision, SplitTunnel};
-use rvpn_tls::TlsFingerprint;
+use rvpn_tls::{ResumptionStore, TlsFingerprint};
 use crate::websocket::{connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter};
 
 /// Payload type bytes for DNS messages — must match server's DnsHandler
@@ -62,6 +62,10 @@ pub struct DnsProxy {
     /// with any trailing dot stripped. Queries for these are always resolved
     /// locally — see the dispatch loop for why.
     server_hosts: Arc<Vec<String>>,
+    /// TLS session resumption store for this proxy's server. Held for the
+    /// proxy's lifetime so each WebSocket reconnect (`run_ws_manager` backoff
+    /// loop) resumes the cached TLS 1.3 ticket instead of a full handshake.
+    resumption: ResumptionStore,
 }
 
 impl DnsProxy {
@@ -112,6 +116,7 @@ impl DnsProxy {
             // SERVFAIL for every bypass query.
             nameservers: rvpn_split_tunnel::dns_cache::with_last_resort_nameservers(&nameservers),
             server_hosts: Arc::new(server_hosts),
+            resumption: ResumptionStore::new(),
         }
     }
 
@@ -349,6 +354,7 @@ impl DnsProxy {
                 &self.server_dns_path,
                 self.tls_fingerprint,
                 None, // SNI hostname not needed for DNS proxy (connects to same server)
+                Some(&self.resumption),
             ),
         )
         .await

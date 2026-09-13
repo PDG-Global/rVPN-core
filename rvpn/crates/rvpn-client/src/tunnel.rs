@@ -23,7 +23,7 @@ use rvpn_core::protocol::{ControlMessage, HandshakeMessage, MultiplexedFrame, Pa
 
 use crate::config::ServerIdentityConfig;
 use crate::identity_verification::{verify_server_identity, KnownHosts, VerificationResult};
-use rvpn_tls::TlsFingerprint;
+use rvpn_tls::{ResumptionStore, TlsFingerprint};
 use crate::websocket::{
     connect_websocket, split_websocket, Message, WebSocketReader, WebSocketTaskHandle,
     WebSocketWriter,
@@ -66,6 +66,9 @@ impl VpnTunnel {
     /// * `identity_key_file` - Path to client's identity key file
     /// * `prekey_bundle_file` - Path to server's prekey bundle file
     /// * `server_identity_config` - Server identity verification config
+    /// * `resumption` - TLS session resumption store held by the caller across
+    ///   reconnects, so a reconnect resumes the cached TLS 1.3 ticket instead
+    ///   of paying a full handshake
     ///
     /// # Returns
     /// Arc<RwLock<VpnTunnel>> which can be used to send/receive data
@@ -79,6 +82,7 @@ impl VpnTunnel {
         identity_key_file: &Path,
         prekey_bundle_file: Option<&Path>,
         server_identity_config: &ServerIdentityConfig,
+        resumption: Option<&ResumptionStore>,
     ) -> Result<Arc<RwLock<VpnTunnel>>> {
         info!("Connecting VPN tunnel to {}:{}{}", host, port, path);
 
@@ -103,7 +107,7 @@ impl VpnTunnel {
         debug!("Loaded server prekey bundle");
 
         // Step 1: Establish WebSocket connection
-        let ws_stream = connect_websocket(host, port, path, fingerprint, sni_hostname)
+        let ws_stream = connect_websocket(host, port, path, fingerprint, sni_hostname, resumption)
             .await
             .context("Failed to establish WebSocket connection")?;
 

@@ -142,26 +142,41 @@ impl IpPool {
         false
     }
 
-    /// Reclaim expired leases and return IPs to available pool.
-    /// IMPORTANT: Do NOT reclaim IPs that are still actively connected.
-    /// Instead, extend their leases. Only reclaim when the client has
-    /// explicitly disconnected (via unregister_client/release_ip).
-    /// This prevents stealing IPs from long-lived sessions (24h+).
-    fn reclaim_expired_leases(&self) -> usize {
+    /// Extend leases that still have an active session; reclaim expired
+    /// leases that don't. `is_active` reports whether an IP currently has a
+    /// live connection (registered downlink sender). Active sessions can
+    /// live 24h+, so their leases are never reclaimed. A lease with no
+    /// active session is a reconnect gap: the IP is kept for the whole
+    /// lease duration (so a reconnecting client reclaims its previous
+    /// tunnel IP) and returned to the pool only once the lease expires.
+    /// Returns the number of reclaimed IPs.
+    fn reclaim_expired(&self, is_active: impl Fn(&IpAddr) -> bool) -> usize {
         let mut allocated = self.allocated.lock().unwrap();
         let now = Instant::now();
-        let mut extended = 0;
+        let mut reclaimed = Vec::new();
 
-        // Instead of reclaiming, just extend expired leases.
-        // IPs are only released when clients explicitly disconnect.
-        for (_ip, entry) in allocated.iter_mut() {
-            if entry.expires_at <= now {
-                entry.expires_at = now + self.lease_duration;
-                extended += 1;
+        for (ip, entry) in allocated.iter_mut() {
+            if is_active(ip) {
+                if entry.expires_at <= now {
+                    entry.expires_at = now + self.lease_duration;
+                }
+            } else if entry.expires_at <= now {
+                reclaimed.push(*ip);
             }
         }
 
-        extended
+        if reclaimed.is_empty() {
+            return 0;
+        }
+
+        let mut available = self.available.lock().unwrap();
+        for ip in &reclaimed {
+            if let Some(entry) = allocated.remove(ip) {
+                debug!("Reclaimed expired lease {} (was leased to {})", ip, entry.client_id);
+                available.push(*ip);
+            }
+        }
+        reclaimed.len()
     }
 
     /// Get the number of available IPs
@@ -296,12 +311,24 @@ impl TunServer {
     }
 
     /// Unregister a client session (called when client disconnects)
-    /// Takes client_id to validate ownership - only the client that was allocated
-    /// this IP can release it. If another client now owns this IP (reconnect race),
-    /// silently skip to avoid corrupting the new client's state.
-    pub async fn unregister_client(&self, client_ip: IpAddr, client_id: &str) -> Result<()> {
-        // Validate ownership BEFORE removing from client_senders to prevent
-        // a reconnecting client from evicting the new connection's sender.
+    /// Takes the session's own downlink sender to validate ownership: after a
+    /// fast reconnect, the map holds the NEW connection's sender for the same
+    /// tunnel IP, and a stale connection's cleanup must not evict it.
+    ///
+    /// The IP lease is deliberately NOT released here. Leases are sticky per
+    /// client identity so a reconnecting client reclaims its previous tunnel
+    /// IP (the client's utun interface keeps that address across a lightweight
+    /// reconnect; handing out a different one silently blackholes downlink).
+    /// Idle leases are returned to the pool by reclaim_expired_leases once
+    /// they expire with no active session.
+    pub async fn unregister_client(
+        &self,
+        client_ip: IpAddr,
+        client_id: &str,
+        sender: &mpsc::Sender<Vec<u8>>,
+    ) -> Result<()> {
+        // Pool ownership check (defense in depth — the sender check below is
+        // the real guard against the reconnect race).
         let pool_client_id = {
             let allocated = self.ip_pool.allocated.lock().unwrap();
             allocated.get(&client_ip).map(|e| e.client_id.clone())
@@ -316,25 +343,28 @@ impl TunServer {
                 return Ok(());
             }
         } else {
-            // IP not in pool (was never allocated or already released)
-            warn!("Attempted to unregister IP {} for client {} but it was never allocated or already released!",
-                  client_ip, client_id);
-            return Ok(());
+            debug!("Unregister for IP {} ({}): no pool lease (already reclaimed)",
+                   client_ip, client_id);
         }
 
-        // Remove from client_senders map — we own this IP
-        {
-            let mut senders = self.client_senders.write().await;
-            senders.remove(&client_ip);
-        }
-
-        // Release IP back to pool
-        if self.ip_pool.release(client_ip) {
-            info!("Unregistered client {} (IP {}) from TUN server", client_id, client_ip);
-        } else {
-            // This should never happen given the check above
-            warn!("Failed to release IP {} for client {} after ownership validated",
-                  client_ip, client_id);
+        // Remove the sender only if the registered sender still belongs to
+        // THIS connection. After a fast reconnect the map holds the new
+        // connection's sender for the same IP; removing it would kill the
+        // live session's downlink.
+        let mut senders = self.client_senders.write().await;
+        match senders.get(&client_ip) {
+            Some(existing) if existing.same_channel(sender) => {
+                senders.remove(&client_ip);
+                info!("Unregistered client {} (IP {}) from TUN server", client_id, client_ip);
+            }
+            Some(_) => {
+                debug!("Skipping unregister for IP {} ({}): sender belongs to a newer connection",
+                       client_ip, client_id);
+            }
+            None => {
+                debug!("Unregister for IP {} ({}): no sender registered",
+                       client_ip, client_id);
+            }
         }
         Ok(())
     }
@@ -342,8 +372,8 @@ impl TunServer {
     /// Allocate an IP address for a client
     #[allow(dead_code)]
     pub async fn allocate_ip(&self, client_id: &str) -> Result<IpAddr> {
-        // First reclaim any expired leases
-        self.ip_pool.reclaim_expired_leases();
+        // First reclaim expired leases that have no active session
+        self.reclaim_expired_leases().await;
 
         match self.ip_pool.allocate(client_id) {
             Some(ip) => {
@@ -366,10 +396,15 @@ impl TunServer {
         released
     }
 
-    /// Reclaim expired IP leases
+    /// Extend leases with an active session; reclaim expired ones without
+    /// one. A lease with a registered downlink sender belongs to a live
+    /// connection and is renewed indefinitely (sessions can live 24h+).
+    /// A lease with no sender is a reconnect gap — kept for the full lease
+    /// duration for stickiness, then returned to the pool.
     #[allow(dead_code)]
     pub async fn reclaim_expired_leases(&self) -> usize {
-        let count = self.ip_pool.reclaim_expired_leases();
+        let senders = self.client_senders.read().await;
+        let count = self.ip_pool.reclaim_expired(|ip| senders.contains_key(ip));
         if count > 0 {
             info!("Reclaimed {} expired IP leases", count);
         }
@@ -504,5 +539,89 @@ impl TunServer {
         } else {
             None // IPv6 not supported yet
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> TunNetworkConfig {
+        TunNetworkConfig {
+            enabled: true,
+            tun_ip: "10.200.0.1/24".to_string(),
+            mtu: 1420,
+            interface_name: "tun-test".to_string(),
+            dns_servers: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn allocate_is_sticky_per_client_id() {
+        let ts = TunServer::new(&test_config()).unwrap();
+        let ip1 = ts.allocate_ip("ik:alice").await.unwrap();
+        let ip2 = ts.allocate_ip("ik:alice").await.unwrap();
+        assert_eq!(ip1, ip2, "same client_id must reclaim the same IP");
+
+        let ip3 = ts.allocate_ip("ik:bob").await.unwrap();
+        assert_ne!(ip1, ip3, "different client_id must get a different IP");
+    }
+
+    #[tokio::test]
+    async fn stale_unregister_does_not_evict_new_connection() {
+        let ts = TunServer::new(&test_config()).unwrap();
+        let ip = ts.allocate_ip("ik:alice").await.unwrap();
+
+        let (tx_old, _rx_old) = mpsc::channel::<Vec<u8>>(1);
+        ts.register_client(ip, tx_old.clone()).await.unwrap();
+
+        // Fast reconnect: same identity reclaims the same IP and registers
+        // a new sender, overwriting the old registration.
+        let ip2 = ts.allocate_ip("ik:alice").await.unwrap();
+        assert_eq!(ip, ip2);
+        let (tx_new, _rx_new) = mpsc::channel::<Vec<u8>>(1);
+        ts.register_client(ip, tx_new.clone()).await.unwrap();
+
+        // The OLD connection's teardown must not evict the new sender.
+        ts.unregister_client(ip, "ik:alice", &tx_old).await.unwrap();
+        {
+            let senders = ts.client_senders.read().await;
+            let current = senders
+                .get(&ip)
+                .expect("new sender must survive stale unregister");
+            assert!(current.same_channel(&tx_new));
+        }
+
+        // The lease must survive too: a third connect still gets the same IP.
+        let ip3 = ts.allocate_ip("ik:alice").await.unwrap();
+        assert_eq!(ip, ip3);
+
+        // The NEW connection's own teardown removes its registration.
+        ts.unregister_client(ip, "ik:alice", &tx_new).await.unwrap();
+        let senders = ts.client_senders.read().await;
+        assert!(!senders.contains_key(&ip));
+    }
+
+    #[tokio::test]
+    async fn reclaim_expires_idle_leases_but_extends_active() {
+        // Zero-duration lease: everything is immediately expired.
+        let pool = IpPool::new("10.200.0.1/24", Duration::from_secs(0)).unwrap();
+        let active_ip = pool.allocate("ik:active").unwrap();
+        let idle_ip = pool.allocate("ik:idle").unwrap();
+
+        let reclaimed = pool.reclaim_expired(|ip| ip == &active_ip);
+        assert_eq!(reclaimed, 1, "only the idle lease should be reclaimed");
+
+        // The active lease is still sticky for its owner.
+        let again = pool.allocate("ik:active").unwrap();
+        assert_eq!(again, active_ip);
+
+        // The reclaimed IP went back to the available pool.
+        let recycled = pool.allocate("ik:other").unwrap();
+        assert_eq!(
+            recycled, idle_ip,
+            "reclaimed IP returns to the available pool"
+        );
     }
 }

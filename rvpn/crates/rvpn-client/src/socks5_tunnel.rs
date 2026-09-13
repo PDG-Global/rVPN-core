@@ -9,7 +9,7 @@
 // encrypted with a single shared DoubleRatchet.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use anyhow::{Context as _, Result};
@@ -20,6 +20,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use rvpn_core::crypto::x3dh::X3DHInitiator;
 use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
+use rvpn_core::protocol::multiplex::{CreditWait, FlowSendCredits, FLOW_CREDIT_STALL_TIMEOUT};
 use rvpn_core::protocol::{ControlMessage, HandshakeMessage, MultiplexedFrame, PayloadType};
 
 use crate::config::ServerIdentityConfig;
@@ -28,7 +29,7 @@ use crate::websocket::{
     connect_websocket, split_websocket, Message, WebSocketReader, WebSocketTaskHandle,
     WebSocketWriter,
 };
-use rvpn_tls::TlsFingerprint;
+use rvpn_tls::{ResumptionStore, TlsFingerprint};
 
 // ── Internal types ──────────────────────────────────────────────────
 
@@ -43,20 +44,67 @@ struct FlowState {
     /// Uses Bytes so payloads sliced out of the decrypted plaintext can be
     /// forwarded without allocating a fresh Vec per received frame.
     ws_to_local_tx: mpsc::Sender<Bytes>,
+    /// Send credits for the local -> server (uplink) direction. Granted by
+    /// server `WindowUpdate` control messages; consumed one byte per payload
+    /// byte sent by `flow_to_ws_loop`.
+    send_credits: Arc<FlowSendCredits>,
 }
 
 // ── Public types ────────────────────────────────────────────────────
 
+/// Ordered encrypt+enqueue handle for one tunnel's WebSocket writer.
+///
+/// The Double Ratchet assigns message numbers at encrypt time, so wire order
+/// MUST match encrypt order: a frame encrypted later (higher message number)
+/// that overtakes an earlier one into the writer channel is dropped by the
+/// receiving ratchet ("Message too old" — skipped-key pruning tolerates
+/// almost no reordering) and its payload — e.g. a WindowUpdate credit
+/// grant — is lost forever. Every send path on the tunnel (per-flow data,
+/// WindowUpdate, CreateFlow/CloseFlow, keepalive) goes through this
+/// serializer: hold `send_lock` across encrypt + enqueue, but release the
+/// ratchet lock BEFORE the send await so a full writer channel never stalls
+/// the receive loop's decrypts.
+#[derive(Clone)]
+struct TunnelSender {
+    ws_writer: WebSocketWriter,
+    ratchet: Arc<Mutex<DoubleRatchet>>,
+    send_lock: Arc<Mutex<()>>,
+}
+
+impl TunnelSender {
+    /// Encrypt `plaintext` (already padded) with the tunnel ratchet and
+    /// enqueue it on the WebSocket writer, preserving
+    /// wire order == ratchet message-number order.
+    async fn send_encrypted(&self, plaintext: &[u8], aad: &[u8]) -> Result<()> {
+        let _send_guard = self.send_lock.lock().await;
+        let message = {
+            let mut guard = self.ratchet.lock().await;
+            guard.encrypt(plaintext, aad)?
+        };
+        // Ratchet lock released before the (potentially blocking) send.
+        self.ws_writer
+            .send(Message::Binary(message.to_bytes()?))
+            .await
+    }
+}
+
 /// Shared multiplexed tunnel for all SOCKS5 flows.
 pub struct Socks5Tunnel {
-    ws_writer: WebSocketWriter,
+    sender: TunnelSender,
     ratchet: Arc<Mutex<DoubleRatchet>>,
     next_flow_id: AtomicU32,
     pending_flows: Mutex<HashMap<u32, PendingFlow>>,
     flow_states: Mutex<HashMap<u32, FlowState>>,
     /// Set to false when the receive loop exits — signals callers to reconnect
     alive: AtomicBool,
-    /// When this tunnel was created (for diagnostics)
+    /// Number of flows currently registered in `flow_states`. Kept as an
+    /// atomic mirror so pool striping (`tunnel_pool.rs`) can read the load
+    /// without locking the flow map.
+    flow_count: AtomicUsize,
+    /// Total payload bytes relayed through this tunnel (both directions).
+    /// Drives the byte-based rotation threshold in pooled mode.
+    bytes_relayed: Arc<AtomicU64>,
+    /// When this tunnel was created (for diagnostics and age-based rotation)
     created_at: std::time::Instant,
     /// Holds the reader/writer/ping helper tasks' shutdown signal. When this
     /// tunnel is dropped (replaced after death), the handle's Drop signals
@@ -112,22 +160,17 @@ impl Drop for Socks5Flow {
         let Some(tunnel) = self.tunnel.upgrade() else {
             return;
         };
-        let ws_writer = tunnel.ws_writer.clone();
-        let ratchet = Arc::clone(&tunnel.ratchet);
+        let sender = tunnel.sender.clone();
         let flow_id = self.flow_id;
         tokio::spawn(async move {
-            if let Err(e) = send_close_frame(&ws_writer, &ratchet, flow_id).await {
+            if let Err(e) = send_close_frame(&sender, flow_id).await {
                 debug!("Failed to send CloseFlow for flow {}: {}", flow_id, e);
             }
         });
     }
 }
 
-async fn send_close_frame(
-    ws_writer: &WebSocketWriter,
-    ratchet: &Mutex<DoubleRatchet>,
-    flow_id: u32,
-) -> Result<()> {
+async fn send_close_frame(sender: &TunnelSender, flow_id: u32) -> Result<()> {
     let msg = ControlMessage::CloseFlow { flow_id };
     // Control messages MUST be sent on flow_id=0 (CONTROL_FLOW_ID)
     // with bincode-serialized payload
@@ -136,12 +179,9 @@ async fn send_close_frame(
     let encoded = frame.encode()?;
     let padded = rvpn_core::protocol::padding::pad_packet(&encoded)
         .map_err(|e| anyhow::anyhow!("Padding failed: {}", e))?;
-    let message = {
-        let mut guard = ratchet.lock().await;
-        guard.encrypt(&padded, &[PayloadType::Admin as u8])?
-    };
-    let encrypted = message.to_bytes()?;
-    ws_writer.send(Message::Binary(encrypted)).await?;
+    sender
+        .send_encrypted(&padded, &[PayloadType::Admin as u8])
+        .await?;
     debug!("Sent CloseFlow for flow {}", flow_id);
     Ok(())
 }
@@ -159,6 +199,7 @@ impl Socks5Tunnel {
         identity_key: &Arc<IdentityKey>,
         server_bundle: &X3DHPublicBundle,
         server_identity_config: Option<&ServerIdentityConfig>,
+        resumption: Option<&ResumptionStore>,
     ) -> Result<Arc<Self>> {
         info!(
             "Connecting SOCKS5 multiplexed tunnel to {}:{}{}",
@@ -166,7 +207,7 @@ impl Socks5Tunnel {
         );
 
         debug!("WebSocket path for mux tunnel: {}", path);
-        let ws_stream = connect_websocket(host, port, path, fingerprint, sni_hostname)
+        let ws_stream = connect_websocket(host, port, path, fingerprint, sni_hostname, resumption)
             .await
             .map_err(|e| {
                 error!("MUX WebSocket connect failed: {}:{}", host, port);
@@ -192,12 +233,18 @@ impl Socks5Tunnel {
         let ratchet = Arc::new(Mutex::new(ratchet));
 
         let tunnel = Arc::new(Self {
-            ws_writer,
+            sender: TunnelSender {
+                ws_writer,
+                ratchet: Arc::clone(&ratchet),
+                send_lock: Arc::new(Mutex::new(())),
+            },
             ratchet: Arc::clone(&ratchet),
             next_flow_id: AtomicU32::new(1),
             pending_flows: Mutex::new(HashMap::new()),
             flow_states: Mutex::new(HashMap::new()),
             alive: AtomicBool::new(true),
+            flow_count: AtomicUsize::new(0),
+            bytes_relayed: Arc::new(AtomicU64::new(0)),
             created_at: std::time::Instant::now(),
             _ws_tasks: ws_tasks,
         });
@@ -212,7 +259,7 @@ impl Socks5Tunnel {
                 // Mark tunnel as dead so callers will reconnect
                 tunnel.alive.store(false, Ordering::SeqCst);
                 error!("SOCKS5 multiplexed tunnel marked as DEAD (age {:.1}s) — next flow will trigger reconnect",
-                       tunnel.tunnel_age().as_secs_f64());
+                       tunnel.age().as_secs_f64());
 
                 // Fail all pending FlowCreated oneshots so waiting open_flow calls
                 // return immediately instead of timing out after 10 seconds.
@@ -264,20 +311,12 @@ impl Socks5Tunnel {
                                             break;
                                         }
                                     };
-                                let encrypted = {
-                                    let mut g = tunnel.ratchet.lock().await;
-                                    g.encrypt(&padded, &[PayloadType::Admin as u8])
-                                };
-                                match encrypted {
-                                    Ok(ciphertext) => {
-                                        let _ = tunnel.ws_writer.send(Message::Binary(
-                                            ciphertext.to_bytes().unwrap_or_default(),
-                                        )).await;
-                                    }
-                                    Err(e) => {
-                                        debug!("Keepalive encrypt failed: {}", e);
-                                        break;
-                                    }
+                                if let Err(e) = tunnel
+                                    .sender
+                                    .send_encrypted(&padded, &[PayloadType::Admin as u8])
+                                    .await
+                                {
+                                    debug!("Keepalive send failed: {}", e);
                                 }
                             }
                         }
@@ -452,17 +491,33 @@ impl Socks5Tunnel {
 
         let (local_to_ws_tx, local_to_ws_rx) = mpsc::channel::<Vec<u8>>(256);
         let (ws_to_local_tx, ws_to_local_rx) = mpsc::channel::<Bytes>(256);
+        let send_credits = Arc::new(FlowSendCredits::new());
 
         {
             let mut states = self.flow_states.lock().await;
-            states.insert(flow_id, FlowState { ws_to_local_tx });
+            states.insert(
+                flow_id,
+                FlowState {
+                    ws_to_local_tx,
+                    send_credits: Arc::clone(&send_credits),
+                },
+            );
         }
+        self.flow_count.fetch_add(1, Ordering::Relaxed);
 
-        let ws_writer = self.ws_writer.clone();
-        let ratchet = Arc::clone(&self.ratchet);
+        let sender = self.sender.clone();
+        let bytes_relayed = Arc::clone(&self.bytes_relayed);
+        let tunnel_weak = Arc::downgrade(self);
         tokio::spawn(async move {
-            if let Err(e) =
-                Self::flow_to_ws_loop(flow_id, local_to_ws_rx, &ws_writer, &ratchet).await
+            if let Err(e) = Self::flow_to_ws_loop(
+                flow_id,
+                local_to_ws_rx,
+                &sender,
+                &bytes_relayed,
+                &send_credits,
+                &tunnel_weak,
+            )
+            .await
             {
                 debug!("Flow {} -> WS loop ended: {}", flow_id, e);
             }
@@ -489,21 +544,61 @@ impl Socks5Tunnel {
         let encoded = frame.encode()?;
         let padded = rvpn_core::protocol::padding::pad_packet(&encoded)
             .map_err(|e| anyhow::anyhow!("Padding failed: {}", e))?;
-        let message = {
-            let mut g = self.ratchet.lock().await;
-            g.encrypt(&padded, &[PayloadType::Admin as u8])?
-        };
-        self.ws_writer.send(Message::Binary(message.to_bytes()?)).await?;
+        self.sender
+            .send_encrypted(&padded, &[PayloadType::Admin as u8])
+            .await?;
         debug!("Sent CreateFlow {} → {}:{}", flow_id, target, port);
         Ok(())
     }
 
     pub async fn close_flow(&self, flow_id: u32) {
-        self.flow_states.lock().await.remove(&flow_id);
+        self.remove_flow_state(flow_id).await;
         self.pending_flows.lock().await.remove(&flow_id);
         // Notify the server immediately so it frees the flow slot
-        if let Err(e) = send_close_frame(&self.ws_writer, &self.ratchet, flow_id).await {
+        if let Err(e) = send_close_frame(&self.sender, flow_id).await {
             debug!("Failed to send CloseFlow for flow {}: {}", flow_id, e);
+        }
+    }
+
+    /// Grant the server `credits` bytes of send window for `flow_id`
+    /// (downlink flow control).
+    ///
+    /// Called by the flow's local consumer after it has written that many
+    /// bytes to the local application socket — i.e. when the flow's receive
+    /// buffer occupancy actually decreases.
+    pub async fn send_window_update(&self, flow_id: u32, credits: u32) {
+        let msg = ControlMessage::WindowUpdate {
+            flow_id,
+            window_size: credits,
+        };
+        let result = async {
+            let frame = MultiplexedFrame::new_control(&msg)
+                .context("Failed to serialize WindowUpdate control message")?;
+            let encoded = frame.encode()?;
+            let padded = rvpn_core::protocol::padding::pad_packet(&encoded)
+                .map_err(|e| anyhow::anyhow!("Padding failed: {}", e))?;
+            self.sender
+                .send_encrypted(&padded, &[PayloadType::Admin as u8])
+                .await
+        }
+        .await;
+        if let Err(e) = result {
+            // Non-fatal: the worst case is the flow stalling and hitting the
+            // sender-side credit stall valve.
+            debug!("Failed to send WindowUpdate for flow {}: {}", flow_id, e);
+        }
+    }
+
+    /// Remove a flow's state, keeping the atomic flow counter in sync.
+    ///
+    /// Closing the flow's credit gate wakes a `flow_to_ws_loop` parked at
+    /// zero credits immediately (it exits quietly with `CreditWait::Closed`)
+    /// instead of lingering until the 60s stall valve and logging a
+    /// misleading stall warning for an already-dead flow.
+    async fn remove_flow_state(&self, flow_id: u32) {
+        if let Some(state) = self.flow_states.lock().await.remove(&flow_id) {
+            state.send_credits.close();
+            self.flow_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -567,7 +662,7 @@ impl Socks5Tunnel {
                         error!(
                             "Ratchet desync on mux tunnel: {:?} — marking tunnel dead (age {:.1}s)",
                             e,
-                            self.tunnel_age().as_secs_f64()
+                            self.age().as_secs_f64()
                         );
                         self.alive.store(false, Ordering::SeqCst);
 
@@ -630,9 +725,57 @@ impl Socks5Tunnel {
         self.alive.load(Ordering::SeqCst)
     }
 
-    /// How long ago this tunnel was created
-    fn tunnel_age(&self) -> std::time::Duration {
+    /// Number of flows currently open on this tunnel.
+    ///
+    /// Used by the pooled-mode striping logic (`tunnel_pool.rs`) for
+    /// least-loaded flow assignment.
+    pub fn active_flow_count(&self) -> usize {
+        self.flow_count.load(Ordering::Relaxed)
+    }
+
+    /// How long ago this tunnel was created. Drives the age-based rotation
+    /// threshold in pooled mode (`tunnel_pool.rs`).
+    pub fn age(&self) -> std::time::Duration {
         self.created_at.elapsed()
+    }
+
+    /// Total payload bytes relayed through this tunnel (both directions).
+    /// Drives the byte-based rotation threshold in pooled mode.
+    pub fn bytes_relayed(&self) -> u64 {
+        self.bytes_relayed.load(Ordering::Relaxed)
+    }
+
+    /// Force-close the tunnel: mark dead, fail all pending flow-creation
+    /// waiters, and drop every flow's receive channel so relay loops exit.
+    ///
+    /// Used by the pool's drain path (`tunnel_pool.rs`) — on the drain
+    /// backstop this is what "fails the remaining flows fast" (their SOCKS5
+    /// sockets close, the app's retry lands on a healthy tunnel).
+    pub async fn shutdown(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+
+        let pending: HashMap<u32, PendingFlow> = {
+            let mut guard = self.pending_flows.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for (flow_id, pf) in pending {
+            let _ = pf.tx.send(Err(anyhow::anyhow!(
+                "Mux tunnel shut down (flow {})",
+                flow_id
+            )));
+        }
+
+        // Close every flow's credit gate first so a flow_to_ws_loop parked
+        // at zero credits wakes and exits quietly, then drop the senders to
+        // close every flow's ws→local channel.
+        {
+            let mut states = self.flow_states.lock().await;
+            for state in states.values() {
+                state.send_credits.close();
+            }
+            states.clear();
+        }
+        self.flow_count.store(0, Ordering::Relaxed);
     }
 
     async fn handle_control_message(&self, payload: &[u8]) {
@@ -653,11 +796,25 @@ impl Socks5Tunnel {
                     }
                     // In 0-RTT mode, the caller may already be sending data.
                     // Close the flow state so the relay loop exits cleanly.
-                    self.flow_states.lock().await.remove(&flow_id);
+                    self.remove_flow_state(flow_id).await;
                 }
                 ControlMessage::CloseFlow { flow_id } => {
                     trace!("Server sent CloseFlow {}", flow_id);
-                    self.flow_states.lock().await.remove(&flow_id);
+                    self.remove_flow_state(flow_id).await;
+                }
+                ControlMessage::WindowUpdate {
+                    flow_id,
+                    window_size,
+                } => {
+                    // Server consumed `window_size` bytes of this flow's
+                    // uplink data (written to the target socket) — grant the
+                    // credits back to the send loop.
+                    let states = self.flow_states.lock().await;
+                    if let Some(state) = states.get(&flow_id) {
+                        state.send_credits.grant(window_size as u64);
+                    } else {
+                        trace!("WindowUpdate for unknown flow {}", flow_id);
+                    }
                 }
                 _ => {}
             }
@@ -665,18 +822,24 @@ impl Socks5Tunnel {
     }
 
     async fn dispatch_data_frame(&self, flow_id: u32, data: Bytes) {
+        self.bytes_relayed
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         let states = self.flow_states.lock().await;
         if let Some(state) = states.get(&flow_id) {
             // Use try_send to avoid blocking the receive loop when a flow's
-            // consumer is slow (e.g. large Gemini response, Instagram images).
-            // If the channel is full, drop the data rather than spawning a
-            // background task per packet. Spawning tasks under backpressure
-            // causes unbounded memory growth — each task holds a Vec<u8>
-            // that isn't freed until the consumer catches up.
+            // consumer is slow. With credit-based flow control the server can
+            // have at most INITIAL_FLOW_WINDOW bytes in flight per flow, so
+            // the channel can never legitimately fill: a Full here means a
+            // flow-control bug or a misbehaving peer. Log it (loudly, once
+            // per frame) and drop — blocking the demux loop would stall
+            // every other flow on the tunnel.
             match state.ws_to_local_tx.try_send(data) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    trace!("Flow {} channel full, dropping frame", flow_id);
+                    warn!(
+                        "Flow {} dispatch channel full, dropping frame — peer is exceeding its credit window",
+                        flow_id
+                    );
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     trace!("Flow {} receiver dropped, cleaning up", flow_id);
@@ -692,19 +855,81 @@ impl Socks5Tunnel {
     async fn flow_to_ws_loop(
         flow_id: u32,
         mut data_rx: mpsc::Receiver<Vec<u8>>,
-        ws_writer: &WebSocketWriter,
-        ratchet: &Mutex<DoubleRatchet>,
+        sender: &TunnelSender,
+        bytes_relayed: &AtomicU64,
+        send_credits: &Arc<FlowSendCredits>,
+        tunnel: &Weak<Socks5Tunnel>,
     ) -> Result<()> {
-        while let Some(data) = data_rx.recv().await {
-            let frame = MultiplexedFrame::new_data(flow_id, data);
+        // Chunk that exceeded the remaining credit window; the unsent tail
+        // is carried to the next iteration.
+        let mut pending: Option<Vec<u8>> = None;
+
+        loop {
+            let data = match pending.take() {
+                Some(d) => d,
+                None => match data_rx.recv().await {
+                    Some(d) => d,
+                    None => break,
+                },
+            };
+            if data.is_empty() {
+                continue;
+            }
+
+            // Flow control: send at most the remaining credit window. At zero
+            // credits, park until the server's WindowUpdate tops us up — the
+            // local_to_ws channel then fills and the SOCKS5 relay stops
+            // reading the app socket, so TCP backpressure throttles the app.
+            let n = send_credits.try_consume(data.len() as u64) as usize;
+            if n == 0 {
+                match send_credits
+                    .wait_for_credit_or_stall(FLOW_CREDIT_STALL_TIMEOUT)
+                    .await
+                {
+                    CreditWait::Granted => {
+                        pending = Some(data);
+                        continue;
+                    }
+                    // The flow was closed while parked (CloseFlow, local
+                    // socket closed, tunnel shutdown): exit quietly — this
+                    // is normal teardown, not a stall.
+                    CreditWait::Closed => {
+                        debug!(
+                            "Flow {} closed while parked at zero credits — exiting",
+                            flow_id
+                        );
+                        return Ok(());
+                    }
+                    // Safety valve: peers built before flow control ignore
+                    // WindowUpdate and never grant credits, which would stall
+                    // this loop forever. Client and server are deployed
+                    // together, so this is purely defensive.
+                    CreditWait::Stalled => {
+                        warn!(
+                            "Flow {} stalled at zero credits for {:?} — closing (peer may not implement flow control)",
+                            flow_id, FLOW_CREDIT_STALL_TIMEOUT
+                        );
+                        if let Some(tunnel) = tunnel.upgrade() {
+                            tunnel.close_flow(flow_id).await;
+                        }
+                        anyhow::bail!("Flow {} closed: credit stall", flow_id);
+                    }
+                }
+            }
+
+            let frame = if n == data.len() {
+                MultiplexedFrame::new_data(flow_id, data)
+            } else {
+                pending = Some(data[n..].to_vec());
+                MultiplexedFrame::new_data(flow_id, Bytes::copy_from_slice(&data[..n]))
+            };
+            bytes_relayed.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
             let encoded = frame.encode()?;
             let padded = rvpn_core::protocol::padding::pad_packet(&encoded)
                 .map_err(|e| anyhow::anyhow!("Padding failed: {}", e))?;
-            let message = {
-                let mut g = ratchet.lock().await;
-                g.encrypt(&padded, &[PayloadType::Data as u8])?
-            };
-            ws_writer.send(Message::Binary(message.to_bytes()?)).await?;
+            sender
+                .send_encrypted(&padded, &[PayloadType::Data as u8])
+                .await?;
             trace!("Flow {} → {} bytes", flow_id, frame.payload.len());
         }
         Ok(())
@@ -761,6 +986,9 @@ pub async fn handle_multiplexed_connection(
                 match data {
                     Some(d) => {
                         if client_write.write_all(&d).await.is_err() { break; }
+                        // Flow control: grant the server credits for the
+                        // bytes just handed to the local application socket.
+                        tunnel.send_window_update(flow_id, d.len() as u32).await;
                     }
                     None => break,
                 }
@@ -770,4 +998,89 @@ pub async fn handle_multiplexed_connection(
 
     tracing::debug!("Multiplexed flow {} closed for {}", flow_id, addr);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rvpn_core::crypto::RatchetMessage;
+    use std::collections::HashSet;
+
+    /// Regression test for the production "Message too old" stall (hk2):
+    /// with many tasks encrypting concurrently on the shared tunnel ratchet,
+    /// wire order MUST equal ratchet message-number order, and every frame
+    /// must decrypt at the receiver. The writer channel capacity is 1 so
+    /// sends genuinely await, maximizing interleaving between encrypt and
+    /// enqueue — without the send_lock serialization this interleaving is
+    /// exactly what let a later-encrypted frame overtake an earlier one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tunnel_sender_preserves_wire_order_under_contention() {
+        const TASKS: usize = 8;
+        const MSGS_PER_TASK: usize = 100;
+        const TOTAL: usize = TASKS * MSGS_PER_TASK;
+
+        let shared_secret = [0x42u8; 32];
+        let alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
+        let mut bob = DoubleRatchet::init_bob(shared_secret);
+
+        let (tx, mut rx) = mpsc::channel::<Message>(1);
+        let sender = TunnelSender {
+            ws_writer: WebSocketWriter::from_sender(tx),
+            ratchet: Arc::new(Mutex::new(alice)),
+            send_lock: Arc::new(Mutex::new(())),
+        };
+
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let sender = sender.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..MSGS_PER_TASK {
+                    let payload = format!("task{}-msg{}", t, i).into_bytes();
+                    sender
+                        .send_encrypted(&payload, &[0x01])
+                        .await
+                        .expect("send_encrypted failed");
+                }
+            }));
+        }
+        // Drop the local handle so the channel closes when all tasks finish.
+        drop(sender);
+
+        let mut wire_numbers = Vec::new();
+        let mut payloads = HashSet::new();
+        while let Some(msg) = rx.recv().await {
+            let Message::Binary(bytes) = msg else {
+                panic!("unexpected non-binary message");
+            };
+            let parsed = RatchetMessage::from_bytes(&bytes).expect("deserialize failed");
+            wire_numbers.push(parsed.header.message_number);
+            let plain = bob
+                .decrypt(&parsed, &[0x01])
+                .expect("decrypt failed — frame dropped or reordered");
+            payloads.insert(String::from_utf8(plain).expect("payload not utf8"));
+        }
+
+        for h in handles {
+            h.await.expect("sender task panicked");
+        }
+
+        // Every frame arrived and decrypted.
+        assert_eq!(wire_numbers.len(), TOTAL, "frames lost on the wire");
+        // Wire order is exactly message-number order 0..TOTAL.
+        let mut sorted = wire_numbers.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            wire_numbers, sorted,
+            "wire order diverged from message-number order"
+        );
+        assert_eq!(wire_numbers[0], 0);
+        assert_eq!(wire_numbers[TOTAL - 1], (TOTAL - 1) as u32);
+        // Every payload arrived intact.
+        assert_eq!(payloads.len(), TOTAL, "payloads lost or duplicated");
+        for t in 0..TASKS {
+            for i in 0..MSGS_PER_TASK {
+                assert!(payloads.contains(&format!("task{}-msg{}", t, i)));
+            }
+        }
+    }
 }

@@ -74,5 +74,5 @@ integration-tests = []
 [dev-dependencies]
 tempfile.workspace = true
 rand.workspace = true
-tokio = { workspace = true, features = ["process", "time"] }
+tokio = { workspace = true, features = ["process", "time", "test-util"] }
 serial_test = "3.0"

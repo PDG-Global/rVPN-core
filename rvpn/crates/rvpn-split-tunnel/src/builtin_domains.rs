@@ -394,7 +394,9 @@ pub const AD_DOMAINS: &[&str] = &[
     "facebook.com/tr",
     "facebook.net",
     "connect.facebook.net",
-    "graph.instagram.com",
+    // NOTE: graph.instagram.com intentionally NOT blocked — it is Instagram's
+    // core GraphQL API; blocking it puts the app into a retry loop and
+    // manifests as "Instagram is slow / videos buffer" for tunneled users.
     "pixel.facebook.com",
     "an.facebook.com",
     // Twitter / X

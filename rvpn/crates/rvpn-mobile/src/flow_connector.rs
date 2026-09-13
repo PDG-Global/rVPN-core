@@ -47,6 +47,14 @@ pub struct FlowConnectorConfig {
     pub tls_fingerprint: TlsFingerprint,
     pub identity_key: std::sync::Arc<rvpn_core::crypto::IdentityKey>,
     pub server_bundle: X3DHPublicBundle,
+    /// TLS session resumption store for this exit server. Callers that hold a
+    /// per-exit tunnel session pass THAT session's store so the persistent
+    /// `/dns` WebSocket's reconnects resume (1-RTT PSK, no certificate
+    /// flight) just like the tunnel's. `None` keeps the backend default.
+    /// Android's DoH arm builds its rustls config inline and is not wired
+    /// for resumption yet, so the field is gated to iOS/macOS.
+    #[cfg(any(feature = "ios-direct-tun", feature = "macos-direct-tun"))]
+    pub resumption: Option<rvpn_tls::ResumptionStore>,
 }
 
 /// A per-flow connection to the VPN server

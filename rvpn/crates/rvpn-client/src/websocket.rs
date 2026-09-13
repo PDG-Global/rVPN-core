@@ -20,7 +20,9 @@ use tracing::trace;
 pub use tungstenite::Message;
 
 #[cfg(not(target_os = "android"))]
-use rvpn_tls::{ChromeTlsStream, TlsFingerprint, connect_chrome_like};
+use rvpn_tls::{
+    ChromeTlsStream, ResumptionStore, TlsFingerprint, connect_chrome_like_with_resumption,
+};
 
 /// WebSocket reader type (receives messages)
 pub type WebSocketReader = tokio::sync::mpsc::Receiver<Message>;
@@ -56,6 +58,12 @@ impl WebSocketWriter {
     /// Check if the underlying channel has been closed (writer task exited)
     pub fn is_closed(&self) -> bool {
         self.sender.is_closed()
+    }
+
+    /// Build a writer directly from a channel sender (tests only).
+    #[cfg(test)]
+    pub(crate) fn from_sender(sender: tokio::sync::mpsc::Sender<Message>) -> Self {
+        Self { sender }
     }
 }
 
@@ -108,6 +116,10 @@ impl Drop for WebSocketTaskHandle {
 /// cannot handle compressed WebSocket frames — if the server negotiates compression, the
 /// connection breaks with `Protocol(ResetWithoutClosingHandshake)`. Chrome sends this
 /// extension because it has native deflate support; we don't.
+///
+/// `resumption` is the per-exit-server TLS session store: reconnects with the
+/// same store offer the cached TLS 1.3 ticket (1-RTT resume, no certificate
+/// flight) instead of a full handshake. `None` disables resumption.
 #[cfg(not(target_os = "android"))]
 pub async fn connect_websocket(
     host: &str,
@@ -115,11 +127,13 @@ pub async fn connect_websocket(
     path: &str,
     fingerprint: TlsFingerprint,
     sni_hostname: Option<&str>,
+    resumption: Option<&ResumptionStore>,
 ) -> Result<WebSocketStream<ChromeTlsStream>> {
     // Establish TLS connection with Chrome fingerprint via boring
-    let tls_stream = connect_chrome_like(host, port, fingerprint, sni_hostname)
-        .await
-        .context("Failed to establish Chrome-fingerprinted TLS connection")?;
+    let tls_stream =
+        connect_chrome_like_with_resumption(host, port, fingerprint, sni_hostname, resumption)
+            .await
+            .context("Failed to establish Chrome-fingerprinted TLS connection")?;
 
     // Build Chrome-like WebSocket upgrade request with 15 headers.
     // Real Chrome 131 sends these on WebSocket upgrade — matching this profile makes

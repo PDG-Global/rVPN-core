@@ -109,3 +109,10 @@ tokio-boring.workspace = true
 tempfile.workspace = true
 rcgen = "0.13"
 tokio-tungstenite = { version = "0.21", features = [] }
+# test-util: paused-clock tests for the tunnel-pool drain backstop
+tokio = { workspace = true, features = ["test-util"] }
+# Test-only: also enable rvpn-tls's rustls backend so tests can observe the
+# resumption store's shared state through the ClientSessionStore trait (the
+# boring side exposes no public inspection hook).
+rvpn-tls = { path = "../rvpn-tls", features = ["rustls"] }
+rustls.workspace = true

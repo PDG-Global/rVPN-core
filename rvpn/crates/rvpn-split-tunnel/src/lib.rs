@@ -6,6 +6,9 @@
 pub mod split_tunnel;
 pub mod config;
 pub mod dns_cache;
+pub mod router;
+
+pub use router::{Router, RoutingRule, DEFAULT_SERVER_NAME};
 
 #[cfg(feature = "builtin-domains")]
 pub mod builtin_domains;

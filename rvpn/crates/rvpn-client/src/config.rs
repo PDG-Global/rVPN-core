@@ -147,18 +147,9 @@ pub struct ServerEntry {
 }
 
 /// Routing rules that steer specific hostnames or IPs to a named server.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RoutingRule {
-    /// Hostname patterns. Supports exact (`google.com`), wildcard
-    /// (`*.google.com`), or bare parent (`google.com` also matches
-    /// `mail.google.com`).
-    #[serde(default)]
-    pub domains: Vec<String>,
-
-    /// IP addresses or CIDR blocks (`8.8.8.8`, `1.1.1.0/24`, `2606:4700::/32`).
-    #[serde(default)]
-    pub ips: Vec<String>,
-}
+/// The type lives in `rvpn-split-tunnel` so the mobile crate shares it;
+/// re-exported here to keep the CLI config API unchanged.
+pub use rvpn_split_tunnel::RoutingRule;
 
 impl ClientConfig {
     /// Load configuration from file
@@ -180,6 +171,24 @@ fn default_server_address() -> String {
 
 fn default_identity_key_file() -> PathBuf {
     PathBuf::from("identity.key")
+}
+
+/// SOCKS5 tunnel mode.
+///
+/// - `Legacy`: each SOCKS5 flow opens its own WebSocket + X3DH handshake
+///   (`stream_relay.rs`). Many short-lived connections, mirrors Brook.
+/// - `Multiplex`: all flows share a single WebSocket (`socks5_tunnel.rs`).
+/// - `Pooled`: a per-exit pool of multiplexed WebSocket tunnels
+///   (`tunnel_pool.rs`); flows are striped least-loaded across the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Socks5Mode {
+    /// Per-flow WebSocket connections (default).
+    Legacy,
+    /// Single shared multiplexed WebSocket.
+    Multiplex,
+    /// Per-exit pool of multiplexed WebSockets with least-loaded striping.
+    Pooled,
 }
 
 /// SOCKS5 proxy configuration
@@ -214,13 +223,98 @@ pub struct Socks5Config {
     /// classifiers can detect. Non-multiplexed mode mirrors the traffic pattern of
     /// standard tools like Brook — many short-lived WebSocket connections, each carrying
     /// a single request — which blends in with normal HTTPS browsing.
+    ///
+    /// Deprecated compat alias for `mode`: `multiplex = true` maps to
+    /// `mode = "multiplex"` unless `mode` is explicitly set (mode wins).
     #[serde(default)]
     pub multiplex: bool,
+
+    /// Tunnel mode: "legacy" | "multiplex" | "pooled".
+    /// When unset, derived from the `multiplex` compat flag (default "legacy").
+    #[serde(default)]
+    pub mode: Option<Socks5Mode>,
 
     /// WebSocket path for multiplexed connections.
     /// When empty (default), derived from server URL as `{server_path}/mux`.
     #[serde(default)]
     pub mux_path: String,
+
+    /// Target number of live multiplexed tunnels per exit server (pooled mode).
+    #[serde(default = "default_pool_size")]
+    pub pool_size: usize,
+
+    /// Hard ceiling on live tunnels per exit under load (pooled mode).
+    #[serde(default = "default_pool_max")]
+    pub pool_max: usize,
+
+    /// Soft cap on active flows per pooled tunnel. When all tunnels are at
+    /// cap the pool grows toward `pool_max`; flows may briefly exceed the cap.
+    #[serde(default = "default_max_flows_per_conn")]
+    pub max_flows_per_conn: usize,
+
+    /// Rotate (drain + replace) a pooled tunnel after this many seconds.
+    /// Jittered ±`rotation_jitter` per tunnel at creation.
+    #[serde(default = "default_rotate_after_secs")]
+    pub rotate_after_secs: u64,
+
+    /// Rotate a pooled tunnel after this many megabytes relayed (both
+    /// directions). Jittered ±`rotation_jitter` per tunnel at creation.
+    #[serde(default = "default_rotate_after_mb")]
+    pub rotate_after_mb: u64,
+
+    /// Rotation jitter fraction (0.0–0.5). A metronome rotation schedule is
+    /// itself a traffic pattern, so thresholds are randomized per tunnel.
+    #[serde(default = "default_rotation_jitter")]
+    pub rotation_jitter: f64,
+}
+
+impl Socks5Config {
+    /// Effective tunnel mode: explicit `mode` wins; otherwise the legacy
+    /// `multiplex` bool maps to Multiplex/Legacy.
+    pub fn effective_mode(&self) -> Socks5Mode {
+        match (self.mode, self.multiplex) {
+            (Some(m), _) => m,
+            (None, true) => Socks5Mode::Multiplex,
+            (None, false) => Socks5Mode::Legacy,
+        }
+    }
+
+    /// Validate pooled-mode knobs. Returns a config error on inconsistent
+    /// values rather than silently clamping.
+    pub fn validate_pool(&self) -> anyhow::Result<()> {
+        if self.pool_size == 0 {
+            anyhow::bail!("socks5.pool_size must be at least 1");
+        }
+        if self.pool_max < self.pool_size {
+            anyhow::bail!(
+                "socks5.pool_max ({}) must be >= socks5.pool_size ({})",
+                self.pool_max,
+                self.pool_size
+            );
+        }
+        if self.max_flows_per_conn == 0 {
+            anyhow::bail!("socks5.max_flows_per_conn must be at least 1");
+        }
+        if self.rotate_after_secs < 60 {
+            anyhow::bail!(
+                "socks5.rotate_after_secs ({}) must be at least 60",
+                self.rotate_after_secs
+            );
+        }
+        if self.rotate_after_mb < 16 {
+            anyhow::bail!(
+                "socks5.rotate_after_mb ({}) must be at least 16",
+                self.rotate_after_mb
+            );
+        }
+        if !(0.0..=0.5).contains(&self.rotation_jitter) {
+            anyhow::bail!(
+                "socks5.rotation_jitter ({}) must be between 0.0 and 0.5",
+                self.rotation_jitter
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for Socks5Config {
@@ -232,9 +326,40 @@ impl Default for Socks5Config {
             auth_username: None,
             auth_password: None,
             multiplex: false,
+            mode: None,
             mux_path: String::new(),
+            pool_size: default_pool_size(),
+            pool_max: default_pool_max(),
+            max_flows_per_conn: default_max_flows_per_conn(),
+            rotate_after_secs: default_rotate_after_secs(),
+            rotate_after_mb: default_rotate_after_mb(),
+            rotation_jitter: default_rotation_jitter(),
         }
     }
+}
+
+fn default_pool_size() -> usize {
+    4
+}
+
+fn default_pool_max() -> usize {
+    8
+}
+
+fn default_max_flows_per_conn() -> usize {
+    64
+}
+
+fn default_rotate_after_secs() -> u64 {
+    600
+}
+
+fn default_rotate_after_mb() -> u64 {
+    256
+}
+
+fn default_rotation_jitter() -> f64 {
+    0.2
 }
 
 fn default_socks5_listen() -> String {
@@ -596,6 +721,102 @@ prekey_bundle     = "hk.bundle.json"
         let cfg: ClientConfig = toml::from_str(raw).expect("parse legacy config");
         assert!(cfg.extra_servers.is_empty());
         assert!(cfg.routing.is_empty());
+    }
+
+    #[test]
+    fn socks5_mode_defaults_to_legacy() {
+        let cfg = Socks5Config::default();
+        assert_eq!(cfg.effective_mode(), Socks5Mode::Legacy);
+        assert_eq!(cfg.pool_size, 4);
+        assert_eq!(cfg.pool_max, 8);
+        assert_eq!(cfg.max_flows_per_conn, 64);
+        assert_eq!(cfg.rotate_after_secs, 600);
+        assert_eq!(cfg.rotate_after_mb, 256);
+        assert!((cfg.rotation_jitter - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn socks5_multiplex_bool_is_compat_alias() {
+        let cfg: Socks5Config = toml::from_str("multiplex = true").expect("parse");
+        assert_eq!(cfg.effective_mode(), Socks5Mode::Multiplex);
+    }
+
+    #[test]
+    fn socks5_explicit_mode_wins_over_multiplex_bool() {
+        let cfg: Socks5Config =
+            toml::from_str("multiplex = true\nmode = \"pooled\"").expect("parse");
+        assert_eq!(cfg.effective_mode(), Socks5Mode::Pooled);
+
+        let cfg: Socks5Config =
+            toml::from_str("multiplex = true\nmode = \"legacy\"").expect("parse");
+        assert_eq!(cfg.effective_mode(), Socks5Mode::Legacy);
+    }
+
+    #[test]
+    fn socks5_mode_parses_all_variants() {
+        for (raw, expected) in [
+            ("legacy", Socks5Mode::Legacy),
+            ("multiplex", Socks5Mode::Multiplex),
+            ("pooled", Socks5Mode::Pooled),
+        ] {
+            let cfg: Socks5Config =
+                toml::from_str(&format!("mode = \"{}\"", raw)).expect("parse mode");
+            assert_eq!(cfg.effective_mode(), expected);
+        }
+    }
+
+    #[test]
+    fn socks5_mode_rejects_unknown_value() {
+        let result = toml::from_str::<Socks5Config>("mode = \"banana\"");
+        let err = result.expect_err("unknown mode must be rejected");
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn socks5_pool_validation() {
+        let mut cfg = Socks5Config::default();
+        assert!(cfg.validate_pool().is_ok());
+
+        cfg.pool_size = 0;
+        assert!(cfg.validate_pool().is_err());
+        cfg.pool_size = 4;
+
+        cfg.pool_max = 2;
+        assert!(cfg.validate_pool().is_err());
+        cfg.pool_max = 8;
+
+        cfg.max_flows_per_conn = 0;
+        assert!(cfg.validate_pool().is_err());
+        cfg.max_flows_per_conn = 64;
+    }
+
+    #[test]
+    fn socks5_rotation_validation() {
+        let mut cfg = Socks5Config::default();
+        assert!(cfg.validate_pool().is_ok());
+
+        cfg.rotate_after_secs = 59;
+        assert!(cfg.validate_pool().is_err());
+        cfg.rotate_after_secs = 60;
+        assert!(cfg.validate_pool().is_ok());
+
+        cfg.rotate_after_mb = 15;
+        assert!(cfg.validate_pool().is_err());
+        cfg.rotate_after_mb = 16;
+        assert!(cfg.validate_pool().is_ok());
+
+        cfg.rotation_jitter = 0.51;
+        assert!(cfg.validate_pool().is_err());
+        cfg.rotation_jitter = -0.1;
+        assert!(cfg.validate_pool().is_err());
+        cfg.rotation_jitter = 0.0;
+        assert!(cfg.validate_pool().is_ok());
+        cfg.rotation_jitter = 0.5;
+        assert!(cfg.validate_pool().is_ok());
     }
 }
 

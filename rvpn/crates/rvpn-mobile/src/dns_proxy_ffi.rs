@@ -176,7 +176,9 @@ pub unsafe extern "C" fn rvpn_dns_proxy_start(config_json: *const c_char) -> c_i
                 };
                 let dns_path = format!("{}/dns", base_path.trim_end_matches("/tun").trim_end_matches('/'));
 
-                // Create DohClient
+                // Create DohClient. This standalone proxy has no tunnel
+                // session to borrow a resumption store from, so it gets its
+                // own — its persistent /dns WebSocket reconnects still resume.
                 let flow_config = FlowConnectorConfig {
                     server_host: server_host.clone(),
                     server_port,
@@ -184,6 +186,7 @@ pub unsafe extern "C" fn rvpn_dns_proxy_start(config_json: *const c_char) -> c_i
                     tls_fingerprint: rvpn_tls::TlsFingerprint::Chrome,
                     identity_key: std::sync::Arc::new(identity_key),
                     server_bundle,
+                    resumption: Some(rvpn_tls::ResumptionStore::new()),
                 };
 
                 let doh_client = std::sync::Arc::new(DohClient::new(flow_config, dns_path));

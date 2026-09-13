@@ -212,7 +212,16 @@ pub unsafe extern "C" fn rvpn_set_log_callback(callback: Option<LogCallback>) {
 
 /// Write a log line to the file specified by RVPN_LOG_FILE env var (if set).
 /// This bypasses macOS unified logging redaction so we can debug the tunnel.
+///
+/// The file is capped at LOG_FILE_MAX_BYTES: once past the cap it is rotated
+/// to `<path>.old` (overwriting the previous rotation) and started fresh, so
+/// the on-disk footprint is bounded at 2× the cap. Without this the macOS
+/// extension's info-level logging grew the file past 190 MB in a few days.
 fn write_log_to_file(level: &str, message: &str) {
+    const LOG_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+    // Bytes written so far, seeded from the on-disk size on first write.
+    static LOG_BYTES: Mutex<Option<u64>> = Mutex::new(None);
+
     if let Ok(path) = std::env::var("RVPN_LOG_FILE") {
         use std::fs::OpenOptions;
         use std::io::Write;
@@ -221,9 +230,20 @@ fn write_log_to_file(level: &str, message: &str) {
             .unwrap_or_default();
         let ts = format!("{:?}", now);
         let line = format!("[{} {}] {}\n", ts, level, message);
+
+        let mut bytes_guard = LOG_BYTES.lock().unwrap();
+        let mut written = match *bytes_guard {
+            Some(n) => n,
+            None => std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+        };
+        if written >= LOG_FILE_MAX_BYTES {
+            let _ = std::fs::rename(&path, format!("{}.old", path));
+            written = 0;
+        }
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
             let _ = file.write_all(line.as_bytes());
         }
+        *bytes_guard = Some(written + line.len() as u64);
     }
 }
 
@@ -403,6 +423,9 @@ pub unsafe extern "C" fn rvpn_start(config_json: *const c_char) -> c_int {
         stealth_fingerprint: None,
         server_identity_pin: mobile_config.server_fingerprint,
         country_ips_file: mobile_config.country_ips_file,
+        // Legacy MobileConfig predates multi-server routing.
+        extra_servers: vec![],
+        routing: std::collections::HashMap::new(),
     };
 
     // Serialize to JSON
@@ -658,10 +681,9 @@ pub extern "C" fn rvpn_tun_start() -> c_int {
         }
     };
 
-    // Start the local DNS proxy if the config asks for it. macOS Direct TUN
-    // intercepts DNS at the packet layer and forwards queries to this proxy;
-    // iOS sets enable_dns_proxy=false (its DNS lives in the separate
-    // NEDNSProxyProvider extension), so this is a no-op there.
+    // Start the local DNS proxy if the config asks for it. Direct TUN
+    // (macOS and iOS) intercepts DNS at the packet layer and forwards
+    // queries to this proxy.
     #[cfg(feature = "dns")]
     {
         let already_running = DNS_PROXY_HANDLE.lock().unwrap().is_some();
@@ -686,12 +708,12 @@ pub extern "C" fn rvpn_tun_start() -> c_int {
     SUCCESS
 }
 
-/// Start the local DNS proxy for Direct TUN mode (macOS).
+/// Start the local DNS proxy for Direct TUN mode (macOS and iOS).
 ///
 /// Binds a UDP DNS server on `dns_bind_addr` (with fallback ports, see
 /// `DnsServer::try_bind_with_fallback` — the primary 5353 collides with
-/// mDNSResponder on macOS) and resolves queries through the tunnel via a DoH
-/// WebSocket to `<server_path>/dns`.
+/// mDNSResponder on macOS; iOS uses 127.0.0.1:15353) and resolves queries
+/// through the tunnel via a DoH WebSocket to `<server_path>/dns`.
 #[cfg(feature = "dns")]
 async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::Result<()> {
     info!(
@@ -720,6 +742,9 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::R
         tls_fingerprint: rvpn_tls::TlsFingerprint::Chrome,
         identity_key: Arc::new(client.identity_key().clone()),
         server_bundle: client.server_bundle().clone(),
+        // Share the default session's resumption store so /dns reconnects
+        // resume from the tickets the tunnel connection earned.
+        resumption: Some(client.resumption_store()),
     };
 
     let doh_client = Arc::new(DohClient::new(flow_config, dns_path));
@@ -727,6 +752,43 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::R
     doh_client.start().await?;
 
     info!("[IOS_TUN_FFI] DoH client started, connecting to {}/dns", base_path);
+
+    // Multi-server: one extra DoH client per secondary exit, each with its
+    // own persistent /dns WebSocket to that exit (same X3DH + ratchet
+    // pattern, per-exit prekey bundle). A failed extra exit must not take
+    // down the default proxy — log and continue without it (routed queries
+    // for that exit will ServFail rather than silently use the default).
+    let mut extra_doh_clients: std::collections::HashMap<String, Arc<DohClient>> =
+        std::collections::HashMap::new();
+    let extra_dns_info = client.extra_session_dns_info();
+    // The exit servers' own hostnames must always bypass the tunnel in the
+    // DNS layer — the reconnect path resolves them while the tunnel is down.
+    let mut server_hostnames: Vec<String> = vec![client.server_host().to_string()];
+    server_hostnames.extend(extra_dns_info.iter().map(|(_, host, _, _, _, _)| host.clone()));
+    for (name, host, port, base_path, bundle, resumption) in extra_dns_info {
+        let dns_path = format!("{}/dns", base_path.trim_end_matches("/tun").trim_end_matches('/'));
+        let flow_config = FlowConnectorConfig {
+            server_host: host,
+            server_port: port,
+            server_path: dns_path.clone(),
+            tls_fingerprint: rvpn_tls::TlsFingerprint::Chrome,
+            identity_key: Arc::new(client.identity_key().clone()),
+            server_bundle: bundle,
+            // This exit session's own store — shared with its tunnel session.
+            resumption: Some(resumption),
+        };
+        let doh = Arc::new(DohClient::new(flow_config, dns_path));
+        doh.clone().start_cleanup_task();
+        match doh.start().await {
+            Ok(()) => {
+                info!("[IOS_TUN_FFI] DoH client for exit '{}' started", name);
+                extra_doh_clients.insert(name, doh);
+            }
+            Err(e) => {
+                error!("[IOS_TUN_FFI] DoH client for exit '{}' failed to start: {}", name, e);
+            }
+        }
+    }
 
     let split_tunnel_config = SplitTunnelConfig {
         enabled: true,
@@ -740,11 +802,27 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::R
     dns_resolver.start_cleanup_task();
     let split_tunnel = SplitTunnel::new(split_tunnel_config, dns_resolver).await?;
 
-    let dns_server = Arc::new(DnsServer::with_doh(
+    let mut dns_server = DnsServer::with_doh(
         split_tunnel,
         doh_client,
         client.get_dns_bind_addr().to_string(),
-    ));
+    );
+    dns_server.set_server_hostnames(server_hostnames);
+
+    // Wire multi-server routing into the DNS layer. The pre-warm hook holds
+    // a Weak<IosTunClient> so the DNS proxy task never keeps the client (or
+    // transitively the runtime's tasks) alive after rvpn_tun_destroy.
+    if let (Some(router), Some(route_map)) = (client.router(), client.route_map()) {
+        let weak = Arc::downgrade(client);
+        let prewarm: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |exit: &str| {
+            if let Some(client) = weak.upgrade() {
+                client.ensure_session_started(exit);
+            }
+        });
+        dns_server.set_multi_exit(router, extra_doh_clients, route_map, prewarm);
+        info!("[IOS_TUN_FFI] DNS proxy: multi-server exit routing enabled");
+    }
+    let dns_server = Arc::new(dns_server);
 
     info!(
         "[IOS_TUN_FFI] DNS server created, starting on {}",
@@ -831,7 +909,8 @@ pub extern "C" fn rvpn_tun_get_mtu() -> c_int {
 /// reconnect TCP SYN packets from being routed through the dead TUN interface.
 ///
 /// # Returns
-/// C string with IP address (e.g., "113.52.134.101") or null if not initialized
+/// C string with IP address (e.g., "113.52.134.101"), or null if not initialized
+/// or if startup resolution failed (connects then dial the hostname).
 /// Caller must free with rvpn_free_string()
 #[no_mangle]
 pub extern "C" fn rvpn_tun_get_server_ip() -> *mut c_char {
@@ -840,7 +919,10 @@ pub extern "C" fn rvpn_tun_get_server_ip() -> *mut c_char {
         None => return std::ptr::null_mut(),
     };
 
-    let ip_str = client.server_ip().to_string();
+    let ip_str = match client.server_ip() {
+        Some(ip) => ip.to_string(),
+        None => return std::ptr::null_mut(),
+    };
     match CString::new(ip_str) {
         Ok(c_str) => c_str.into_raw(),
         Err(_) => std::ptr::null_mut(),
@@ -872,6 +954,42 @@ pub extern "C" fn rvpn_tun_get_server_identity() -> *mut c_char {
     match CString::new(pin) {
         Ok(c_str) => c_str.into_raw(),
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Return the canonical TOFU pin (`ik:1:<base32>`) of a NAMED exit server
+/// (`"default"` or a name from `extraServers`). Lets apps implement per-exit
+/// TOFU pinning for multi-server profiles: read each exit's pin after first
+/// connect, persist it, and pass it back as that exit's `serverIdentityPin`.
+///
+/// # Returns
+/// Non-empty C string on success. Null pointer if no client exists, the name
+/// is null/invalid UTF-8, or no session exists under that name.
+///
+/// Caller must free the returned pointer with `rvpn_free_string`.
+///
+/// # Safety
+/// `name` must be a valid null-terminated C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn rvpn_tun_get_server_identity_for(name: *const c_char) -> *mut c_char {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
+    let name = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let client = match TUN_CLIENT.lock().unwrap().as_ref() {
+        Some(c) => c.clone(),
+        None => return std::ptr::null_mut(),
+    };
+
+    match client.server_identity_pin_for(name) {
+        Some(pin) => match CString::new(pin) {
+            Ok(c_str) => c_str.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        None => std::ptr::null_mut(),
     }
 }
 
@@ -1122,7 +1240,7 @@ pub extern "C" fn rvpn_tun_stop() -> c_int {
         }
     }
 
-    // Abort the local DNS proxy task if running (macOS; iOS never starts it)
+    // Abort the local DNS proxy task if running
     #[cfg(feature = "dns")]
     {
         let mut guard = DNS_PROXY_HANDLE.lock().unwrap();

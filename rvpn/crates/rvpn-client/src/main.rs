@@ -28,6 +28,7 @@ mod stream_relay;
 // TLS re-exported from rvpn-tls crate
 mod tun;
 mod tunnel;
+mod tunnel_pool;
 mod websocket;
 
 // Use mimalloc as the global allocator: glibc malloc arenas retain memory
@@ -313,6 +314,7 @@ async fn run_socks5(config: ClientConfig) -> Result<()> {
             proxy.split_tunnel(),
             proxy.dns_resolver(),
             proxy.mux_tunnel(),
+            proxy.tunnel_pools(),
             proxy.pool(),
             proxy.router(),
         )
@@ -374,6 +376,11 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
     let mut reconnect_attempts: u32 = 0;
     let tun_config = config.tun.clone();
 
+    // TLS session resumption store for the single TUN-mode server. Held here
+    // (outside the reconnect loop) so every reconnect offers the cached TLS
+    // 1.3 ticket instead of paying a full handshake.
+    let resumption_store = rvpn_tls::ResumptionStore::new();
+
     // Set up signal handling for graceful shutdown
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -405,6 +412,7 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
             &config.identity_key_file,
             config.prekey_bundle.as_deref(),
             &config.server_identity,
+            Some(&resumption_store),
         )
         .await
         {

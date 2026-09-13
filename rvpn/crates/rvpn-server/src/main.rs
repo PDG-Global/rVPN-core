@@ -25,6 +25,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
+use rvpn_server::decoy::{parse_request_head, DecoyServer, RequestHead, RewindStream};
 use rvpn_server::handler::{DnsHandler, MultiplexerHandler, TunHandler, VpnHandler};
 
 #[tokio::main]
@@ -104,6 +105,26 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     let dns_handler = Arc::new(RwLock::new(DnsHandler::new(config.clone())?));
     let mux_handler = Arc::new(RwLock::new(MultiplexerHandler::new(config.clone())?));
 
+    // Decoy static site for non-VPN HTTPS requests (active-probing mask).
+    // When absent or unusable, non-WebSocket requests keep the historical
+    // behavior: connection closed right after the TLS handshake.
+    let decoy = match config.decoy_root.as_ref() {
+        Some(root) => match DecoyServer::new(root) {
+            Ok(server) => {
+                info!("Decoy site enabled, serving {:?}", root);
+                Some(Arc::new(server))
+            }
+            Err(e) => {
+                warn!(
+                    "decoy_root {:?} is unusable: {}. Non-WebSocket requests will be dropped.",
+                    root, e
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     // Path for TUN-mode mobile connections
     let tun_path = format!("{}/tun", config.websocket_path.trim_end_matches('/'));
     // Path for DNS-over-WebSocket connections
@@ -178,6 +199,7 @@ async fn run_server(config: ServerConfig) -> Result<()> {
         let dns_handler = dns_handler.clone();
         let mux_handler = mux_handler.clone();
         let tun_server = tun_server.clone();
+        let decoy = decoy.clone();
         let ws_path = config.websocket_path.clone();
         let tun_path = tun_path.clone();
         let dns_path = dns_path.clone();
@@ -185,7 +207,23 @@ async fn run_server(config: ServerConfig) -> Result<()> {
         let tls_acceptor = tls_acceptor.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer_addr, handler, tun_handler, dns_handler, mux_handler, tun_server, ws_path, tun_path, dns_path, mux_path, tls_acceptor).await {
+            if let Err(e) = handle_connection(
+                stream,
+                peer_addr,
+                handler,
+                tun_handler,
+                dns_handler,
+                mux_handler,
+                tun_server,
+                decoy,
+                ws_path,
+                tun_path,
+                dns_path,
+                mux_path,
+                tls_acceptor,
+            )
+            .await
+            {
                 debug!("Connection error from {}: {}", peer_addr, e);
             }
         });
@@ -664,6 +702,7 @@ async fn handle_connection(
     dns_handler: Arc<RwLock<DnsHandler>>,
     mux_handler: Arc<RwLock<MultiplexerHandler>>,
     _tun_server: Arc<tokio::sync::RwLock<rvpn_server::tun_server::TunServer>>,
+    decoy: Option<Arc<DecoyServer>>,
     ws_path: String,
     tun_path: String,
     dns_path: String,
@@ -691,10 +730,131 @@ async fn handle_connection(
     } else {
         Box::new(stream)
     };
-    
-    // Try WebSocket upgrade with path detection
-    debug!("Attempting WebSocket upgrade for {}", peer_addr);
 
+    // When a decoy site is configured, pre-read the HTTP request head so
+    // non-WebSocket requests are answered with static files instead of a
+    // dropped connection (which is an active-probing tell). WebSocket
+    // upgrades — to VPN paths or otherwise — still go through tungstenite
+    // unchanged, replaying the buffered head via RewindStream so no bytes
+    // are lost. Without a decoy, hand the stream straight to tungstenite
+    // exactly as before.
+    if let Some(decoy) = decoy {
+        let mut stream = stream;
+        match pre_read_head(&mut stream).await {
+            HeadVerdict::WebSocket(buffered) => {
+                debug!("WebSocket upgrade from {} (decoy pre-read)", peer_addr);
+                let stream = RewindStream::new(buffered, stream);
+                accept_and_dispatch_ws(
+                    stream,
+                    peer_addr,
+                    handler,
+                    tun_handler,
+                    dns_handler,
+                    mux_handler,
+                    ws_path,
+                    tun_path,
+                    dns_path,
+                    mux_path,
+                )
+                .await
+            }
+            HeadVerdict::Http(buffered) => {
+                if let Err(e) = decoy.serve(&mut stream, buffered).await {
+                    debug!("Decoy HTTP error from {}: {}", peer_addr, e);
+                }
+                Ok(())
+            }
+            HeadVerdict::Drop => Ok(()),
+        }
+    } else {
+        debug!("Attempting WebSocket upgrade for {}", peer_addr);
+        accept_and_dispatch_ws(
+            stream,
+            peer_addr,
+            handler,
+            tun_handler,
+            dns_handler,
+            mux_handler,
+            ws_path,
+            tun_path,
+            dns_path,
+            mux_path,
+        )
+        .await
+    }
+}
+
+/// Timeout for reading the initial HTTP request head when a decoy site is
+/// configured. VPN clients send the WebSocket handshake immediately after
+/// TLS, so this only bites probers that connect and stay silent.
+const HEAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Outcome of pre-reading the HTTP request head on a decoy-enabled port.
+enum HeadVerdict {
+    /// Well-formed WebSocket upgrade; replay these bytes into tungstenite.
+    WebSocket(Vec<u8>),
+    /// Plain HTTP request; serve from the decoy site.
+    Http(Vec<u8>),
+    /// EOF, timeout, oversized, or malformed head — close silently.
+    Drop,
+}
+
+/// Read from the stream until a complete HTTP request head has been
+/// buffered, then classify it.
+async fn pre_read_head<S>(stream: &mut S) -> HeadVerdict
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut scratch = [0u8; 8192];
+
+    let read_head = async {
+        loop {
+            if let Some(head) = parse_request_head(&buf) {
+                return Some(head);
+            }
+            if buf.len() >= rvpn_server::decoy::MAX_HEADER_SIZE {
+                return None;
+            }
+            match stream.read(&mut scratch).await {
+                Ok(0) => return None,
+                Ok(n) => buf.extend_from_slice(&scratch[..n]),
+                Err(_) => return None,
+            }
+        }
+    };
+
+    let head: Option<RequestHead> = tokio::time::timeout(HEAD_READ_TIMEOUT, read_head)
+        .await
+        .ok()
+        .flatten();
+
+    match head {
+        Some(h) if h.is_websocket_upgrade => HeadVerdict::WebSocket(buf),
+        Some(_) => HeadVerdict::Http(buf),
+        None => HeadVerdict::Drop,
+    }
+}
+
+/// Perform the WebSocket handshake and route the connection to the VPN
+/// handler for its path. Unknown paths are accepted then dropped, exactly
+/// as before.
+#[allow(clippy::too_many_arguments)]
+async fn accept_and_dispatch_ws<S>(
+    stream: S,
+    peer_addr: SocketAddr,
+    handler: Arc<RwLock<VpnHandler>>,
+    tun_handler: Arc<RwLock<TunHandler>>,
+    dns_handler: Arc<RwLock<DnsHandler>>,
+    mux_handler: Arc<RwLock<MultiplexerHandler>>,
+    ws_path: String,
+    tun_path: String,
+    dns_path: String,
+    mux_path: String,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     // Track the request path using std::sync::Mutex since the callback is synchronous
     let request_path = Arc::new(std::sync::Mutex::new(String::new()));
     let request_path_clone = request_path.clone();
@@ -707,15 +867,15 @@ async fn handle_connection(
         }
         Ok(response)
     };
-    
+
     let ws_result = tokio_tungstenite::accept_hdr_async(stream, callback).await;
-    
+
     match ws_result {
         Ok(ws) => {
             // WebSocket upgrade successful
             let path = request_path.lock().unwrap().clone();
             info!("WebSocket upgrade accepted from {} on path: {}", peer_addr, path);
-            
+
             // Route based on path
             if path == tun_path || path.starts_with(&format!("{}/", tun_path)) {
                 if let Err(e) = tun_handler.read().await.handle_connection(ws, peer_addr).await {
@@ -738,7 +898,7 @@ async fn handle_connection(
                 // Unknown path - close connection
                 warn!("WebSocket connection on unknown path '{}' from {}", path, peer_addr);
             }
-            
+
             info!("Connection from {} closed", peer_addr);
         }
         Err(e) => {
@@ -746,7 +906,7 @@ async fn handle_connection(
             debug!("Not a WebSocket from {}: {}", peer_addr, e);
         }
     }
-    
+
     Ok(())
 }
 

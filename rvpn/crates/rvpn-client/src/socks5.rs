@@ -10,10 +10,13 @@
 
 //! SOCKS5 Proxy Server
 //!
-//! Supports two modes:
-//! - **Multiplexed** (default): All SOCKS5 flows share a single WebSocket with one
-//!   DoubleRatchet. Lower overhead, no per-connection handshakes, bypasses rate limits.
-//! - **Legacy**: Each SOCKS5 flow opens its own WebSocket + X3DH handshake (StreamRelay).
+//! Supports three tunnel modes (`socks5.mode`):
+//! - **Legacy** (default): Each SOCKS5 flow opens its own WebSocket + X3DH
+//!   handshake (StreamRelay).
+//! - **Multiplexed**: All SOCKS5 flows share a single WebSocket with one
+//!   DoubleRatchet. Lower overhead, no per-connection handshakes.
+//! - **Pooled**: A per-exit pool of multiplexed WebSockets; flows are striped
+//!   least-loaded across the pool with background pre-warm (tunnel_pool.rs).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,7 +29,7 @@ use tracing::{info, debug, error, warn};
 
 use rvpn_core::crypto::{IdentityKey, X3DHPublicBundle};
 
-use crate::config::{ClientConfig, Socks5Config, ServerIdentityConfig};
+use crate::config::{ClientConfig, ServerIdentityConfig, Socks5Config, Socks5Mode};
 use crate::proxy_common::{self, ProxyHandle};
 use crate::router::Router;
 use crate::server_pool::ServerPool;
@@ -34,6 +37,7 @@ use crate::split_tunnel::SplitTunnel;
 use rvpn_tls::TlsFingerprint;
 use crate::socks5_tunnel::Socks5Tunnel;
 use crate::dns_cache::DnsResolver;
+use crate::tunnel_pool::TunnelPools;
 
 /// SOCKS5 Proxy server
 pub struct Socks5Proxy {
@@ -49,34 +53,55 @@ pub struct Socks5Proxy {
     split_tunnel: Arc<SplitTunnel>,
     socks5_config: Socks5Config,
     mux_tunnel: Arc<Mutex<Option<Arc<Socks5Tunnel>>>>,
+    tunnel_pools: Option<Arc<TunnelPools>>,
     dns_resolver: Arc<DnsResolver>,
     pool: Arc<ServerPool>,
     router: Arc<Router>,
+    mode: Socks5Mode,
 }
 
 impl Socks5Proxy {
     pub async fn new(listen_addr: SocketAddr, config: &ClientConfig) -> Result<Self> {
         let key_path = config.identity_key_file.clone();
-        let identity_key = tokio::task::spawn_blocking(move || IdentityKey::load(&key_path))
-            .await
-            .context("Identity key load task failed")?
-            .context("Failed to load identity key")?;
+        let identity_key = Arc::new(
+            tokio::task::spawn_blocking(move || IdentityKey::load(&key_path))
+                .await
+                .context("Identity key load task failed")?
+                .context("Failed to load identity key")?,
+        );
 
         // Build the multi-server pool (the default server + any [[server]]
         // entries). Fails fast if a referenced bundle can't be loaded.
         let pool = Arc::new(ServerPool::from_config(config).await?);
-        let router = Arc::new(Router::build(&pool, &config.routing)?);
+        let router = Arc::new(Router::build(&pool.names(), &config.routing)?);
 
-        // Multiplex mode currently maintains a single shared tunnel; combining
-        // it with multi-server routing would need a per-server tunnel map,
-        // which is out of scope for this pass. Refuse the combination up
-        // front rather than silently ignoring the routing table.
-        if config.socks5.multiplex && pool.extra_count() > 0 {
+        let mode = config.socks5.effective_mode();
+
+        // Single-pipe multiplex mode maintains one shared tunnel to the
+        // default server; combining it with multi-server routing would need
+        // a per-server tunnel map. Pooled mode solves this properly with
+        // per-exit pools, so the refusal applies to multiplex mode only.
+        if mode == Socks5Mode::Multiplex && pool.extra_count() > 0 {
             anyhow::bail!(
                 "multi-server routing is not supported in multiplex mode; \
-                 either remove `[[server]]` entries or set `socks5.multiplex = false`"
+                 either remove `[[server]]` entries, set `socks5.mode = \"pooled\"`, \
+                 or set `socks5.mode = \"legacy\"`"
             );
         }
+
+        // Pooled mode: one lazily-filled tunnel pool per exit server.
+        let tunnel_pools = if mode == Socks5Mode::Pooled {
+            config.socks5.validate_pool()?;
+            let pools = TunnelPools::from_server_pool(
+                &pool,
+                &config.socks5,
+                Arc::clone(&identity_key),
+                config.tls_fingerprint,
+            );
+            Some(Arc::new(pools))
+        } else {
+            None
+        };
 
         // Default server metadata for the legacy accessors below (dns_proxy,
         // http_proxy still consult the default). These fields duplicate what
@@ -145,15 +170,17 @@ impl Socks5Proxy {
             server_path: default_server.path.clone(),
             tls_fingerprint: config.tls_fingerprint,
             sni_hostname: config.sni_hostname.clone(),
-            identity_key: Arc::new(identity_key),
+            identity_key,
             server_bundle: Arc::new(server_bundle),
             server_identity: config.server_identity.clone(),
             split_tunnel,
             socks5_config: config.socks5.clone(),
             mux_tunnel: Arc::new(Mutex::new(None)),
+            tunnel_pools,
             dns_resolver,
             pool,
             router,
+            mode,
         })
     }
 
@@ -169,6 +196,7 @@ impl Socks5Proxy {
     pub fn split_tunnel(&self) -> Arc<SplitTunnel> { Arc::clone(&self.split_tunnel) }
     pub fn dns_resolver(&self) -> Arc<DnsResolver> { Arc::clone(&self.dns_resolver) }
     pub fn mux_tunnel(&self) -> Arc<Mutex<Option<Arc<Socks5Tunnel>>>> { Arc::clone(&self.mux_tunnel) }
+    pub fn tunnel_pools(&self) -> Option<Arc<TunnelPools>> { self.tunnel_pools.clone() }
     pub fn pool(&self) -> Arc<ServerPool> { Arc::clone(&self.pool) }
     pub fn router(&self) -> Arc<Router> { Arc::clone(&self.router) }
 
@@ -201,9 +229,10 @@ impl Socks5Proxy {
                 server_bundle: Arc::clone(&self.server_bundle),
                 server_identity: self.server_identity.clone(),
                 split_tunnel: Arc::clone(&self.split_tunnel),
-                multiplex: self.socks5_config.multiplex,
+                mode: self.mode,
                 mux_path: self.socks5_config.mux_path.clone(),
                 mux_tunnel: self.mux_tunnel.clone(),
+                tunnel_pools: self.tunnel_pools.clone(),
                 pool: Arc::clone(&self.pool),
                 router: Arc::clone(&self.router),
             };

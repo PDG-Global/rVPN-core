@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use rvpn_core::crypto::{IdentityKey, X3DHPublicBundle};
 
-use crate::config::{ClientConfig, HttpProxyConfig, ServerIdentityConfig};
+use crate::config::{ClientConfig, HttpProxyConfig, ServerIdentityConfig, Socks5Mode};
 use crate::proxy_common::{self, ProxyHandle};
 use crate::router::Router;
 use crate::server_pool::ServerPool;
@@ -29,6 +29,7 @@ use crate::split_tunnel::{RoutingDecision, SplitTunnel};
 use rvpn_tls::TlsFingerprint;
 use crate::socks5_tunnel::Socks5Tunnel;
 use crate::dns_cache::DnsResolver;
+use crate::tunnel_pool::TunnelPools;
 
 /// HTTP/HTTPS Proxy server
 pub struct HttpProxy {
@@ -44,6 +45,8 @@ pub struct HttpProxy {
     split_tunnel: Arc<SplitTunnel>,
     http_config: HttpProxyConfig,
     mux_tunnel: Arc<Mutex<Option<Arc<Socks5Tunnel>>>>,
+    tunnel_pools: Option<Arc<TunnelPools>>,
+    mode: Socks5Mode,
     pool: Arc<ServerPool>,
     router: Arc<Router>,
 }
@@ -58,12 +61,25 @@ impl HttpProxy {
         split_tunnel: Arc<SplitTunnel>,
         dns_resolver: Arc<DnsResolver>,
         mux_tunnel: Arc<Mutex<Option<Arc<Socks5Tunnel>>>>,
+        tunnel_pools: Option<Arc<TunnelPools>>,
         pool: Arc<ServerPool>,
         router: Arc<Router>,
     ) -> Result<Self> {
         let (host, port, path) = parse_server_url(&config.server_address);
 
         dns_resolver.start_cleanup_task();
+
+        // The HTTP CONNECT path shares `proxy_common::route_connection` with
+        // SOCKS5, so pooled SOCKS5 mode applies here automatically. The
+        // legacy `http_proxy.multiplex` bool still forces single-pipe mode.
+        let mode = if config.http_proxy.multiplex {
+            Socks5Mode::Multiplex
+        } else {
+            match config.socks5.effective_mode() {
+                Socks5Mode::Pooled => Socks5Mode::Pooled,
+                _ => Socks5Mode::Legacy,
+            }
+        };
 
         Ok(Self {
             listen_addr,
@@ -78,6 +94,8 @@ impl HttpProxy {
             split_tunnel,
             http_config: config.http_proxy.clone(),
             mux_tunnel,
+            tunnel_pools,
+            mode,
             pool,
             router,
         })
@@ -113,9 +131,10 @@ impl HttpProxy {
                 server_bundle: Arc::clone(&self.server_bundle),
                 server_identity: self.server_identity.clone(),
                 split_tunnel: Arc::clone(&self.split_tunnel),
-                multiplex: self.http_config.multiplex,
+                mode: self.mode,
                 mux_path: self.http_config.mux_path.clone(),
                 mux_tunnel: self.mux_tunnel.clone(),
+                tunnel_pools: self.tunnel_pools.clone(),
                 pool: Arc::clone(&self.pool),
                 router: Arc::clone(&self.router),
             };
@@ -440,6 +459,12 @@ async fn forward_through_mux_tunnel(
         }
 
         if guard.is_none() {
+            // Same as proxy_common::handle_tunnel_multiplexed: the tunnel
+            // always dials the default exit, so use that exit's resumption
+            // store to let reconnects resume the TLS session.
+            let default_server = proxy
+                .pool
+                .get_or_default(crate::server_pool::DEFAULT_SERVER_NAME);
             let t = Socks5Tunnel::connect(
                 &proxy.server_host,
                 proxy.server_port,
@@ -449,6 +474,7 @@ async fn forward_through_mux_tunnel(
                 &proxy.identity_key,
                 &proxy.server_bundle,
                 Some(&proxy.server_identity),
+                Some(&default_server.resumption),
             )
             .await
             .context("Failed to create multiplexed tunnel")?;
@@ -462,6 +488,7 @@ async fn forward_through_mux_tunnel(
         .await
         .context("Failed to open mux flow")?;
 
+    let flow_id = flow.flow_id;
     let send_tx = flow.take_send().unwrap();
     let mut recv_rx = flow.take_recv().unwrap();
 
@@ -483,6 +510,8 @@ async fn forward_through_mux_tunnel(
     let socket = reader.get_mut();
     while let Some(data) = recv_rx.recv().await {
         socket.write_all(&data).await?;
+        // Flow control: grant the server credits for the consumed bytes.
+        tunnel.send_window_update(flow_id, data.len() as u32).await;
     }
 
     Ok(())

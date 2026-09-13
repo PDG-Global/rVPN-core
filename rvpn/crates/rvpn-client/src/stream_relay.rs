@@ -22,7 +22,7 @@ use rvpn_core::protocol::HandshakeMessage;
 
 use crate::config::ServerIdentityConfig;
 use crate::identity_verification::{verify_server_identity, KnownHosts, VerificationResult};
-use rvpn_tls::TlsFingerprint;
+use rvpn_tls::{ResumptionStore, TlsFingerprint};
 use crate::websocket::{connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter};
 
 /// Brook-style stream relay for one SOCKS5 connection
@@ -44,6 +44,8 @@ impl StreamRelay {
     /// * `identity_key` - Client's identity key for X3DH
     /// * `server_bundle` - Server's X3DH prekey bundle
     /// * `server_identity_config` - Server identity verification config
+    /// * `resumption` - Per-exit TLS session resumption store (reconnects
+    ///   resume the cached TLS 1.3 ticket instead of a full handshake)
     ///
     /// # Returns
     /// A tuple of (StreamRelay, WebSocketReader, WebSocketWriter, WebSocketTaskHandle)
@@ -59,11 +61,12 @@ impl StreamRelay {
         identity_key: &Arc<IdentityKey>,
         server_bundle: &X3DHPublicBundle,
         server_identity_config: Option<&ServerIdentityConfig>,
+        resumption: Option<&ResumptionStore>,
     ) -> Result<(Self, WebSocketReader, WebSocketWriter, crate::websocket::WebSocketTaskHandle)> {
         info!("Connecting StreamRelay to {}:{}{}", host, port, path);
 
         // Step 1: Establish WebSocket connection
-        let ws_stream = connect_websocket(host, port, path, fingerprint, sni_hostname)
+        let ws_stream = connect_websocket(host, port, path, fingerprint, sni_hostname, resumption)
             .await
             .context("Failed to establish WebSocket connection")?;
 
