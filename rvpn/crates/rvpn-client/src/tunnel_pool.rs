@@ -411,6 +411,8 @@ fn spawn_connect<T: PoolTunnel>(ctx: PoolCtx<T>, inner: &mut PoolInner<T>, delay
         let Some(inner_arc) = ctx.inner.upgrade() else {
             return;
         };
+        // Handshake timing is recorded inside Socks5Tunnel::connect (shared
+        // by mux and pooled paths) — do not add a second probe here.
         let result = (ctx.connector)().await;
         let mut guard = inner_arc.lock().await;
         guard.connecting = guard.connecting.saturating_sub(1);
@@ -468,6 +470,9 @@ fn spawn_watcher<T: PoolTunnel>(ctx: PoolCtx<T>, tunnel: &Arc<T>) {
                         pruned,
                         guard.tunnels.len()
                     );
+                    for _ in 0..pruned {
+                        crate::dashboard::record_reconnect();
+                    }
                     ensure_target(&ctx, &mut guard);
                 }
                 return;
@@ -496,6 +501,7 @@ fn spawn_watcher<T: PoolTunnel>(ctx: PoolCtx<T>, tunnel: &Arc<T>) {
                     entry.draining = true;
                     entry.draining_since = Some(tokio::time::Instant::now());
                     guard.rotations += 1;
+                    crate::dashboard::record_reconnect();
                     info!(
                         "pool '{}': tunnel hit rotation threshold (age {:.0}s, {} bytes) — draining",
                         ctx.name,

@@ -117,6 +117,7 @@ pub async fn route_connection(
     target_addr: &str,
     proxy: &ProxyHandle,
 ) -> Result<()> {
+    crate::dashboard::record_conn_accepted();
     let (target_host, target_port) = parse_target(target_addr)?;
 
     // Split tunnel decision
@@ -154,17 +155,26 @@ pub async fn route_connection(
     match final_decision {
         RoutingDecision::Bypass => {
             info!("Bypassing VPN for {}:{}", target_host, target_port);
-            handle_direct_connection(socket, &target_host, target_port).await?;
+            crate::dashboard::record_conn_bypassed();
+            let result = handle_direct_connection(socket, &target_host, target_port).await;
+            crate::dashboard::record_conn_completed();
+            result?;
         }
-        RoutingDecision::Tunnel => match proxy.mode {
-            Socks5Mode::Multiplex => {
-                handle_tunnel_multiplexed(socket, addr, target_addr, proxy).await?
-            }
-            Socks5Mode::Pooled => handle_tunnel_pooled(socket, addr, target_addr, proxy).await?,
-            Socks5Mode::Legacy => handle_tunnel_legacy(socket, addr, target_addr, proxy).await?,
-        },
+        RoutingDecision::Tunnel => {
+            crate::dashboard::record_conn_tunneled();
+            let result = match proxy.mode {
+                Socks5Mode::Multiplex => {
+                    handle_tunnel_multiplexed(socket, addr, target_addr, proxy).await
+                }
+                Socks5Mode::Pooled => handle_tunnel_pooled(socket, addr, target_addr, proxy).await,
+                Socks5Mode::Legacy => handle_tunnel_legacy(socket, addr, target_addr, proxy).await,
+            };
+            crate::dashboard::record_conn_completed();
+            result?;
+        }
         RoutingDecision::Block => {
             info!("Blocking ad/tracker: {}:{}", target_host, target_port);
+            crate::dashboard::record_conn_blocked();
             // Caller should handle sending an error response to the client before
             // calling route_connection, but if we get here the socket is just dropped.
         }
@@ -189,10 +199,12 @@ async fn handle_direct_connection(
     let (mut client_read, mut client_write) = socket.split();
     let (mut target_read, mut target_write) = target.split();
 
-    tokio::try_join!(
+    let (up, down) = tokio::try_join!(
         tokio::io::copy(&mut client_read, &mut target_write),
         tokio::io::copy(&mut target_read, &mut client_write)
     )?;
+    crate::dashboard::record_bytes_up(up);
+    crate::dashboard::record_bytes_down(down);
 
     Ok(())
 }

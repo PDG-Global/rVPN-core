@@ -50,8 +50,30 @@ use crate::ios_tun::{
 #[cfg(feature = "diagnostics")]
 use crate::ios_tun::{
     all_zones_size_in_use, get_rss_bytes, jetsam_headroom_bytes, mi_commit_after_collect,
-    mi_committed_bytes, mi_peak_commit_bytes, vm_internal_compressed,
+    mi_committed_bytes, mi_peak_commit_bytes, vm_internal_compressed, zone_sizes_str,
 };
+
+/// Extended memory stats for the per-session reconnect log lines. Separates
+/// Rust heap (mimalloc commit), C heap (all malloc zones), and anonymous VM
+/// (internal/compressed) so an overnight soak shows exactly which space
+/// grows per reconnect. Empty string in non-diagnostics builds.
+#[cfg(feature = "diagnostics")]
+fn mem_stats_suffix() -> String {
+    let (internal, compressed) = vm_internal_compressed();
+    format!(
+        " commit={}KB allzones={}KB internal={}KB compressed={}KB zones=[{}]",
+        mi_committed_bytes() / 1024,
+        all_zones_size_in_use() / 1024,
+        internal / 1024,
+        compressed / 1024,
+        zone_sizes_str(),
+    )
+}
+/// No-op without the diagnostics feature — see above.
+#[cfg(not(feature = "diagnostics"))]
+fn mem_stats_suffix() -> String {
+    String::new()
+}
 
 /// WebSocket writer type.
 ///
@@ -237,6 +259,10 @@ pub(crate) struct ServerSession {
     /// control frames, so Swift can distinguish a healthy idle tunnel from
     /// a suspended/dead one.
     last_rx_time: Arc<AtomicU64>,
+    /// Monotonic counter bumped alongside `last_rx_time` on every received
+    /// frame. The keepalive's post-doze probe compares this (not the
+    /// second-granularity timestamp) so a sub-second pong can't be missed.
+    rx_count: Arc<AtomicU64>,
     /// Start/reconnect loop running flag (prevents duplicate loops)
     is_started: AtomicBool,
     /// Reconnection enabled flag
@@ -343,6 +369,7 @@ impl ServerSession {
                     .unwrap_or_default()
                     .as_secs(),
             )),
+            rx_count: Arc::new(AtomicU64::new(0)),
             is_started: AtomicBool::new(false),
             reconnect_enabled: AtomicBool::new(false), // Disabled by default, enable via setter
             reconnect_max_attempts: AtomicU32::new(0),
@@ -402,13 +429,15 @@ impl ServerSession {
                 unsafe {
                     cb(new_state as i32, ip_ptr, msg_ptr);
                 }
-                // Leaking the CStrings here is safe because:
-                // 1. Swift's trampoline copies the strings immediately using String(cString:)
-                // 2. Swift never stores the raw pointers
-                // 3. The memory will be reclaimed when the process exits
-                // Leaking is preferred over from_raw because we don't want Swift to try to free our memory
-                std::mem::forget(ip_cstring);
-                std::mem::forget(msg_cstring);
+                // The CStrings drop here. Safe because Swift's trampoline
+                // copies them with String(cString:) on the calling thread
+                // BEFORE dispatching to its callback queue — it never reads
+                // the raw pointers after this callback returns. (The old
+                // mem::forget leak was paired with a trampoline that copied
+                // AFTER an async hop — simultaneously a leak and a latent
+                // use-after-free.)
+                drop(ip_cstring);
+                drop(msg_cstring);
             }
         }
         self.state.store(new_state as i32, Ordering::SeqCst);
@@ -1547,6 +1576,12 @@ impl ServerSession {
                                 let _ = ws_guard.send_pong(&frame_buf[..len]).await;
                             }
                         }
+                        Ok(Ok((FrameType::Pong, _))) => {
+                            // Pongs prove the round trip works — this is the
+                            // keepalive's post-doze probe signal.
+                            this.update_last_rx_time();
+                            debug!("[IosTun] Server->Swift: received Pong");
+                        }
                         Ok(Err(e)) => {
                             error!("[IosTun] Server->Swift: WebSocket error: {}, sending shutdown and breaking", e);
                             let _ = shutdown_tx.send(());
@@ -1578,6 +1613,7 @@ impl ServerSession {
         send_lock: Arc<Mutex<()>>,
     ) {
         let shutdown_tx = this.shutdown_tx.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the immediate first tick.
@@ -1591,8 +1627,25 @@ impl ServerSession {
         // Must use SystemTime (CLOCK_REALTIME) — Instant (CLOCK_MONOTONIC)
         // pauses during iOS suspension, making elapsed time unreliable.
         let mut last_wall = std::time::SystemTime::now();
+        // Post-doze probe state: (wall-clock when probing started, rx_count
+        // baseline). Set when a >30s suspension is detected; cleared when any
+        // frame arrives (connection survived) or escalated to a reconnect
+        // after the 10s grace with no response.
+        let mut doze_probe: Option<(std::time::SystemTime, u64)> = None;
         loop {
-            interval.tick().await;
+            // Exit promptly when this connection ends via another arm
+            // (tx/rx completing first). Without this the keepalive task
+            // outlives its connection as a zombie: it shares the session's
+            // shutdown_tx and last_rx_time, so after a doze its suspension
+            // detector would fire a shutdown into the LIVE successor
+            // connection — the double-reconnect seen in on-device logs.
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    info!("[IosTun] Keepalive: shutdown received, exiting");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
 
             // Return freed C-heap pages to the OS across ALL malloc zones
             // (default zone alone misses the nano zone where small allocations
@@ -1601,31 +1654,65 @@ impl ServerSession {
             all_zones_pressure_relief();
 
             // Detect process suspension: if wall clock advanced >30s
-            // since last keepalive, iOS froze us and the server's
-            // 60-second timeout already expired. Force reconnect.
+            // since last keepalive, iOS froze us. DO NOT kill the session
+            // outright — a short doze (30-90s, constant on an idle phone)
+            // almost always leaves the TCP/WebSocket alive, and killing the
+            // session at the tail end of a wake window means the process
+            // gets reclaimed before the reconnect can even start (the
+            // overnight dead-tunnel cycle seen on build 19). Instead probe:
+            // the ping below goes out immediately, and we give the
+            // connection PROBE_GRACE wall-clock for ANY inbound frame
+            // (pong, server ping, data) before declaring it dead.
             let now = std::time::SystemTime::now();
             let elapsed = now.duration_since(last_wall).unwrap_or_default();
             last_wall = now;
-            if elapsed > std::time::Duration::from_secs(30) {
-                error!("[IosTun] Keepalive: process was suspended for {:.0}s, connection dead. Reconnecting.", elapsed.as_secs_f64());
-                let _ = shutdown_tx.send(());
-                break;
+            if elapsed > std::time::Duration::from_secs(30) && doze_probe.is_none() {
+                warn!("[IosTun] Keepalive: process was suspended for {:.0}s, probing connection before reconnect...", elapsed.as_secs_f64());
+                doze_probe = Some((now, this.rx_count.load(Ordering::Relaxed)));
             }
 
-            // Check if server is still sending data. If no data received
-            // for 60s, the connection is dead (server closed it, network
-            // changed, etc.). Force reconnect.
-            let rx_elapsed = this.last_rx_time.load(Ordering::Relaxed);
-            if rx_elapsed > 0 {
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+            if let Some((probe_start, rx_baseline)) = doze_probe {
+                if this.rx_count.load(Ordering::Relaxed) > rx_baseline {
+                    info!("[IosTun] Keepalive: connection survived doze, staying connected");
+                    doze_probe = None;
+                } else if now
+                    .duration_since(probe_start)
                     .unwrap_or_default()
-                    .as_secs();
-                let since_rx = now_secs.saturating_sub(rx_elapsed);
-                if since_rx > 30 {
-                    error!("[IosTun] Keepalive: no server data for {}s, connection dead. Reconnecting.", since_rx);
+                    > std::time::Duration::from_secs(10)
+                {
+                    error!("[IosTun] Keepalive: no response after doze, connection dead. Reconnecting.");
+                    // Tell Swift to hold a background assertion BEFORE the
+                    // teardown, so iOS can't suspend the process mid-reconnect
+                    // (the assertion from connect()'s own Connecting state
+                    // arrives too late — the wake window is already closing).
+                    this.notify_state(TunClientState::Connecting, None, "Reconnecting")
+                        .await;
                     let _ = shutdown_tx.send(());
                     break;
+                }
+                // Probe pending: skip the no-RX check below — after a doze,
+                // last_rx_time is stale by definition; the probe deadline
+                // is the arbiter.
+            } else {
+                // Check if server is still sending data. If no data received
+                // for 30s, the connection is dead (server closed it, network
+                // changed, etc.). Force reconnect.
+                let rx_elapsed = this.last_rx_time.load(Ordering::Relaxed);
+                if rx_elapsed > 0 {
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let since_rx = now_secs.saturating_sub(rx_elapsed);
+                    if since_rx > 30 {
+                        error!("[IosTun] Keepalive: no server data for {}s, connection dead. Reconnecting.", since_rx);
+                        // Same pre-teardown assertion request as the
+                        // probe-failed path above.
+                        this.notify_state(TunClientState::Connecting, None, "Reconnecting")
+                            .await;
+                        let _ = shutdown_tx.send(());
+                        break;
+                    }
                 }
             }
 
@@ -1835,6 +1922,7 @@ impl ServerSession {
             .unwrap_or_default()
             .as_secs();
         self.last_rx_time.store(now, Ordering::Relaxed);
+        self.rx_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the last time any traffic was received from the server, in Unix seconds.
@@ -2122,11 +2210,12 @@ impl ServerSession {
                         let rss_after_kb = rss_bytes_now() / 1024;
                         let headroom_after_kb = headroom_bytes_now() / 1024;
                         info!(
-                            "[IosTun] Session ended: rss={}KB (Δ{:+}KB) headroom={}KB (Δ{:+}KB)",
+                            "[IosTun] Session ended: rss={}KB (Δ{:+}KB) headroom={}KB (Δ{:+}KB){}",
                             rss_after_kb,
                             rss_after_kb as i64 - rss_before_kb as i64,
                             headroom_after_kb,
                             headroom_after_kb as i64 - headroom_before_kb as i64,
+                            mem_stats_suffix(),
                         );
                         info!("[IosTun] Connection ended, reconnecting immediately...");
                         attempts = 0;
@@ -2136,13 +2225,14 @@ impl ServerSession {
                         let rss_after_kb = rss_bytes_now() / 1024;
                         let headroom_after_kb = headroom_bytes_now() / 1024;
                         error!(
-                            "[IosTun] Connection failed (attempt {}): {} — rss={}KB (Δ{:+}KB) headroom={}KB (Δ{:+}KB)",
+                            "[IosTun] Connection failed (attempt {}): {:#} — rss={}KB (Δ{:+}KB) headroom={}KB (Δ{:+}KB){}",
                             attempts + 1,
                             e,
                             rss_after_kb,
                             rss_after_kb as i64 - rss_before_kb as i64,
                             headroom_after_kb,
                             headroom_after_kb as i64 - headroom_before_kb as i64,
+                            mem_stats_suffix(),
                         );
                         attempts += 1;
                         // Surface the failure so the app can distinguish

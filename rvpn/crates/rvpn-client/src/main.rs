@@ -11,6 +11,7 @@
 //! R-VPN Client Implementation - Brook-style simplified architecture
 
 mod config;
+mod dashboard;
 mod dns;
 mod dns_cache;
 mod dns_proxy;
@@ -96,6 +97,10 @@ struct Args {
     #[arg(long)]
     fingerprint: Option<String>,
 
+    /// Enable the stats dashboard and set its HTTP listen address (e.g. 127.0.0.1:9800)
+    #[arg(long)]
+    dashboard_listen: Option<String>,
+
     /// Enable verbose logging
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -179,6 +184,10 @@ async fn main() -> Result<()> {
             config.tls_fingerprint = fp;
         }
     }
+    if let Some(dashboard_listen) = args.dashboard_listen {
+        config.dashboard.listen_address = dashboard_listen;
+        config.dashboard.enabled = true;
+    }
 
     // Handle subcommands
     match args.command {
@@ -204,6 +213,89 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Start the stats dashboard (global state + sampler + HTTP listener) when
+/// enabled in the config. The state is created once and stored in the global
+/// handle so the `dashboard::record_*` hook points find it. `shutdown` is
+/// available in TUN mode; SOCKS5 mode runs the dashboard until process exit.
+async fn start_dashboard(
+    config: &ClientConfig,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    if !config.dashboard.enabled {
+        return;
+    }
+
+    let state = match dashboard::global() {
+        Some(s) => s,
+        None => {
+            let s = std::sync::Arc::new(dashboard::DashboardState::new());
+            dashboard::init(std::sync::Arc::clone(&s));
+            s
+        }
+    };
+
+    let listener = match tokio::net::TcpListener::bind(&config.dashboard.listen_address).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(
+                "Failed to bind dashboard listener on {}: {}",
+                config.dashboard.listen_address, e
+            );
+            return;
+        }
+    };
+
+    // Parse the access allowlist; invalid entries are dropped with a warning.
+    let allow: Vec<ip_network::IpNetwork> = config
+        .dashboard
+        .allow_cidrs
+        .iter()
+        .filter_map(|c| match c.parse() {
+            Ok(net) => Some(net),
+            Err(e) => {
+                warn!("Dashboard: ignoring invalid allow_cidrs entry {:?}: {}", c, e);
+                None
+            }
+        })
+        .collect();
+    if allow.is_empty() {
+        warn!("Dashboard: allow_cidrs is empty after parsing — not starting (would 403 everything)");
+        return;
+    }
+    if !config.dashboard.listen_address.starts_with("127.")
+        && !config.dashboard.listen_address.starts_with("[::1]")
+        && config.dashboard.allow_cidrs.iter().all(|c| {
+            c.starts_with("127.") || c.starts_with("::1")
+        })
+    {
+        warn!(
+            "Dashboard: listening on {} but allow_cidrs only covers localhost — \
+             remote clients will get 403",
+            config.dashboard.listen_address
+        );
+    }
+    info!(
+        "Dashboard: http://{}/ (allow: {})",
+        config.dashboard.listen_address,
+        config.dashboard.allow_cidrs.join(", ")
+    );
+    let allow = std::sync::Arc::new(allow);
+
+    match shutdown {
+        Some(rx) => {
+            tokio::spawn(dashboard::run_sampler_until(
+                std::sync::Arc::clone(&state),
+                rx.clone(),
+            ));
+            tokio::spawn(dashboard::serve_until(listener, state, allow, rx));
+        }
+        None => {
+            tokio::spawn(dashboard::run_sampler(std::sync::Arc::clone(&state)));
+            tokio::spawn(dashboard::serve(listener, state, allow));
+        }
+    }
+}
+
 /// Run in SOCKS5 proxy mode (Brook-style)
 async fn run_socks5(config: ClientConfig) -> Result<()> {
     info!("Starting R-VPN Client in SOCKS5 mode (Brook-style)");
@@ -226,6 +318,9 @@ async fn run_socks5(config: ClientConfig) -> Result<()> {
     // Initialize stats manager for historical tracking
     let stats_manager = stats::init_global_stats_manager_with_dir(config.data_dir.clone()).await;
     let _stats_handle = stats_manager.start_collection();
+
+    // Optionally start the stats dashboard (SOCKS5 mode: runs until exit)
+    start_dashboard(&config, None).await;
 
     // Create SOCKS5 proxy (each connection manages its own WebSocket)
     let proxy = Socks5Proxy::new(socks_addr, &config).await?;
@@ -389,6 +484,9 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
         handle_signals(shutdown_tx).await;
     });
 
+    // Optionally start the stats dashboard (exits with the shutdown signal)
+    start_dashboard(&config, Some(shutdown_rx.clone())).await;
+
     // Main reconnection loop
     loop {
         // Check shutdown signal first
@@ -423,7 +521,9 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
             }
             Err(e) => {
                 error!("Failed to connect VPN tunnel: {}", e);
+                // VpnTunnel::connect already recorded handshake_fail; don't double-count.
                 reconnect_attempts += 1;
+                dashboard::record_reconnect();
                 if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
                     error!("Max connection attempts ({}) reached, giving up", MAX_RECONNECT_ATTEMPTS);
                     return Err(anyhow::anyhow!("Failed to connect after {} attempts: {}", MAX_RECONNECT_ATTEMPTS, e));
@@ -511,6 +611,7 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
             Some(Err(e)) => {
                 error!("TUN device error: {}", e);
                 reconnect_attempts += 1;
+                dashboard::record_reconnect();
 
                 if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
                     error!("Max reconnection attempts ({}) reached, giving up", MAX_RECONNECT_ATTEMPTS);

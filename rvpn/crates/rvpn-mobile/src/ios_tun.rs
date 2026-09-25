@@ -163,12 +163,24 @@ pub(crate) fn jetsam_headroom_bytes() -> u64 {
 // NOT stop the leak — so the growth is in another zone (iOS routes small allocs
 // to the nano zone, which `malloc_default_zone()` doesn't cover) or in vm
 // regions. These helpers enumerate ALL zones so we can measure/relief the lot.
+// MUST match <malloc/malloc.h> malloc_statistics_t exactly (32 bytes on
+// 64-bit). An undersized declaration is not a benign truncation:
+// malloc_zone_statistics writes ALL four fields, so a smaller struct is a
+// stack buffer overflow — on arm64 the trailing max_size_in_use /
+// size_allocated writes landed on mem_stats_suffix's saved x28/x27 slots,
+// returning with x28 = 0 and segfaulting the caller's next mach_task_self()
+// read (the reconnect-loop deaths seen in builds 19–21).
 #[cfg(feature = "diagnostics")]
 #[repr(C)]
+#[allow(dead_code)] // blocks_in_use/max_size_in_use/size_allocated are
+// write-only padding for the ABI — the struct must span all 32 bytes even
+// though we only read size_in_use.
 struct MallocStatistics {
-    size_in_use: u32,
-    count: u32,
-    reserved: [u32; 2],
+    blocks_in_use: libc::c_uint,
+    _pad: u32,
+    size_in_use: usize,
+    max_size_in_use: usize,
+    size_allocated: usize,
 }
 
 /// Read `task_vm_info` (flavor 22) raw bytes and extract the `internal` and
@@ -205,6 +217,8 @@ extern "C" {
     fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
     #[cfg(feature = "diagnostics")]
     fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut MallocStatistics);
+    #[cfg(feature = "diagnostics")]
+    fn malloc_get_zone_name(zone: *mut std::ffi::c_void) -> *const libc::c_char;
     // VM region enumeration via mach_vm_region + VM_REGION_EXTENDED_INFO.
     // This flavor gives a clean struct: {protection(4), user_tag(4), pages_resident(4), ...}
     // No submap handling needed — mach_vm_region iterates all regions linearly.
@@ -302,6 +316,43 @@ fn all_zone_ptrs() -> Vec<*mut std::ffi::c_void> {
     }
 }
 
+/// Per-zone live bytes, compact "name=KB" list sorted by size desc, zones
+/// >= 64 KB. The aggregate `all_zones_size_in_use` tells us the C heap grows
+/// per reconnect; THIS tells us which zone owns the growth (e.g. the nano
+/// zone = small ObjC/C allocs, a named helper zone = a specific framework).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn zone_sizes_str() -> String {
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    for zone in all_zone_ptrs() {
+        unsafe {
+            let mut stats = MallocStatistics {
+                blocks_in_use: 0,
+                _pad: 0,
+                size_in_use: 0,
+                max_size_in_use: 0,
+                size_allocated: 0,
+            };
+            malloc_zone_statistics(zone, &mut stats);
+            let name_ptr = malloc_get_zone_name(zone);
+            let name = if name_ptr.is_null() {
+                "?".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(name_ptr)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            entries.push((name, stats.size_in_use as u64));
+        }
+    }
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries
+        .iter()
+        .filter(|(_, s)| *s >= 64 * 1024)
+        .map(|(n, s)| format!("{}={}KB", n, s / 1024))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Ask every malloc zone to release as many freed pages as possible. The default
 /// zone alone does not cover the nano zone (where small BoringSSL allocations
 /// live), so we must relief ALL zones. Non-disruptive (no live allocations,
@@ -320,18 +371,18 @@ pub(crate) fn all_zones_pressure_relief() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn all_zones_size_in_use() -> u64 {
     let mut total = 0u64;
-    let mut stats = MallocStatistics {
-        size_in_use: 0,
-        count: 0,
-        reserved: [0, 0],
-    };
     for zone in all_zone_ptrs() {
+        let mut stats = MallocStatistics {
+            blocks_in_use: 0,
+            _pad: 0,
+            size_in_use: 0,
+            max_size_in_use: 0,
+            size_allocated: 0,
+        };
         unsafe {
-            stats.size_in_use = 0;
-            stats.count = 0;
             malloc_zone_statistics(zone, &mut stats);
-            total += stats.size_in_use as u64;
         }
+        total += stats.size_in_use as u64;
     }
     total
 }

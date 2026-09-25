@@ -38,6 +38,7 @@ pub struct MinimalWebSocket<S> {
 pub enum FrameType {
     Binary,
     Ping,
+    Pong,
     Close,
 }
 
@@ -254,7 +255,7 @@ impl<S: AsyncRead + Unpin> MinimalWsReader<S> {
                 }
                 0x0A => {
                     self.read_buf.drain(..frame_end);
-                    continue;
+                    return Ok((FrameType::Pong, 0));
                 }
                 other => {
                     anyhow::bail!("Unsupported WebSocket opcode: 0x{:02X}", other);

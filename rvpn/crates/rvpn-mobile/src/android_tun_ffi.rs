@@ -10,11 +10,6 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-// Pending state callback - stored here because it's called before TUN client is created
-type StateCallbackType =
-    Option<unsafe extern "C" fn(state: i32, ip: *const c_char, msg: *const c_char)>;
-static PENDING_STATE_CALLBACK: Mutex<StateCallbackType> = Mutex::new(None);
-
 // JNI types are only available on Android
 #[cfg(target_os = "android")]
 use jni::sys::{jclass, jobject, jstring};
@@ -815,15 +810,6 @@ fn create_tun_client_impl(json_str: &str) -> c_int {
         logcat_info!("[Android_TUN_FFI] TUN client created successfully");
     }
 
-    // Apply any pending state callback that was set before the client was created
-    let pending_cb = PENDING_STATE_CALLBACK.lock().clone();
-    if pending_cb.is_some() {
-        if let Some(client) = TUN_CLIENT.lock().clone() {
-            client.set_state_callback(pending_cb);
-            logcat_info!("[Android_TUN_FFI] Pending state callback applied");
-        }
-    }
-
     SUCCESS
 }
 
@@ -1104,21 +1090,6 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunDestroy() {
     *TUN_CLIENT.lock() = None;
     *TUN_RUNTIME.lock() = None;
     logcat_info!("[Android_TUN_FFI] TUN client and runtime cleared");
-}
-
-#[no_mangle]
-pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunSetStateCallback(
-    callback: Option<unsafe extern "C" fn(state: i32, ip: *const c_char, msg: *const c_char)>,
-) {
-    // Store the callback - it will be applied when the client is created
-    let mut pending = PENDING_STATE_CALLBACK.lock();
-    *pending = callback;
-    logcat_info!("[Android_TUN_FFI] State callback stored (will be applied on client creation)");
-
-    // Also try to set it on existing client if any (race condition protection)
-    if let Some(client) = TUN_CLIENT.lock().clone() {
-        client.set_state_callback(callback);
-    }
 }
 
 // ============================================================================

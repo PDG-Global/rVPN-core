@@ -205,6 +205,7 @@ impl Socks5Tunnel {
             "Connecting SOCKS5 multiplexed tunnel to {}:{}{}",
             host, port, path
         );
+        let probe = crate::dashboard::HandshakeProbe::start();
 
         debug!("WebSocket path for mux tunnel: {}", path);
         let ws_stream = connect_websocket(host, port, path, fingerprint, sni_hostname, resumption)
@@ -229,6 +230,7 @@ impl Socks5Tunnel {
         .await?;
 
         info!("SOCKS5 multiplexed tunnel X3DH handshake completed");
+        probe.success();
 
         let ratchet = Arc::new(Mutex::new(ratchet));
 
@@ -977,6 +979,7 @@ pub async fn handle_multiplexed_connection(
                 match n {
                     Ok(0) => break,
                     Ok(n) => {
+                        crate::dashboard::record_bytes_up(n as u64);
                         if send_tx.send(buf[..n].to_vec()).await.is_err() { break; }
                     }
                     Err(_) => break,
@@ -985,6 +988,7 @@ pub async fn handle_multiplexed_connection(
             data = recv_rx.recv() => {
                 match data {
                     Some(d) => {
+                        crate::dashboard::record_bytes_down(d.len() as u64);
                         if client_write.write_all(&d).await.is_err() { break; }
                         // Flow control: grant the server credits for the
                         // bytes just handed to the local application socket.

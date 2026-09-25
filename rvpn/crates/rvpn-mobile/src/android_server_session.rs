@@ -29,7 +29,6 @@ use anyhow::{Context as _, Result};
 use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use futures_util::stream::SplitSink;
-use parking_lot::RwLock;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::time::timeout;
@@ -44,7 +43,7 @@ use rvpn_core::protocol::{
     ControlMessage, HandshakeMessage, MultiplexedFrame, PayloadType, VirtualIp,
 };
 
-use crate::android_tun::{android_log, StateCallback, TunClientState};
+use crate::android_tun::{android_log, TunClientState};
 
 // tun_log!/tun_log_error! come from android_tun.rs via #[macro_use] in lib.rs.
 
@@ -85,9 +84,6 @@ pub(crate) struct AndroidSharedContext {
     pub identity_key: IdentityKey,
     /// Sender for packets to Kotlin (Kotlin receives via recv_packet_from_server)
     pub to_swift_sender: mpsc::Sender<Vec<u8>>,
-    /// State callback for Kotlin notifications (sync RwLock to avoid deadlock
-    /// on the 2-thread runtime)
-    pub state_callback: Arc<RwLock<StateCallback>>,
     /// The primary (default) session's assigned tunnel IPv4 address. Set by
     /// the default session when its VirtualIp arrives. Secondary sessions'
     /// downlink (`run_rx`) rewrites each packet's destination to this address
@@ -230,12 +226,13 @@ impl AndroidServerSession {
         &self.server_identity_pin_actual
     }
 
-    /// Call the state callback if set
+    /// Record a state transition. Kotlin learns state by polling
+    /// `rvpnTunGetState` (see RvpnTunnelService) — the old C state-callback
+    /// path was never wired correctly on the JNI side (Kotlin passed a
+    /// `StateCallback` jobject to a native function whose signature expected
+    /// a C function pointer, with no JNIEnv/jclass params) and was removed;
+    /// it was never invoked in practice.
     async fn notify_state(&self, new_state: TunClientState, ip: Option<&str>, message: &str) {
-        // Only the default session reports to Kotlin — secondary exits are an
-        // internal routing detail; their Connecting/Error churn must not
-        // perturb the app's view of the tunnel (FFI state accessors also read
-        // only the default session).
         if self.is_default {
             tun_log!(
                 "[AndroidTun] notify_state: {:?}, ip={:?}, msg={}",
@@ -243,23 +240,6 @@ impl AndroidServerSession {
                 ip,
                 message
             );
-            let callback = { *self.shared.state_callback.read() };
-            if let Some(cb) = callback {
-                let ip_cstring = ip.map(|s| std::ffi::CString::new(s).unwrap());
-                let msg_cstring = std::ffi::CString::new(message).unwrap();
-                let ip_ptr = ip_cstring
-                    .as_ref()
-                    .map(|s| s.as_ptr())
-                    .unwrap_or(std::ptr::null());
-                let msg_ptr = msg_cstring.as_ptr();
-                unsafe {
-                    cb(new_state as i32, ip_ptr, msg_ptr);
-                }
-                // Leaking the CStrings here is safe: Kotlin's trampoline copies
-                // the strings immediately and never stores the raw pointers.
-                std::mem::forget(ip_cstring);
-                std::mem::forget(msg_cstring);
-            }
         }
         self.state.store(new_state as i32, Ordering::SeqCst);
     }
@@ -1002,12 +982,22 @@ impl AndroidServerSession {
         send_lock: Arc<Mutex<()>>,
     ) {
         let shutdown_tx = this.shutdown_tx.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the immediate first tick.
         interval.tick().await;
         loop {
-            interval.tick().await;
+            // Exit when this connection ends via another arm; otherwise the
+            // keepalive outlives its connection as a zombie holding Arc<Self>
+            // and can fire shutdown into the live successor connection.
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    tun_log!("[AndroidTun] Keepalive: shutdown received, exiting");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
 
             // Serialize encrypt→enqueue against run_tx: a keepalive encrypted
             // after a data batch must not overtake it on the wire, or the
@@ -1460,7 +1450,6 @@ mod tests {
             handle: rt.handle().clone(),
             identity_key: IdentityKey::generate(),
             to_swift_sender,
-            state_callback: Arc::new(RwLock::new(None)),
             primary_tunnel_ip: Arc::new(std::sync::Mutex::new(None)),
         });
         let bundle = X3DHPublicBundle {

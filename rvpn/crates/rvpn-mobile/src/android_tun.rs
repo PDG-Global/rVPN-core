@@ -30,7 +30,6 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use parking_lot::RwLock;
 use tokio::sync::{mpsc, Mutex};
 
 use rvpn_core::crypto::{IdentityKey, X3DHPublicBundle};
@@ -99,16 +98,6 @@ impl From<i32> for TunClientState {
         }
     }
 }
-
-/// State callback type for Android notifications
-/// Called when state changes: (state: i32, ip: *const c_char, message: *const c_char)
-pub type StateCallback = Option<
-    unsafe extern "C" fn(
-        state: i32,
-        ip: *const std::os::raw::c_char,
-        msg: *const std::os::raw::c_char,
-    ),
->;
 
 /// AndroidTunClient - Direct TUN mode client for Android
 ///
@@ -227,7 +216,6 @@ impl AndroidTunClient {
             handle,
             identity_key,
             to_swift_sender,
-            state_callback: Arc::new(RwLock::new(None)),
             primary_tunnel_ip: Arc::new(std::sync::Mutex::new(None)),
         });
 
@@ -413,12 +401,6 @@ impl AndroidTunClient {
     /// Get the runtime handle for spawning tasks
     pub fn runtime_handle(&self) -> tokio::runtime::Handle {
         self.shared.handle.clone()
-    }
-
-    /// Set the state callback for Android notifications
-    pub fn set_state_callback(&self, callback: StateCallback) {
-        let mut guard = self.shared.state_callback.write();
-        *guard = callback;
     }
 
     /// Get the assigned tunnel IP (default session)

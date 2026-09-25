@@ -2,6 +2,46 @@
 
 All notable changes to rVPN are documented in this file.
 
+## [1.3.6] — 2026-09-25
+
+Patch release: a built-in stats dashboard for the CLI client, and a round
+of mobile memory and reconnect-stability fixes.
+
+### Added
+
+- **MRTG/RRD-style stats dashboard (client).** The CLI can now serve a
+  self-contained HTML page with live graphs (throughput, connections) and
+  a JSON endpoint at `/api/stats.json` from a small embedded HTTP
+  listener. History is kept in memory for 24 hours. Enable with
+  `--dashboard-listen 127.0.0.1:9800` or `[dashboard] enabled = true`.
+- **Dashboard access control.** `allow_cidrs` restricts which client IPs
+  may view the dashboard (localhost only by default), so it can be shared
+  safely on a LAN.
+
+### Fixed
+
+- **Memory leak at the Rust/Swift packet boundary (mobile).** The tunnel
+  write loop now wraps the entire iteration — packet drain, packet write
+  and status write — in an autoreleasepool. Previously the periodic status
+  write autoreleased several KB per call on a thread whose pool never
+  drained, leaking ~600 KB/min into the default malloc zone.
+- **Stack corruption in the mobile memory diagnostics.** A hand-declared
+  `malloc_statistics_t` was 16 bytes short of the platform struct; the C
+  write smashed the stack and segfaulted the process at the next session
+  end. The declaration now matches the platform header.
+- **Overnight extension kills (iOS).** `wake()` no longer tears down the
+  Rust core on every maintenance wake, `sleep()` keeps it alive, and
+  zombie keepalive tasks no longer send shutdowns into successor
+  connections.
+- **Reconnect resilience.** The keepalive probes before declaring a
+  session dead after a doze, a background assertion is held across every
+  reconnect, and the platform health check no longer races the client's
+  own reconnect logic.
+
+### Changed
+
+- **Removed the dead Android JNI state-callback path.**
+
 ## [1.3.5] — 2026-09-13
 
 Patch release: seamless mobile roaming, pooled multiplexing with TLS

@@ -5,6 +5,7 @@
 //! its own WebSocket connection (no connection pooling or multiplexing).
 
 pub mod config;
+pub mod dashboard;
 pub mod dns;
 
 // These modules are temporarily unused in the Brook-style refactor

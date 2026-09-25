@@ -156,6 +156,7 @@ impl TunDevice {
                         Ok(n) if n > 0 => {
                             let packet = &tun_buffer[..n];
                             trace!("Read {} bytes from TUN", n);
+                            crate::dashboard::record_bytes_up(n as u64);
 
                             // Parse packet for logging/debugging
                             if let Some(packet_info) = parse_packet(packet) {
@@ -204,6 +205,7 @@ impl TunDevice {
                             }
 
                             trace!("TUN RX: Received {} bytes from tunnel", data.len());
+                            crate::dashboard::record_bytes_down(data.len() as u64);
 
                             // Parse packet for logging
                             if let Some(packet_info) = parse_packet(&data) {

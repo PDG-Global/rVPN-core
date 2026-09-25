@@ -2,7 +2,7 @@
 name = "rvpn-mobile"
 # Pinned separately from the workspace. Bump this in lockstep with the mobile
 # app releases (iOS/macOS/Android), not with the CLI/server workspace version.
-version = "1.2.11"
+version = "1.2.10"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -150,3 +150,8 @@ default = ["dns", "mimalloc"]
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 # SOCKS5 proxy - disable on mobile as we handle it differently
 # fast-socks5 = "0.8"
+
+[dev-dependencies]
+# fmt layer for examples (e.g. reconnect_soak) — never linked into the
+# shipped staticlib/cdylib.
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

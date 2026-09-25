@@ -155,6 +155,7 @@ impl DnsProxy {
             tokio::spawn(async move {
                 match parse_dns_query(&data) {
                     Ok((dns_txid, domain, qtype)) => {
+                        let query_start = Instant::now();
                         debug!("DNS query from {}: {} (type={})", src, domain, qtype);
 
                         // The VPN server hostnames themselves must never be
@@ -195,11 +196,21 @@ impl DnsProxy {
                                         build_dns_servfail(&data, dns_txid)
                                     }
                                 };
+                                crate::dashboard::record_dns(
+                                    crate::dashboard::DnsDecision::Bypass,
+                                    false,
+                                    query_start.elapsed(),
+                                );
                                 wire
                             }
                             RoutingDecision::Block => {
                                 // Return NXDOMAIN — treat blocked ad/tracker as non-existent
                                 debug!("DNS proxy: blocking {} (ad/tracker)", domain);
+                                crate::dashboard::record_dns(
+                                    crate::dashboard::DnsDecision::Block,
+                                    false,
+                                    query_start.elapsed(),
+                                );
                                 build_dns_nxdomain(&data, dns_txid)
                             }
                             RoutingDecision::Tunnel => {
@@ -213,7 +224,7 @@ impl DnsProxy {
                                 // for connectivity — still go through the tunnel.
                                 if qtype != 1 && qtype != 28 {
                                     debug!("DNS proxy: resolving {} (type={}) locally (non-A/AAAA)", domain, qtype);
-                                    match resolve_locally(
+                                    let wire = match resolve_locally(
                                         &data, dns_txid, &domain, qtype, &nameservers_clone
                                     ).await {
                                         Ok(wire) => wire,
@@ -221,7 +232,13 @@ impl DnsProxy {
                                             warn!("DNS proxy: local resolution failed for {} (type={}): {}", domain, qtype, e);
                                             build_dns_servfail(&data, dns_txid)
                                         }
-                                    }
+                                    };
+                                    crate::dashboard::record_dns(
+                                        crate::dashboard::DnsDecision::Bypass,
+                                        false,
+                                        query_start.elapsed(),
+                                    );
+                                    wire
                                 } else {
 
                                 // The server has no IPv6 upstream and build_dns_response
@@ -270,6 +287,11 @@ impl DnsProxy {
                                             error: None,
                                         };
                                         let wire = build_dns_response(&data, dns_txid, &response);
+                                        crate::dashboard::record_dns(
+                                            crate::dashboard::DnsDecision::Tunnel,
+                                            true,
+                                            query_start.elapsed(),
+                                        );
                                         if let Err(e) = socket_clone.send_to(&wire, src).await {
                                             debug!("DNS proxy: failed to send cached response to {}: {}", src, e);
                                         }
@@ -289,14 +311,20 @@ impl DnsProxy {
                                 }
                                 // 5s timeout — if the WebSocket is zombie (protocol alive but
                                 // server not responding), don't hang the DNS client forever.
-                                match tokio::time::timeout(tokio::time::Duration::from_secs(5), reply_rx).await {
+                                let wire = match tokio::time::timeout(tokio::time::Duration::from_secs(5), reply_rx).await {
                                     // Propagate resolution failure as SERVFAIL
                                     // instead of a NOERROR with no answers —
                                     // NODATA wrongly tells stubs the name
                                     // exists but has no such record.
                                     Ok(Ok(Some(r))) if r.success => build_dns_response(&data, dns_txid, &r),
                                     _ => build_dns_servfail(&data, dns_txid),
-                                }
+                                };
+                                crate::dashboard::record_dns(
+                                    crate::dashboard::DnsDecision::Tunnel,
+                                    false,
+                                    query_start.elapsed(),
+                                );
+                                wire
                                 }
                             }
                         };

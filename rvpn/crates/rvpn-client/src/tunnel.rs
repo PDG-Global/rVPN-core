@@ -86,6 +86,11 @@ impl VpnTunnel {
     ) -> Result<Arc<RwLock<VpnTunnel>>> {
         info!("Connecting VPN tunnel to {}:{}{}", host, port, path);
 
+        // Times the connect handshake; records handshake_fail on any early
+        // error return, handshake_ok on success (dashboard no-ops when
+        // disabled).
+        let probe = crate::dashboard::HandshakeProbe::start();
+
         // Load identity key
         let identity_key = Arc::new(IdentityKey::load(identity_key_file)
             .map_err(|e| anyhow::anyhow!("Failed to load identity key: {}", e))?);
@@ -182,6 +187,7 @@ impl VpnTunnel {
             _ws_tasks: ws_tasks,
         };
 
+        probe.success();
         Ok(Arc::new(RwLock::new(tunnel)))
     }
 

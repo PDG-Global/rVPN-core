@@ -65,6 +65,10 @@ pub struct ClientConfig {
     #[serde(default)]
     pub dns_proxy: DnsProxyConfig,
 
+    /// Stats dashboard configuration (localhost HTTP listener)
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
+
     /// TLS fingerprint configuration for DPI resistance
     /// Set to "chrome", "firefox", "safari", "ios", "android", "edge", or "none"
     #[serde(default = "default_tls_fingerprint")]
@@ -109,6 +113,7 @@ impl Default for ClientConfig {
             server_identity: ServerIdentityConfig::default(),
             http_proxy: HttpProxyConfig::default(),
             dns_proxy: DnsProxyConfig::default(),
+            dashboard: DashboardConfig::default(),
             tls_fingerprint: TlsFingerprint::default(),
             data_dir: default_data_dir(),
             extra_servers: Vec::new(),
@@ -422,6 +427,47 @@ fn default_http_proxy_listen() -> String {
     "127.0.0.1:8118".to_string()
 }
 
+/// Stats dashboard configuration
+///
+/// When enabled, the client serves a self-contained MRTG/RRD-style HTML+SVG
+/// stats page (and a JSON API at `/api/stats.json`) from a small embedded
+/// HTTP listener. There is no authentication; access is restricted by client
+/// IP against `allow_cidrs` (localhost only by default).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardConfig {
+    /// Enable the stats dashboard HTTP listener
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Listen address for the dashboard (e.g. "127.0.0.1:9800")
+    #[serde(default = "default_dashboard_listen")]
+    pub listen_address: String,
+
+    /// CIDRs allowed to view the dashboard; others get 403. Defaults to
+    /// localhost only. To share on a LAN, bind `listen_address` to the LAN
+    /// interface (or 0.0.0.0) and add e.g. "192.168.0.0/16" here.
+    #[serde(default = "default_dashboard_allow_cidrs")]
+    pub allow_cidrs: Vec<String>,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: default_dashboard_listen(),
+            allow_cidrs: default_dashboard_allow_cidrs(),
+        }
+    }
+}
+
+fn default_dashboard_listen() -> String {
+    "127.0.0.1:9800".to_string()
+}
+
+fn default_dashboard_allow_cidrs() -> Vec<String> {
+    vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]
+}
+
 /// TUN device configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunConfig {
@@ -721,6 +767,37 @@ prekey_bundle     = "hk.bundle.json"
         let cfg: ClientConfig = toml::from_str(raw).expect("parse legacy config");
         assert!(cfg.extra_servers.is_empty());
         assert!(cfg.routing.is_empty());
+    }
+
+    #[test]
+    fn dashboard_config_toml_round_trips() {
+        // Explicit section
+        let raw = r#"
+server_address = "wss://hk.example.com"
+
+[dashboard]
+enabled = true
+listen_address = "127.0.0.1:9801"
+"#;
+        let cfg: ClientConfig = toml::from_str(raw).expect("parse dashboard config");
+        assert!(cfg.dashboard.enabled);
+        assert_eq!(cfg.dashboard.listen_address, "127.0.0.1:9801");
+
+        // Serialize back out and re-parse
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let cfg2: ClientConfig = toml::from_str(&serialized).expect("re-parse");
+        assert!(cfg2.dashboard.enabled);
+        assert_eq!(cfg2.dashboard.listen_address, "127.0.0.1:9801");
+
+        // Absent section: defaults to disabled on 127.0.0.1:9800
+        let cfg3: ClientConfig = toml::from_str("server_address = \"wss://hk.example.com\"")
+            .expect("parse without dashboard section");
+        assert!(!cfg3.dashboard.enabled);
+        assert_eq!(cfg3.dashboard.listen_address, "127.0.0.1:9800");
+        assert_eq!(
+            cfg3.dashboard.listen_address,
+            DashboardConfig::default().listen_address
+        );
     }
 
     #[test]

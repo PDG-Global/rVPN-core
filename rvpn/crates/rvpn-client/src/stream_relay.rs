@@ -65,6 +65,10 @@ impl StreamRelay {
     ) -> Result<(Self, WebSocketReader, WebSocketWriter, crate::websocket::WebSocketTaskHandle)> {
         info!("Connecting StreamRelay to {}:{}{}", host, port, path);
 
+        // Times the handshake; records handshake_fail on any early error
+        // return, handshake_ok on success (dashboard no-ops when disabled).
+        let probe = crate::dashboard::HandshakeProbe::start();
+
         // Step 1: Establish WebSocket connection
         let ws_stream = connect_websocket(host, port, path, fingerprint, sni_hostname, resumption)
             .await
@@ -90,6 +94,7 @@ impl StreamRelay {
         .await?;
 
         info!("StreamRelay X3DH handshake completed successfully");
+        probe.success();
 
         let relay = Self { ratchet };
 
@@ -424,6 +429,7 @@ impl StreamRelay {
                         break;
                     }
                     Ok(n) => {
+                        crate::dashboard::record_bytes_up(n as u64);
                         // Pad to 1KB boundary before encryption
                         let padded = match rvpn_core::protocol::padding::pad_packet(&buf[..n]) {
                             Ok(p) => p,
@@ -527,6 +533,7 @@ impl StreamRelay {
         // Task 3: Write decrypted data to local
         let write_task = async move {
             while let Some(data) = rx.recv().await {
+                crate::dashboard::record_bytes_down(data.len() as u64);
                 if let Err(e) = local_write.write_all(&data).await {
                     warn!("Error writing to local: {}", e);
                     return Err(e.into());

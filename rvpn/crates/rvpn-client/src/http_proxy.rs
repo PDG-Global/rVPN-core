@@ -408,6 +408,9 @@ async fn handle_http_forward(
             if let Some(ref b) = body {
                 target.write_all(b).await?;
             }
+            crate::dashboard::record_bytes_up(
+                (request.len() + body.as_ref().map_or(0, |b| b.len())) as u64
+            );
 
             let socket = reader.get_mut();
             relay_http_response(&mut target, socket).await?;
@@ -499,17 +502,21 @@ async fn forward_through_mux_tunnel(
         .map_err(|_| anyhow::anyhow!("Mux flow send channel closed"))?;
 
     // Send body if present
+    let mut sent_up = request.len() as u64;
     if let Some(b) = body {
         send_tx
             .send(b.to_vec())
             .await
             .map_err(|_| anyhow::anyhow!("Mux flow send channel closed"))?;
+        sent_up += b.len() as u64;
     }
+    crate::dashboard::record_bytes_up(sent_up);
 
     // Read response from mux flow and write back to client
     let socket = reader.get_mut();
     while let Some(data) = recv_rx.recv().await {
         socket.write_all(&data).await?;
+        crate::dashboard::record_bytes_down(data.len() as u64);
         // Flow control: grant the server credits for the consumed bytes.
         tunnel.send_window_update(flow_id, data.len() as u32).await;
     }
@@ -534,12 +541,14 @@ async fn relay_http_response(
     let mut status_line = String::new();
     target_buf.read_line(&mut status_line).await?;
     client.write_all(status_line.as_bytes()).await?;
+    crate::dashboard::record_bytes_down(status_line.len() as u64);
 
     // Read response headers
     loop {
         let mut header = String::new();
         target_buf.read_line(&mut header).await?;
         client.write_all(header.as_bytes()).await?;
+        crate::dashboard::record_bytes_down(header.len() as u64);
 
         let trimmed = header.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
@@ -572,12 +581,14 @@ async fn relay_http_response(
             }
             let n = buf.len().min(remaining);
             client.write_all(&buf[..n]).await?;
+            crate::dashboard::record_bytes_down(n as u64);
             target_buf.consume(n);
             remaining -= n;
         }
     } else if connection_close || status_line.starts_with("HTTP/1.0") {
         // No length indicator — copy until EOF
-        tokio::io::copy(&mut target_buf, client).await?;
+        let n = tokio::io::copy(&mut target_buf, client).await?;
+        crate::dashboard::record_bytes_down(n);
     }
     // else: keep-alive with no content-length and not chunked — nothing to read
 
@@ -596,6 +607,7 @@ async fn relay_chunked_response(
         let mut size_line = String::new();
         target.read_line(&mut size_line).await?;
         client.write_all(size_line.as_bytes()).await?;
+        crate::dashboard::record_bytes_down(size_line.len() as u64);
 
         let size_str = size_line.trim().split(';').next().unwrap_or("0");
         let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
@@ -606,6 +618,7 @@ async fn relay_chunked_response(
                 let mut trailer = String::new();
                 target.read_line(&mut trailer).await?;
                 client.write_all(trailer.as_bytes()).await?;
+                crate::dashboard::record_bytes_down(trailer.len() as u64);
                 if trailer.trim().is_empty() {
                     break;
                 }
@@ -622,6 +635,7 @@ async fn relay_chunked_response(
             }
             let n = buf.len().min(remaining);
             client.write_all(&buf[..n]).await?;
+            crate::dashboard::record_bytes_down(n as u64);
             target.consume(n);
             remaining -= n;
         }
@@ -630,6 +644,7 @@ async fn relay_chunked_response(
         let mut crlf = String::new();
         target.read_line(&mut crlf).await?;
         client.write_all(crlf.as_bytes()).await?;
+        crate::dashboard::record_bytes_down(crlf.len() as u64);
     }
 
     Ok(())
