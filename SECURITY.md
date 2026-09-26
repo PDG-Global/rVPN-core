@@ -112,7 +112,7 @@ We follow responsible disclosure practices:
 
 ### Current Limitations
 
-1. **Single Server Trust**: Currently, R-VPN requires trusting a single relay server. Future versions will support decentralized relay discovery.
+1. **Single Server Trust**: Currently, rVPN requires trusting a single relay server. Future versions will support decentralized relay discovery.
 
 2. **No Quantum Resistance**: The current cryptographic primitives (X25519, ChaCha20-Poly1305) are not quantum-resistant. Post-quantum cryptography is on our roadmap.
 
@@ -120,14 +120,14 @@ We follow responsible disclosure practices:
 
 ### Threat Model
 
-R-VPN is designed to protect against:
+rVPN is designed to protect against:
 
 - Passive network eavesdropping
 - Active MITM attacks (with proper key verification)
 - Compromised relay servers (cannot decrypt traffic)
 - Forward secrecy attacks (keys rotate automatically)
 
-R-VPN does NOT protect against:
+rVPN does NOT protect against:
 
 - Endpoint compromise (your device or the target server)
 - Traffic analysis by sophisticated adversaries
@@ -140,7 +140,7 @@ R-VPN does NOT protect against:
 |------|---------|-------|---------|
 | TBD | TBD | TBD | TBD |
 
-We are actively seeking independent security audits. If you are a security researcher or audit firm interested in reviewing R-VPN, please contact us at security@rvpn.org.
+We are actively seeking independent security audits. If you are a security researcher or audit firm interested in reviewing rVPN, please contact us at security@rvpn.org.
 
 ## Acknowledgments
 

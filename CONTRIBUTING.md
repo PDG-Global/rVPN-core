@@ -1,6 +1,6 @@
-# Contributing to R-VPN
+# Contributing to rVPN
 
-Thank you for your interest in contributing to R-VPN! This document provides guidelines and instructions for contributing to the project.
+Thank you for your interest in contributing to rVPN! This document provides guidelines and instructions for contributing to the project.
 
 ## Table of Contents
 
@@ -57,7 +57,7 @@ We welcome feature suggestions! Please:
 
 - Check if the feature has already been suggested
 - Explain the use case and why it would be valuable
-- Consider how it fits with R-VPN's privacy-focused design
+- Consider how it fits with rVPN's privacy-focused design
 - Be open to discussion and alternative approaches
 
 ### Contributing Code
@@ -84,8 +84,8 @@ Areas where contributions are especially welcome:
 
 ```bash
 # Clone the repository
-git clone https://github.com/creativebastard/rvpn.git
-cd rvpn
+git clone https://github.com/PDG-Global/rVPN-core.git
+cd rVPN-core/rvpn
 
 # Build the client
 cargo build --release --bin rvpn
@@ -208,7 +208,7 @@ We will:
 
 ### Contributor License Agreement
 
-By contributing to R-VPN, you agree that:
+By contributing to rVPN, you agree that:
 
 1. You have the right to submit the contribution
 2. You grant PDG Global Limited a perpetual, worldwide, non-exclusive, royalty-free license to use your contribution under both:
@@ -217,7 +217,7 @@ By contributing to R-VPN, you agree that:
 3. Your contribution is your original work or you have permission to submit it
 
 This dual-licensing approach allows us to:
-- Keep R-VPN open source under AGPL
+- Keep rVPN open source under AGPL
 - Offer commercial licenses to businesses
 - Protect the project's long-term sustainability
 
@@ -230,9 +230,9 @@ Please include this header in new files:
 // Copyright (C) 2024-2025 [Your Name]
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// This file is part of R-VPN.
+// This file is part of rVPN.
 //
-// R-VPN is free software: you can redistribute it and/or modify
+// rVPN is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
@@ -240,9 +240,9 @@ Please include this header in new files:
 
 ## Questions?
 
-- **General questions**: Open a [GitHub Discussion](https://github.com/creativebastard/rvpn/discussions)
-- **Bug reports**: Open an [Issue](https://github.com/creativebastard/rvpn/issues)
+- **General questions**: Open a [GitHub Discussion](https://github.com/PDG-Global/rVPN-core/discussions)
+- **Bug reports**: Open an [Issue](https://github.com/PDG-Global/rVPN-core/issues)
 - **Security issues**: Email security@rvpn.org
 - **Commercial licensing**: Email license@pdg-global.com
 
-Thank you for contributing to R-VPN and helping build genuinely private networking infrastructure!
+Thank you for contributing to rVPN and helping build genuinely private networking infrastructure!

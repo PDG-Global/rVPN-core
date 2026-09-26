@@ -1,21 +1,21 @@
-# Commercial License for R-VPN
+# Commercial License for rVPN
 
 ## Dual Licensing Overview
 
-R-VPN is dual-licensed under:
+rVPN is dual-licensed under:
 
 1. **AGPL-3.0** (GNU Affero General Public License v3.0) - for open source use
 2. **Commercial License** - for proprietary use
 
-This dual licensing model allows us to keep R-VPN open source while also supporting businesses that need to integrate R-VPN into proprietary products or services without the obligations of the AGPL.
+This dual licensing model allows us to keep rVPN open source while also supporting businesses that need to integrate rVPN into proprietary products or services without the obligations of the AGPL.
 
 ## When You Need a Commercial License
 
 You **MUST** obtain a commercial license if you:
 
-- Use R-VPN in a proprietary product or service
-- Distribute R-VPN as part of a closed-source application
-- Provide R-VPN as a managed service without releasing your modifications under AGPL
+- Use rVPN in a proprietary product or service
+- Distribute rVPN as part of a closed-source application
+- Provide rVPN as a managed service without releasing your modifications under AGPL
 - Cannot comply with the AGPL's source code disclosure requirements
 - Need warranty, indemnification, or professional support
 
@@ -23,9 +23,9 @@ You **MUST** obtain a commercial license if you:
 
 Under the AGPL, you MUST:
 
-- Release your complete source code to users who interact with your R-VPN deployment
+- Release your complete source code to users who interact with your rVPN deployment
 - License your entire application under AGPL-3.0 or later
-- Provide clear attribution to PDG Global Limited and the R-VPN project
+- Provide clear attribution to PDG Global Limited and the rVPN project
 - State your modifications prominently
 
 ## Commercial License Benefits
@@ -33,10 +33,10 @@ Under the AGPL, you MUST:
 A commercial license from PDG Global Limited provides:
 
 ### Legal Rights
-- Use R-VPN in proprietary applications without AGPL obligations
-- Modify R-VPN without disclosing source code
-- Distribute R-VPN as part of closed-source products
-- Provide R-VPN as a service without source disclosure
+- Use rVPN in proprietary applications without AGPL obligations
+- Modify rVPN without disclosing source code
+- Distribute rVPN as part of closed-source products
+- Provide rVPN as a service without source disclosure
 
 ### Professional Support
 - Priority email support
@@ -47,7 +47,7 @@ A commercial license from PDG Global Limited provides:
 ### Warranty and Indemnification
 - Limited warranty on software functionality
 - Indemnification against IP infringement claims
-- Legal protection for your use of R-VPN
+- Legal protection for your use of rVPN
 
 ## License Terms and Pricing
 
@@ -64,7 +64,7 @@ Commercial licenses are available under several models:
 - White-label options available
 
 ### OEM/Embedded License
-- For hardware or software products shipping with R-VPN
+- For hardware or software products shipping with rVPN
 - Per-unit or flat-rate pricing
 - Custom terms for high-volume deployments
 
@@ -89,8 +89,8 @@ Please include in your inquiry:
 
 ## Frequently Asked Questions
 
-### Q: Can I evaluate R-VPN commercially before purchasing a license?
-A: Yes. You may evaluate R-VPN for up to 30 days under the AGPL. If you decide to use it commercially beyond evaluation, you must either comply with AGPL requirements or purchase a commercial license.
+### Q: Can I evaluate rVPN commercially before purchasing a license?
+A: Yes. You may evaluate rVPN for up to 30 days under the AGPL. If you decide to use it commercially beyond evaluation, you must either comply with AGPL requirements or purchase a commercial license.
 
 ### Q: Does the commercial license cover future versions?
 A: Standard commercial licenses include updates for one year. Extended update coverage is available.
@@ -101,7 +101,7 @@ A: Yes. You can purchase a commercial license at any time. Your previous AGPL co
 ### Q: What happens if I stop paying for commercial support?
 A: You retain your commercial license rights to the versions you received. However, you lose access to updates, support, and new versions unless you comply with AGPL requirements.
 
-### Q: Can I contribute to R-VPN if I have a commercial license?
+### Q: Can I contribute to rVPN if I have a commercial license?
 A: Absolutely! We encourage all users to contribute improvements back to the open source project. Contributors retain their copyright but grant PDG Global Limited the right to license their contributions under both AGPL and commercial terms.
 
 ## Contributing Back
@@ -111,11 +111,11 @@ Even with a commercial license, we encourage you to:
 - Report bugs and security issues
 - Suggest feature improvements
 - Contribute non-core modifications back to the open source project
-- Participate in the R-VPN community
+- Participate in the rVPN community
 
 ## About PDG Global Limited
 
-PDG Global Limited is a Hong Kong-based technology company focused on privacy-enhancing technologies and secure communications infrastructure. R-VPN represents our commitment to providing genuinely private networking solutions for individuals and organizations worldwide.
+PDG Global Limited is a Hong Kong-based technology company focused on privacy-enhancing technologies and secure communications infrastructure. rVPN represents our commitment to providing genuinely private networking solutions for individuals and organizations worldwide.
 
 ---
 

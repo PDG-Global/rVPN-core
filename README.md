@@ -3,7 +3,7 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-R-VPN is a stealth VPN with end-to-end encryption. The relay server forwards encrypted packets but cannot read them.
+rVPN is a stealth VPN with end-to-end encryption. Traffic is encrypted on your device and decrypted only by its destination — the relay server in between forwards ciphertext it cannot read.
 
 This repository contains the core Rust implementation: the client, server, protocol libraries, and mobile FFI bindings. The native macOS, iOS, and Android apps are maintained separately.
 
@@ -11,9 +11,12 @@ This repository contains the core Rust implementation: the client, server, proto
 
 - **Double Ratchet Algorithm** (from Signal) for continuous key rotation and forward secrecy
 - **X3DH key exchange** for initial handshake without passwords or accounts
-- **WebSocket over TLS** transport - traffic is indistinguishable from normal HTTPS
-- **Reverse proxy** - the server hosts a real website on port 443, the VPN endpoint is hidden behind it
-- **TLS fingerprint mimicry** - connections mimic Chrome, Firefox, or Safari fingerprints
+- **WebSocket over TLS** transport — traffic is indistinguishable from normal HTTPS
+- **Pooled multiplexing** — many flows share a small set of long-lived connections, with credit-based flow control and TLS session resumption
+- **Reverse proxy** — the server hosts a real website on port 443, the VPN endpoint is hidden behind it
+- **Per-instance decoy pages** — plain HTTPS probes get a realistic, randomly chosen login page, so no two servers present the same face
+- **TLS fingerprint mimicry** — connections mimic Chrome, Firefox, or Safari fingerprints
+- **Stats dashboard** — the CLI serves a live MRTG-style traffic page with a JSON API
 
 ## Repository Structure
 
@@ -141,7 +144,7 @@ Full documentation is at [docs.rvpn.org](https://docs.rvpn.org). The whitepaper 
 
 ## Licensing
 
-R-VPN is dual-licensed:
+rVPN is dual-licensed:
 
 - **AGPL-3.0** for open-source use
 - **Commercial license** for proprietary use, SaaS providers, or when AGPL obligations cannot be met
