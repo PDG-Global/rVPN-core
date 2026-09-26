@@ -21,8 +21,8 @@ of mobile memory and reconnect-stability fixes.
 ### Fixed
 
 - **Memory leak at the Rust/Swift packet boundary (mobile).** The tunnel
-  write loop now wraps the entire iteration — packet drain, packet write
-  and status write — in an autoreleasepool. Previously the periodic status
+  write loop now wraps the entire iteration (packet drain, packet write
+  and status write) in an autoreleasepool. Previously the periodic status
   write autoreleased several KB per call on a thread whose pool never
   drained, leaking ~600 KB/min into the default malloc zone.
 - **Stack corruption in the mobile memory diagnostics.** A hand-declared
@@ -52,13 +52,13 @@ session resumption, and per-instance decoy login pages.
 - **Pooled multiplex mode (client).** Many flows now share a small set of
   long-lived WebSocket connections instead of one connection per flow, with
   credit-based per-flow flow control (256 KiB initial window) and strict
-  wire ordering — every encrypt→send path on a shared ratchet is
+  wire ordering: every encrypt→send path on a shared ratchet is
   serialized, since the Double Ratchet drops reordered frames.
 - **TLS 1.3 session resumption (client + mobile).** Reconnects offer the
   cached session ticket (1-RTT PSK), skipping the certificate flight.
 - **Per-instance decoy login pages (server).** Non-VPN HTTPS requests are
-  served a realistic, randomly chosen login page — webmail, NAS, photo
-  sharing, and more — generated per server instance, so no two servers
+  served a realistic, randomly chosen login page (webmail, NAS, photo
+  sharing, and more) generated per server instance, so no two servers
   present the same face to a prober.
 - **Multi-server Direct TUN routing (mobile).** Profiles can carry extra
   exit servers, each with its own route domains and route IPs. Each exit
@@ -71,7 +71,7 @@ session resumption, and per-instance decoy login pages.
 - **Sticky TUN IP leases across reconnects (server).** Tunnel IPs are now
   leased by the client's X25519 identity key instead of its source IP and
   port. Roaming between Wi-Fi and cellular hands back the same tunnel
-  address — previously the new connection got a fresh IP while the OS kept
+  address. Previously the new connection got a fresh IP while the OS kept
   routing to the old one, leaving the tunnel "connected" but passing no
   traffic until a manual reconnect.
 - **Pooled-tunnel reliability (multiplex).** Flow-control, wire-order, and
@@ -89,16 +89,16 @@ long-running memory growth in the CLI client.
 ### Fixed
 
 - **DNS resolver fallback chain (client).** When every configured
-  nameserver drops queries — observed in the field on both major CN public
-  resolvers (223.6.6.6, 114.114.114.114) — the client now falls through to
-  last-resort public resolvers (1.1.1.1, 8.8.8.8) instead of answering
+  nameserver drops queries (observed in the field on both major CN public
+  resolvers, 223.6.6.6 and 114.114.114.114), the client now falls through
+  to last-resort public resolvers (1.1.1.1, 8.8.8.8) instead of answering
   SERVFAIL. Fixes the recurring "everything stops resolving roughly once an
   hour" report. The system-resolver fallback also no longer loops back into
   the client's own DNS proxy when rvpn is the system resolver.
 - **Non-A/AAAA queries answered properly (client + server).** NS, TXT, MX,
   HTTPS and PTR queries are now resolved locally via raw UDP forward.
   Previously the tunnel DNS protocol (A/AAAA only) returned empty NODATA for
-  these, or A records that did not match the question type — so tools like
+  these, or A records that did not match the question type, so tools like
   `dig` got empty or bogus answers through the proxy.
 - **Honest failure signalling (client).** A server-side resolution failure
   is now returned as SERVFAIL instead of a NOERROR with zero answers, which
