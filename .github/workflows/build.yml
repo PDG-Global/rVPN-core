@@ -1,0 +1,54 @@
+name: build
+
+# The build half of the merge gate:
+#
+#   build — the required check on PRs: workspace check with the mobile
+#           platform feature, then the workspace test suite. These are the
+#           exact commands PR #2 was verified with. macOS because
+#           rvpn-mobile/macos-direct-tun selects the BoringSSL desktop TLS
+#           path (Chrome ClientHello mimicry) that the desktop clients
+#           ship, and the examples need a platform feature to compile.
+#   msrv  — advisory: the workspace still builds on the declared Rust
+#           floor (1.88, the version the locked graph needs — time 0.3.47
+#           via rustls-acme). Runs on Ubuntu, which also gives the
+#           Linux-side code paths a compile pass. Bump the floor and the
+#           workspace rust-version together.
+#
+# Toolchain and cache actions match rvault CI.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions: read-all
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: rvpn
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: workspace check (incl. mobile examples)
+        run: cargo check --workspace --all-targets --features rvpn-mobile/macos-direct-tun
+      - name: workspace tests
+        run: cargo test --workspace --features rvpn-mobile/macos-direct-tun
+
+  msrv:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rvpn
+    steps:
+      - uses: actions/checkout@v4
+      - name: install Rust 1.88.0 (MSRV floor)
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check at MSRV
+        run: cargo +1.88.0 check
