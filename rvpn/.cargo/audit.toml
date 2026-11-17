@@ -21,10 +21,6 @@ ignore = [
     # A. rustls 0.22.4 (EOL line — migration, review 2026-12-17)
     "RUSTSEC-2026-0346", # Debug impls expose TLS session secrets
     "RUSTSEC-2026-0349", # unauthenticated ServerHello downgrade
-    # B. fixed by semver-compatible bumps (lockfile PR removes these)
-    "RUSTSEC-2026-0285", # rustls 0.23.37: handshake messages across encryption levels
-    "RUSTSEC-2026-0348", # rustls 0.23.37: brotli cert decompression allocation
-    "RUSTSEC-2026-0381", # webpki-roots 1.0.6: distrusted emSign intermediates
     # C. rustls-webpki 0.102.8 (migration, review 2026-12-17)
     "RUSTSEC-2026-0104", # CRL parsing panic
     "RUSTSEC-2026-0098", # URI name constraints
