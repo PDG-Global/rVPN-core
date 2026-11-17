@@ -54,6 +54,7 @@ fn client_side_wire_bundle(
         one_time_prekey: None,
         identity_key_version: stale_local_bundle.identity_key_version,
         rotation_signature: stale_local_bundle.rotation_signature,
+        identity_x25519_signature: stale_local_bundle.identity_x25519_signature,
     }
 }
 

@@ -160,10 +160,7 @@ async fn load_bundle(path: &std::path::Path) -> Result<X3DHPublicBundle> {
         .with_context(|| format!("Failed to parse prekey bundle: {:?}", path))
 }
 
-fn resolve_identity(
-    base: &ServerIdentityConfig,
-    entry: &ServerEntry,
-) -> ServerIdentityConfig {
+fn resolve_identity(base: &ServerIdentityConfig, entry: &ServerEntry) -> ServerIdentityConfig {
     let mut cfg = base.clone();
     if let Some(fp) = entry.fingerprint.clone() {
         cfg.fingerprint = Some(fp);
@@ -242,6 +239,7 @@ mod tests {
                 one_time_prekey: None,
                 identity_key_version: 1,
                 rotation_signature: None,
+                identity_x25519_signature: None,
             }),
             identity_config: ServerIdentityConfig::default(),
             resumption: ResumptionStore::new(),

@@ -68,6 +68,13 @@ pub struct TunConfig {
     /// that older builds still use for the same slot.
     #[serde(default, alias = "serverFingerprint")]
     pub server_identity_pin: Option<String>,
+    /// Whether this server has already proved signed X25519 support. Once true,
+    /// unsigned ServerHello messages are rejected as a downgrade.
+    #[serde(default)]
+    pub signed_x25519_seen: bool,
+    /// Allow capture when no identity pin is stored. Disable to fail closed.
+    #[serde(default = "default_true")]
+    pub trust_on_first_use: bool,
     /// Path to JSON file mapping country codes to CIDR arrays.
     /// Format: {"CN": ["1.0.1.0/24", ...]}
     /// Used instead of compiled-in builtin IPs.
@@ -109,6 +116,9 @@ pub struct MobileServerEntry {
     /// this exit uses TOFU like the default server.
     #[serde(default, alias = "serverFingerprint")]
     pub server_identity_pin: Option<String>,
+    /// Whether a valid signed X25519 proof has been seen for this exit.
+    #[serde(default)]
+    pub signed_x25519_seen: bool,
     /// TLS SNI hostname (optional; defaults to the URL host).
     #[serde(default)]
     pub sni_hostname: Option<String>,
@@ -120,4 +130,39 @@ fn default_dns_bind_addr() -> String {
 
 fn default_mtu() -> u16 {
     1420
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub(crate) fn ensure_tofu_allowed(pin: Option<&str>, enabled: bool) -> anyhow::Result<()> {
+    if !enabled && pin.map(str::trim).filter(|pin| !pin.is_empty()).is_none() {
+        anyhow::bail!("server identity pin is required when trust on first use is disabled");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tofu_disabled_requires_a_pin() {
+        assert!(ensure_tofu_allowed(None, false).is_err());
+        assert!(ensure_tofu_allowed(Some(" "), false).is_err());
+        assert!(ensure_tofu_allowed(None, true).is_ok());
+        assert!(ensure_tofu_allowed(Some("ik:1:test"), false).is_ok());
+    }
+
+    #[test]
+    fn tofu_setting_defaults_to_enabled_for_legacy_configs() {
+        let config: TunConfig = serde_json::from_value(serde_json::json!({
+            "serverAddress": "wss://example.com/connect",
+            "identityKeyPath": "identity.key",
+            "prekeyBundlePath": "bundle.json"
+        }))
+        .unwrap();
+        assert!(config.trust_on_first_use);
+    }
 }

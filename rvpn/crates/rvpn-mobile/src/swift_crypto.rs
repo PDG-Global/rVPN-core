@@ -58,7 +58,10 @@ pub unsafe extern "C" fn rvpn_ratchet_encrypt(
     let data = std::slice::from_raw_parts(plaintext, plaintext_len);
 
     let mut ciphertext = Vec::new();
-    let (nonce, header) = match handle.ratchet.encrypt_to(data, &[payload_type], &mut ciphertext) {
+    let (nonce, header) = match handle
+        .ratchet
+        .encrypt_to(data, &[payload_type], &mut ciphertext)
+    {
         Ok(v) => v,
         Err(e) => {
             super::ios_tun_ffi::set_last_error(&format!("encrypt: {}", e));
@@ -133,7 +136,10 @@ pub unsafe extern "C" fn rvpn_ratchet_decrypt(
 
     let payload_type = msg.header.payload_type;
     let mut plaintext = Vec::new();
-    let pt_len = match handle.ratchet.decrypt_to(&msg, &[payload_type], &mut plaintext) {
+    let pt_len = match handle
+        .ratchet
+        .decrypt_to(&msg, &[payload_type], &mut plaintext)
+    {
         Ok(v) => v,
         Err(e) => {
             super::ios_tun_ffi::set_last_error(&format!("decrypt: {}", e));
@@ -163,9 +169,7 @@ pub unsafe extern "C" fn rvpn_ratchet_decrypt(
 /// # Returns
 /// Opaque ratchet handle, or null on error.
 #[no_mangle]
-pub unsafe extern "C" fn rvpn_ratchet_init_alice(
-    shared_secret: *const u8,
-) -> *mut RatchetHandle {
+pub unsafe extern "C" fn rvpn_ratchet_init_alice(shared_secret: *const u8) -> *mut RatchetHandle {
     if shared_secret.is_null() {
         return ptr::null_mut();
     }
@@ -191,9 +195,7 @@ pub unsafe extern "C" fn rvpn_ratchet_free(handle: *mut RatchetHandle) {
 /// # Returns
 /// Opaque identity handle, or null on error.
 #[no_mangle]
-pub unsafe extern "C" fn rvpn_identity_load(
-    path: *const c_char,
-) -> *mut IdentityHandle {
+pub unsafe extern "C" fn rvpn_identity_load(path: *const c_char) -> *mut IdentityHandle {
     if path.is_null() {
         return ptr::null_mut();
     }
@@ -414,26 +416,23 @@ pub unsafe extern "C" fn rvpn_x3dh_agree(
 
     let identity = &*identity;
 
-    let sid_key: [u8; 32] =
-        match std::slice::from_raw_parts(server_identity_key, 32).try_into() {
-            Ok(v) => v,
-            Err(_) => return -1,
-        };
+    let sid_key: [u8; 32] = match std::slice::from_raw_parts(server_identity_key, 32).try_into() {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
     let sid_x25519: [u8; 32] =
         match std::slice::from_raw_parts(server_identity_x25519, 32).try_into() {
             Ok(v) => v,
             Err(_) => return -1,
         };
-    let spk: [u8; 32] =
-        match std::slice::from_raw_parts(server_signed_prekey, 32).try_into() {
-            Ok(v) => v,
-            Err(_) => return -1,
-        };
-    let sig: [u8; 64] =
-        match std::slice::from_raw_parts(server_prekey_signature, 64).try_into() {
-            Ok(v) => v,
-            Err(_) => return -1,
-        };
+    let spk: [u8; 32] = match std::slice::from_raw_parts(server_signed_prekey, 32).try_into() {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    let sig: [u8; 64] = match std::slice::from_raw_parts(server_prekey_signature, 64).try_into() {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
 
     // Verify Ed25519 signature on signed prekey
     let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&sid_key) {
@@ -458,12 +457,13 @@ pub unsafe extern "C" fn rvpn_x3dh_agree(
         // the bundle valid for X3DH agreement without asserting a version.
         identity_key_version: 1,
         rotation_signature: None,
+        identity_x25519_signature: None,
     };
 
     // Create X3DH initiator
-    let initiator = rvpn_core::crypto::x3dh::X3DHInitiator::from_identity_key(
-        std::sync::Arc::new(identity.key.clone()),
-    );
+    let initiator = rvpn_core::crypto::x3dh::X3DHInitiator::from_identity_key(std::sync::Arc::new(
+        identity.key.clone(),
+    ));
 
     // Copy ephemeral public key to output
     let epk = initiator.ephemeral_key.public_key.to_bytes();
@@ -561,26 +561,23 @@ pub unsafe extern "C" fn rvpn_x3dh_agree_with_ephemeral(
     let identity = &*identity;
     let ephemeral = &*ephemeral;
 
-    let sid_key: [u8; 32] =
-        match std::slice::from_raw_parts(server_identity_key, 32).try_into() {
-            Ok(v) => v,
-            Err(_) => return -1,
-        };
+    let sid_key: [u8; 32] = match std::slice::from_raw_parts(server_identity_key, 32).try_into() {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
     let sid_x25519: [u8; 32] =
         match std::slice::from_raw_parts(server_identity_x25519, 32).try_into() {
             Ok(v) => v,
             Err(_) => return -1,
         };
-    let spk: [u8; 32] =
-        match std::slice::from_raw_parts(server_signed_prekey, 32).try_into() {
-            Ok(v) => v,
-            Err(_) => return -1,
-        };
-    let sig: [u8; 64] =
-        match std::slice::from_raw_parts(server_prekey_signature, 64).try_into() {
-            Ok(v) => v,
-            Err(_) => return -1,
-        };
+    let spk: [u8; 32] = match std::slice::from_raw_parts(server_signed_prekey, 32).try_into() {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    let sig: [u8; 64] = match std::slice::from_raw_parts(server_prekey_signature, 64).try_into() {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
 
     // Verify Ed25519 signature on signed prekey
     let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&sid_key) {
@@ -605,6 +602,7 @@ pub unsafe extern "C" fn rvpn_x3dh_agree_with_ephemeral(
         // the bundle valid for X3DH agreement without asserting a version.
         identity_key_version: 1,
         rotation_signature: None,
+        identity_x25519_signature: None,
     };
 
     // Create X3DH initiator with the pre-generated ephemeral key

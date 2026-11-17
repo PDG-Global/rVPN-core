@@ -14,13 +14,21 @@
 //! above target is not replaced.
 //!
 //! Rotation: each tunnel carries per-creation jittered age and byte
-//! thresholds. When either fires the tunnel enters **draining** — no new
-//! flows are assigned, existing flows run to completion, and a replacement
-//! handshake is spawned in the same critical section (the remaining
-//! assignable tunnels absorb new flows while it completes). A draining
-//! tunnel is shut down once empty, or after the drain backstop
-//! ([`DEFAULT_DRAIN_BACKSTOP`]), which fails its remaining flows. Rotation
-//! and failure replacement share the same `spawn_connect` path.
+//! thresholds. The byte threshold always fires — a busy tunnel rotates
+//! once it has moved enough bytes, and its active flows complete during
+//! the drain. The age threshold only fires when the tunnel has zero BUSY
+//! flows (activity within [`IDLE_FLOW_THRESHOLD`]), so a tunnel carrying
+//! only long-lived but sporadic connections (browser H2 keep-alive, push
+//! sockets) rotates on schedule instead of dragging them into the drain.
+//! When a threshold fires the tunnel enters **draining** — no new flows
+//! are assigned, active flows run to completion, idle flows are reaped on
+//! each poll (closed exactly like a client-initiated close, so apps
+//! reconnect onto fresh tunnels), and a replacement handshake is spawned
+//! in the same critical section (the remaining assignable tunnels absorb
+//! new flows while it completes). A draining tunnel is shut down once
+//! empty, or after the drain backstop ([`DEFAULT_DRAIN_BACKSTOP`]), which
+//! fails its remaining flows. Rotation and failure replacement share the
+//! same `spawn_connect` path.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -53,6 +61,18 @@ const METRICS_INTERVAL: Duration = Duration::from_secs(60);
 /// still active on a draining tunnel after an hour is not going to finish.
 const DEFAULT_DRAIN_BACKSTOP: Duration = Duration::from_secs(3600);
 
+/// A flow with no traffic in either direction for this long is "idle".
+///
+/// Drives the rotation/drain policy: the age threshold only fires on a
+/// tunnel with zero busy flows (so a tunnel full of idle keep-alive
+/// connections rotates on schedule instead of pinning the pool), and each
+/// draining poll reaps flows idle past this threshold so drains complete
+/// in minutes instead of hitting the [`DEFAULT_DRAIN_BACKSTOP`] mass-fail.
+/// 120s is long enough to not churn connections between page loads, short
+/// enough that drains complete promptly; reaped apps reconnect
+/// transparently onto a fresh tunnel on their next request.
+const IDLE_FLOW_THRESHOLD: Duration = Duration::from_secs(120);
+
 /// Liveness + load view of a pooled tunnel.
 ///
 /// Abstracted into a trait so the pool's striping/refill/rotation logic is
@@ -66,6 +86,14 @@ pub trait PoolTunnel: Send + Sync + 'static {
     fn age(&self) -> Duration;
     /// Total payload bytes relayed through the tunnel (both directions).
     fn bytes_relayed(&self) -> u64;
+    /// Number of flows with activity in either direction within `idle`.
+    /// The age rotation threshold only fires when this returns zero.
+    fn busy_flow_count(&self, idle: Duration) -> usize;
+    /// Close every flow idle longer than `idle`, exactly like a normal
+    /// client-initiated close (CloseFlow upstream, local socket closes).
+    /// Returns the number of reaped flows. Called each poll while the
+    /// tunnel drains.
+    fn reap_idle_flows(&self, idle: Duration) -> impl std::future::Future<Output = usize> + Send;
     /// Force-close the tunnel, failing its remaining flows. Called when a
     /// draining tunnel empties or hits the drain backstop.
     fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send;
@@ -86,6 +114,14 @@ impl PoolTunnel for Socks5Tunnel {
 
     fn bytes_relayed(&self) -> u64 {
         Socks5Tunnel::bytes_relayed(self)
+    }
+
+    fn busy_flow_count(&self, idle: Duration) -> usize {
+        Socks5Tunnel::busy_flow_count(self, idle)
+    }
+
+    async fn reap_idle_flows(&self, idle: Duration) -> usize {
+        Socks5Tunnel::reap_idle_flows(self, idle).await
     }
 
     async fn shutdown(&self) {
@@ -478,7 +514,7 @@ fn spawn_watcher<T: PoolTunnel>(ctx: PoolCtx<T>, tunnel: &Arc<T>) {
                 return;
             }
 
-            let Some(idx) = guard
+            let Some(mut idx) = guard
                 .tunnels
                 .iter()
                 .position(|e| Arc::ptr_eq(&e.tunnel, &t))
@@ -491,11 +527,20 @@ fn spawn_watcher<T: PoolTunnel>(ctx: PoolCtx<T>, tunnel: &Arc<T>) {
             // under the same lock, so no observer ever sees a drain without
             // a replacement already in flight. New flows stripe onto the
             // remaining assignable tunnels while the handshake completes.
+            //
+            // The byte threshold fires regardless of flow activity — a
+            // genuinely busy tunnel rotates once it has moved enough bytes,
+            // and its active flows complete during the drain. The age
+            // threshold only fires when the tunnel has zero busy flows, so
+            // long-lived but sporadic flows (browser H2 keep-alive, push
+            // sockets) never defer rotation: the tunnel is effectively
+            // idle and the drain reaps those flows within one poll.
             {
                 let entry = &guard.tunnels[idx];
                 let threshold_hit = !entry.draining
-                    && (t.age() >= entry.rotate_at_age
-                        || t.bytes_relayed() >= entry.rotate_at_bytes);
+                    && (t.bytes_relayed() >= entry.rotate_at_bytes
+                        || (t.age() >= entry.rotate_at_age
+                            && t.busy_flow_count(IDLE_FLOW_THRESHOLD) == 0));
                 if threshold_hit {
                     let entry = &mut guard.tunnels[idx];
                     entry.draining = true;
@@ -510,6 +555,32 @@ fn spawn_watcher<T: PoolTunnel>(ctx: PoolCtx<T>, tunnel: &Arc<T>) {
                     );
                     ensure_target(&ctx, &mut guard);
                 }
+            }
+
+            // While draining, reap idle flows each poll so keep-alive
+            // connections close within one threshold window instead of
+            // pinning the tunnel until the backstop. The pool lock MUST
+            // NOT be held across the reap (it sends on the writer channel
+            // and may await) — re-acquire and re-locate the entry after.
+            if guard.tunnels[idx].draining {
+                drop(guard);
+                let reaped = t.reap_idle_flows(IDLE_FLOW_THRESHOLD).await;
+                if reaped > 0 {
+                    debug!(
+                        "pool '{}': reaped {} idle flow(s) from draining tunnel",
+                        ctx.name, reaped
+                    );
+                }
+                guard = inner_arc.lock().await;
+                let Some(new_idx) = guard
+                    .tunnels
+                    .iter()
+                    .position(|e| Arc::ptr_eq(&e.tunnel, &t))
+                else {
+                    // Entry already removed (drain completed elsewhere).
+                    return;
+                };
+                idx = new_idx;
             }
 
             // Drain completion: close when empty, or fail remaining flows
@@ -702,9 +773,12 @@ mod tests {
         id: u32,
         alive: AtomicBool,
         flows: AtomicUsize,
+        /// Of `flows`, how many are busy (activity within the idle window).
+        busy: AtomicUsize,
         /// Controllable age in milliseconds (real tunnels use a clock).
         age_ms: AtomicU64,
         bytes: AtomicU64,
+        reaped: AtomicUsize,
         shutdown_called: AtomicBool,
     }
 
@@ -723,6 +797,21 @@ mod tests {
 
         fn bytes_relayed(&self) -> u64 {
             self.bytes.load(Ordering::SeqCst)
+        }
+
+        fn busy_flow_count(&self, _idle: Duration) -> usize {
+            self.busy.load(Ordering::SeqCst)
+        }
+
+        async fn reap_idle_flows(&self, _idle: Duration) -> usize {
+            // Every non-busy flow is idle; reaping closes it. Busy flows
+            // keep the tunnel alive.
+            let flows = self.flows.load(Ordering::SeqCst);
+            let busy = self.busy.load(Ordering::SeqCst).min(flows);
+            let reaped = flows - busy;
+            self.flows.store(busy, Ordering::SeqCst);
+            self.reaped.fetch_add(reaped, Ordering::SeqCst);
+            reaped
         }
 
         async fn shutdown(&self) {
@@ -751,8 +840,10 @@ mod tests {
                     id,
                     alive: AtomicBool::new(true),
                     flows: AtomicUsize::new(0),
+                    busy: AtomicUsize::new(0),
                     age_ms: AtomicU64::new(0),
                     bytes: AtomicU64::new(0),
+                    reaped: AtomicUsize::new(0),
                     shutdown_called: AtomicBool::new(false),
                 }))
             })
@@ -1021,9 +1112,12 @@ mod tests {
         wait_for_live(&pool, 2).await;
         let attempts_before = state.attempts.load(Ordering::SeqCst);
 
-        // One in-flight flow keeps the drain from completing instantly.
+        // One busy in-flight flow keeps the drain from completing
+        // instantly; the byte threshold starts the drain regardless of
+        // activity (an idle flow would now be reaped in the same poll).
         t0.flows.store(1, Ordering::SeqCst);
-        t0.age_ms.store(61_000, Ordering::SeqCst);
+        t0.busy.store(1, Ordering::SeqCst);
+        t0.bytes.store(2 * 1024 * 1024, Ordering::SeqCst);
 
         // Wait until t0 is draining; a replacement connect must already be
         // in flight or done (spawned under the same lock as the drain mark).
@@ -1083,9 +1177,11 @@ mod tests {
         let (pool, _state) = mock_pool_rot(1, 8, 64, rotation);
         let t0 = pool.pick_tunnel().await.expect("first pick");
 
-        // One flow that never completes.
+        // One busy flow that never completes; the byte threshold fires
+        // regardless of activity (busy flows defer only the AGE threshold).
         t0.flows.store(1, Ordering::SeqCst);
-        t0.age_ms.store(61_000, Ordering::SeqCst);
+        t0.busy.store(1, Ordering::SeqCst);
+        t0.bytes.store(2 * 1024 * 1024, Ordering::SeqCst);
 
         // The tunnel must survive the drain briefly, then the 100ms
         // backstop fires shutdown, failing the stuck flow.
@@ -1110,9 +1206,11 @@ mod tests {
         let (pool, _state) = mock_pool_rot(1, 8, 64, rotation);
         let t0 = pool.pick_tunnel().await.expect("first pick");
 
-        // One long-lived flow; the tunnel starts draining on age.
+        // One long-lived busy flow; the byte threshold fires regardless of
+        // activity and starts the drain (a busy flow defers only age).
         t0.flows.store(1, Ordering::SeqCst);
-        t0.age_ms.store(61_000, Ordering::SeqCst);
+        t0.busy.store(1, Ordering::SeqCst);
+        t0.bytes.store(2 * 1024 * 1024, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_secs(1)).await; // a few watcher ticks
 
         // Well past the old 300s hard cap, the live flow must keep the
@@ -1125,6 +1223,7 @@ mod tests {
         assert!(t0.is_alive());
 
         // The flow ends — the drain completes on the next watcher tick.
+        t0.busy.store(0, Ordering::SeqCst);
         t0.flows.store(0, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(
@@ -1147,9 +1246,11 @@ mod tests {
         let (pool, _state) = mock_pool_rot(1, 8, 64, rotation);
         let t0 = pool.pick_tunnel().await.expect("first pick");
 
-        // One flow that never completes.
+        // One busy flow that never completes; the byte threshold starts
+        // the drain regardless of activity.
         t0.flows.store(1, Ordering::SeqCst);
-        t0.age_ms.store(61_000, Ordering::SeqCst);
+        t0.busy.store(1, Ordering::SeqCst);
+        t0.bytes.store(2 * 1024 * 1024, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_secs(1)).await; // drain starts
         assert!(!t0.shutdown_called.load(Ordering::SeqCst));
 
@@ -1160,6 +1261,114 @@ mod tests {
             "backstop must fire for a flow stuck past 3600s"
         );
         assert!(!t0.is_alive());
+    }
+
+    /// (a) The age threshold must NOT fire while the tunnel has busy flows.
+    #[tokio::test]
+    async fn age_rotation_deferred_while_flows_busy() {
+        let (pool, _state) = mock_pool_rot(1, 8, 64, test_rotation());
+        let t0 = pool.pick_tunnel().await.expect("first pick");
+
+        // One busy flow; age is past the (unjittered) 60s threshold.
+        t0.flows.store(1, Ordering::SeqCst);
+        t0.busy.store(1, Ordering::SeqCst);
+        t0.age_ms.store(61_000, Ordering::SeqCst);
+
+        // Several watcher polls: no drain may start.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let inner = pool.inner.lock().await;
+        assert_eq!(inner.rotations, 0, "busy flow must defer age rotation");
+        assert!(
+            inner
+                .tunnels
+                .iter()
+                .any(|e| e.tunnel.id == t0.id && !e.draining),
+            "tunnel must stay assignable"
+        );
+    }
+
+    /// (b) Once every flow is idle, the age threshold fires and the drain
+    /// reaps the idle flows instead of waiting for them to end.
+    #[tokio::test]
+    async fn age_rotation_fires_once_flows_go_idle_and_drain_reaps() {
+        let (pool, _state) = mock_pool_rot(1, 8, 64, test_rotation());
+        let t0 = pool.pick_tunnel().await.expect("first pick");
+
+        // Three long-lived flows, one of them active: no age rotation.
+        t0.flows.store(3, Ordering::SeqCst);
+        t0.busy.store(1, Ordering::SeqCst);
+        t0.age_ms.store(61_000, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(pool.inner.lock().await.rotations, 0);
+
+        // The last busy flow goes idle: the age threshold fires, the drain
+        // reaps all three idle flows, and the tunnel closes without ever
+        // hitting the drain backstop.
+        t0.busy.store(0, Ordering::SeqCst);
+        wait_until(|| t0.shutdown_called.load(Ordering::SeqCst)).await;
+        assert_eq!(t0.reaped.load(Ordering::SeqCst), 3);
+        let inner = pool.inner.lock().await;
+        assert_eq!(inner.rotations, 1);
+        assert!(inner.tunnels.iter().all(|e| e.tunnel.id != t0.id));
+    }
+
+    /// (c) The byte threshold fires regardless of flow activity; during
+    /// the drain, busy flows run to completion while idle ones are reaped.
+    #[tokio::test(start_paused = true)]
+    async fn byte_rotation_fires_regardless_of_flow_activity() {
+        let rotation = RotationConfig {
+            drain_timeout: DEFAULT_DRAIN_BACKSTOP,
+            poll_interval: Duration::from_millis(100),
+            ..test_rotation()
+        };
+        let (pool, _state) = mock_pool_rot(1, 8, 64, rotation);
+        let t0 = pool.pick_tunnel().await.expect("first pick");
+
+        // Four flows, two of them busy; exceed the 1 MB byte threshold.
+        t0.flows.store(4, Ordering::SeqCst);
+        t0.busy.store(2, Ordering::SeqCst);
+        t0.bytes.store(2 * 1024 * 1024, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await; // a few watcher ticks
+
+        // Draining started despite the busy flows; the two idle flows were
+        // reaped, the busy ones still pin the tunnel.
+        assert_eq!(pool.inner.lock().await.rotations, 1);
+        assert_eq!(t0.reaped.load(Ordering::SeqCst), 2);
+        assert_eq!(t0.active_flow_count(), 2);
+        assert!(!t0.shutdown_called.load(Ordering::SeqCst));
+
+        // The active flows complete; the drain then closes the tunnel.
+        t0.busy.store(0, Ordering::SeqCst);
+        t0.flows.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(t0.shutdown_called.load(Ordering::SeqCst));
+    }
+
+    /// (d) The production pathology: 45 idle keep-alive flows on a tunnel
+    /// past its age threshold. The drain must reap them within a couple of
+    /// polls — nowhere near the 3600s backstop.
+    #[tokio::test(start_paused = true)]
+    async fn drain_completes_via_reaping_without_backstop() {
+        let rotation = RotationConfig {
+            drain_timeout: DEFAULT_DRAIN_BACKSTOP,
+            poll_interval: Duration::from_millis(100),
+            ..test_rotation()
+        };
+        let (pool, _state) = mock_pool_rot(1, 8, 64, rotation);
+        let t0 = pool.pick_tunnel().await.expect("first pick");
+
+        t0.flows.store(45, Ordering::SeqCst);
+        t0.age_ms.store(61_000, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await; // a few watcher ticks
+
+        assert_eq!(t0.reaped.load(Ordering::SeqCst), 45);
+        assert!(
+            t0.shutdown_called.load(Ordering::SeqCst),
+            "drain must complete via reaping, not the backstop"
+        );
+        let inner = pool.inner.lock().await;
+        assert_eq!(inner.rotations, 1);
+        assert!(inner.tunnels.iter().all(|e| e.tunnel.id != t0.id));
     }
 
     #[tokio::test]

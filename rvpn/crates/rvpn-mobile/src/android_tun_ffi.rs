@@ -93,6 +93,7 @@ static TUN_CLIENT: parking_lot::Mutex<Option<Arc<AndroidTunClient>>> =
 static TUN_RUNTIME: parking_lot::Mutex<Option<tokio::runtime::Runtime>> =
     parking_lot::Mutex::new(None);
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+static DNS_PROXY_PORT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static TRACING_INITIALIZED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -128,7 +129,7 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnInitialize() -> c_in
     SUCCESS
 }
 
-fn set_last_error(msg: &str) {
+pub(crate) fn set_last_error(msg: &str) {
     let mut guard = LAST_ERROR.lock();
     *guard = msg.to_string();
 }
@@ -431,6 +432,8 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnStart(
         // the TOFU pin slot, not the stealth ClientHello selector.
         stealth_fingerprint: None,
         server_identity_pin: mobile_config.server_fingerprint,
+        signed_x25519_seen: false,
+        trust_on_first_use: mobile_config.trust_on_first_use.unwrap_or(true),
         country_ips_file: mobile_config.country_ips_file,
         // The legacy MobileConfig format predates multi-server routing;
         // profiles with exit servers go through rvpnTunCreate (full TunConfig
@@ -507,6 +510,7 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<AndroidTunClient>) -> anyho
         tls_fingerprint: client.tls_fingerprint(),
         identity_key: Arc::new(client.identity_key().clone()),
         server_bundle: client.server_bundle().clone(),
+        security: client.default_security(),
     };
 
     let doh_client = Arc::new(DohClient::new(flow_config, dns_path));
@@ -529,8 +533,12 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<AndroidTunClient>) -> anyho
     // The exit servers' own hostnames must always bypass the tunnel in the
     // DNS layer — the reconnect path resolves them while the tunnel is down.
     let mut server_hostnames: Vec<String> = vec![client.server_host().to_string()];
-    server_hostnames.extend(extra_dns_info.iter().map(|(_, host, _, _, _)| host.clone()));
-    for (name, host, port, base_path, bundle) in extra_dns_info {
+    server_hostnames.extend(
+        extra_dns_info
+            .iter()
+            .map(|(_, host, _, _, _, _)| host.clone()),
+    );
+    for (name, host, port, base_path, bundle, security) in extra_dns_info {
         let dns_path = format!(
             "{}/dns",
             base_path.trim_end_matches("/tun").trim_end_matches('/')
@@ -542,6 +550,7 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<AndroidTunClient>) -> anyho
             tls_fingerprint: client.tls_fingerprint(),
             identity_key: Arc::new(client.identity_key().clone()),
             server_bundle: bundle,
+            security,
         };
         let doh = Arc::new(DohClient::new(flow_config, dns_path));
         doh.clone().start_cleanup_task();
@@ -561,7 +570,7 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<AndroidTunClient>) -> anyho
     }
 
     let split_tunnel_config = rvpn_split_tunnel::SplitTunnelConfig {
-        enabled: true,
+        enabled: client.is_split_tunnel_enabled(),
         builtin_bypass_countries: client.get_builtin_bypass_countries().to_vec(),
         bypass_networks: client.get_bypass_networks().to_vec(),
         block_ads: client.is_block_ads_enabled(),
@@ -607,7 +616,12 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<AndroidTunClient>) -> anyho
         client.get_dns_bind_addr()
     );
 
-    dns_server.run().await
+    dns_server
+        .run_with_ready(|addr| {
+            DNS_PROXY_PORT.store(i32::from(addr.port()), std::sync::atomic::Ordering::Release);
+            logcat_info!("[Android_TUN_FFI] DNS proxy ready on {}", addr);
+        })
+        .await
 }
 
 #[cfg(not(feature = "dns"))]
@@ -668,6 +682,7 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunCreate(
 
 fn create_tun_client_impl(json_str: &str) -> c_int {
     logcat_info!("create_tun_client_impl() called");
+    DNS_PROXY_PORT.store(0, std::sync::atomic::Ordering::Release);
 
     let config: TunConfig = match serde_json::from_str::<TunConfig>(json_str) {
         Ok(c) => {
@@ -840,8 +855,6 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunStart() -> c_int 
             }
         });
         logcat_info!("[Android_TUN_FFI] DNS proxy task spawned");
-        // Give DNS proxy a moment to bind before packet relay starts
-        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     // Enable the auto-reconnect loop and hand off to `client.start()`. The
@@ -860,6 +873,16 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunGetState() -> c_i
         Some(client) => client.get_state() as c_int,
         None => ERROR_NOT_INITIALIZED,
     }
+}
+
+/// Return the OS-assigned DNS proxy port, or zero until the proxy is ready.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunGetDnsProxyPort(
+    _env: *mut jni_sys::JNIEnv,
+    _class: jclass,
+) -> c_int {
+    DNS_PROXY_PORT.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Get the tunnel IP address, writing it into a pre-allocated buffer.
@@ -939,6 +962,25 @@ pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunGetServerI
 
     let pin = client.server_identity_pin_for(&name).unwrap_or_default();
     env.new_string(&pin).unwrap_or_default().as_raw()
+}
+
+/// Return 1 when the named server has proved signed X25519 support, 0 otherwise.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunSignedX25519SeenFor(
+    env_ptr: *mut jni_sys::JNIEnv,
+    _class: jclass,
+    name: jstring,
+) -> c_int {
+    let name = match jstring_to_rust(env_ptr, name) {
+        Some(name) => name,
+        None => return 0,
+    };
+    let client = match TUN_CLIENT.lock().clone() {
+        Some(client) => client.clone(),
+        None => return 0,
+    };
+    i32::from(client.signed_x25519_seen_for(&name).unwrap_or(false))
 }
 
 /// Write the tunnel IP into a pre-allocated buffer (alternative buffer-based API).
@@ -1089,6 +1131,7 @@ pub extern "C" fn Java_com_rvpn_client_core_RustVPNCore_rvpnTunDestroy() {
     // runs BlockingPool::shutdown outside any tokio context, which is safe.
     *TUN_CLIENT.lock() = None;
     *TUN_RUNTIME.lock() = None;
+    DNS_PROXY_PORT.store(0, std::sync::atomic::Ordering::Release);
     logcat_info!("[Android_TUN_FFI] TUN client and runtime cleared");
 }
 

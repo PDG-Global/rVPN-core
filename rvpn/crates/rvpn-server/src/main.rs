@@ -15,7 +15,6 @@ use rvpn_server::config::{ServerConfig, TunNetworkConfig};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -27,6 +26,22 @@ use tracing_subscriber::FmtSubscriber;
 
 use rvpn_server::decoy::{parse_request_head, DecoyServer, RequestHead, RewindStream};
 use rvpn_server::handler::{DnsHandler, MultiplexerHandler, TunHandler, VpnHandler};
+
+/// TCP_NOTSENT_LOWAT applied to every accepted tunnel socket (Linux only).
+///
+/// The WebSocket writer keeps writing as long as the kernel reports the
+/// socket writable; with default send-buffer autotuning the buffer grows
+/// toward `net.ipv4.tcp_wmem` max (commonly 4 MB), which becomes a standing
+/// bufferbloat queue whenever the downstream hop drains slower than the TUN
+/// reader feeds packets — e.g. the loopback hop to a reverse proxy
+/// (caddy :443 → rvpn-server :8443), where loopback BDP is huge. Measured
+/// on a congested HK exit as 4 MB queued in the server's own Send-Q and
+/// >1 s added RTT for traffic sharing the tunnel during a bulk download.
+/// Limiting *unsent* data to 64 KiB pushes backpressure up to the TUN
+/// response channel (which drops rather than queues), while throughput on
+/// fast paths is unaffected — in-flight data is not limited by this option.
+#[cfg(target_os = "linux")]
+const TCP_NOTSENT_LOWAT_BYTES: u32 = 64 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -83,7 +98,15 @@ async fn main() -> Result<()> {
 /// Run the VPN server
 async fn run_server(config: ServerConfig) -> Result<()> {
     info!("Starting R-VPN Server on {}", config.bind_address);
-    verify_tun_network_prerequisites(&config);
+
+    // Deny relays and raw TUN egress to the host's own interface addresses —
+    // SSH and other local services must not be reachable through the VPN.
+    // Operator-configured public_addresses (1:1 NAT) are denied too. Fail
+    // closed: refuse to accept clients if the address set cannot be
+    // enumerated, and keep it refreshed as interfaces change.
+    rvpn_server::egress::initialize_host_egress_policy(&config.network.public_addresses)
+        .context("Host egress policy initialization failed; refusing to accept clients")?;
+    rvpn_server::egress::spawn_host_egress_refresh();
 
     // Initialize TUN server if configured (must be done before creating handlers)
     let tun_server = rvpn_server::tun_server::TunServer::new(&config.tun)?;
@@ -92,6 +115,11 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     let tun_server_for_loop = tun_server.clone();
 
     if config.tun.enabled {
+        rvpn_server::firewall::setup_tun_egress(&config).context(
+            "TUN egress containment failed; refusing to accept clients. \
+             Firewall management needs root, or CAP_NET_ADMIN when using the \
+             documented systemd unit; on FreeBSD the rc.d service runs as root",
+        )?;
         {
             let mut ts = tun_server_for_loop.write().await;
             ts.start().await?;
@@ -101,7 +129,10 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     }
 
     let handler = Arc::new(RwLock::new(VpnHandler::new(config.clone())?));
-    let tun_handler = Arc::new(RwLock::new(TunHandler::new(config.clone(), Some(tun_server.clone()))?));
+    let tun_handler = Arc::new(RwLock::new(TunHandler::new(
+        config.clone(),
+        Some(tun_server.clone()),
+    )?));
     let dns_handler = Arc::new(RwLock::new(DnsHandler::new(config.clone())?));
     let mux_handler = Arc::new(RwLock::new(MultiplexerHandler::new(config.clone())?));
 
@@ -132,16 +163,18 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     // Path for SOCKS5 multiplexed connections (single WebSocket, multiple flows)
     let mux_path = format!("{}/mux", config.websocket_path.trim_end_matches('/'));
 
-    let addr: SocketAddr = config.bind_address.parse()
+    let addr: SocketAddr = config
+        .bind_address
+        .parse()
         .context("Invalid bind address")?;
 
     // Check if TLS is configured — either static cert files or automatic
     // ACME (mutually exclusive, checked in configure_tls).
-    let tls_acceptor = configure_tls(&config).await
+    let tls_acceptor = configure_tls(&config)
+        .await
         .context("Failed to configure TLS")?;
 
-    let listener = TcpListener::bind(addr).await
-        .context("Failed to bind")?;
+    let listener = TcpListener::bind(addr).await.context("Failed to bind")?;
 
     let protocol = if tls_acceptor.is_some() { "wss" } else { "ws" };
     info!("Server listening on {}://{}", protocol, addr);
@@ -156,18 +189,23 @@ async fn run_server(config: ServerConfig) -> Result<()> {
         let http_addr: SocketAddr = format!("0.0.0.0:{}", http_port)
             .parse()
             .context("Invalid HTTP bind address")?;
-        
+
         match TcpListener::bind(http_addr).await {
             Ok(http_listener) => {
-                info!("HTTP server listening on http://{}", http_listener.local_addr()?);
-                
+                info!(
+                    "HTTP server listening on http://{}",
+                    http_listener.local_addr()?
+                );
+
                 let redirect_https = config.redirect_http_to_https;
                 tokio::spawn(async move {
                     loop {
                         match http_listener.accept().await {
                             Ok((stream, peer_addr)) => {
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_http_port(stream, peer_addr, redirect_https).await {
+                                    if let Err(e) =
+                                        handle_http_port(stream, peer_addr, redirect_https).await
+                                    {
                                         debug!("HTTP error from {}: {}", peer_addr, e);
                                     }
                                 });
@@ -185,14 +223,30 @@ async fn run_server(config: ServerConfig) -> Result<()> {
         }
     }
 
-    info!("WebSocket endpoint (desktop SOCKS): {}", config.websocket_path);
+    info!(
+        "WebSocket endpoint (desktop SOCKS): {}",
+        config.websocket_path
+    );
     info!("WebSocket endpoint (mobile TUN): {}", tun_path);
     info!("WebSocket endpoint (DNS proxy): {}", dns_path);
 
     // Accept connections
     loop {
-        let (stream, peer_addr) = listener.accept().await
+        let (stream, peer_addr) = listener
+            .accept()
+            .await
             .context("Failed to accept connection")?;
+
+        // Bound the kernel-level send queue (see TCP_NOTSENT_LOWAT_BYTES).
+        // Without this, a slow downstream hop turns the socket buffer into
+        // a multi-MB standing queue instead of dropping at the TUN reader.
+        #[cfg(target_os = "linux")]
+        {
+            let sock_ref = socket2::SockRef::from(&stream);
+            if let Err(e) = sock_ref.set_tcp_notsent_lowat(TCP_NOTSENT_LOWAT_BYTES) {
+                debug!("Failed to set TCP_NOTSENT_LOWAT for {}: {}", peer_addr, e);
+            }
+        }
 
         let handler = handler.clone();
         let tun_handler = tun_handler.clone();
@@ -234,25 +288,20 @@ async fn run_server(config: ServerConfig) -> Result<()> {
 fn setup_tun_routing(config: &TunNetworkConfig) -> Result<()> {
     use std::process::Command;
 
-    // Parse CIDR and calculate actual network address (e.g., "10.200.0.1/24" -> "10.200.0.0/24")
-    let parts: Vec<&str> = config.tun_ip.split('/').collect();
-    let ip_str = parts.first().unwrap();
-    let prefix: u8 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(24);
-
-    let ip: std::net::Ipv4Addr = ip_str.parse()
-        .with_context(|| format!("Invalid IP: {}", ip_str))?;
-
-    let ip_u32 = u32::from(ip);
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
-    let network_u32 = ip_u32 & mask;
-
-    let network = format!(
-        "{}/{}",
-        std::net::Ipv4Addr::from(network_u32),
-        prefix
-    );
+    let network = rvpn_server::egress::normalized_tun_subnet(&config.tun_ip)?;
 
     // Add route to TUN network via TUN interface
+    #[cfg(target_os = "freebsd")]
+    let output = Command::new("route")
+        .args([
+            "add",
+            "-net",
+            &network,
+            "-interface",
+            &config.interface_name,
+        ])
+        .output()?;
+    #[cfg(not(target_os = "freebsd"))]
     let output = Command::new("ip")
         .args(["route", "add", &network, "dev", &config.interface_name])
         .output()?;
@@ -266,84 +315,43 @@ fn setup_tun_routing(config: &TunNetworkConfig) -> Result<()> {
     }
 
     info!("Added route for {} via {}", network, config.interface_name);
-    Ok(())
-}
 
-fn verify_tun_network_prerequisites(config: &ServerConfig) {
-    if !config.network.nat_enabled {
-        warn!("server.network.nat_enabled is false; full-tunnel Internet egress will require external routing");
-        return;
-    }
-
-    if cfg!(target_os = "linux") {
-        match std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward") {
-            Ok(v) => {
-                if v.trim() != "1" {
-                    warn!("net.ipv4.ip_forward is disabled; enable it for full-tunnel packet forwarding");
-                } else {
-                    info!("Kernel IPv4 forwarding is enabled");
+    // Optional CAKE shaper on the TUN interface. When the path to clients
+    // has a known rate-limited bottleneck (e.g. a capped transit product),
+    // shaping just below it moves the standing queue from the bottleneck's
+    // policer — where it adds seconds of bufferbloat with no fairness —
+    // into our own qdisc, where cake fair-shares between inner flows.
+    if let Some(kbit) = config.shaper_bandwidth_kbit {
+        if cfg!(target_os = "linux") {
+            let bw = format!("{}kbit", kbit);
+            let tc = Command::new("tc")
+                .args([
+                    "qdisc",
+                    "replace",
+                    "dev",
+                    &config.interface_name,
+                    "root",
+                    "cake",
+                    "bandwidth",
+                    &bw,
+                ])
+                .output();
+            match tc {
+                Ok(out) if out.status.success() => {
+                    info!("CAKE shaper enabled on {} at {}", config.interface_name, bw);
                 }
+                Ok(out) => warn!(
+                    "Failed to set CAKE shaper on {}: {}",
+                    config.interface_name,
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                Err(e) => warn!("tc not available, skipping CAKE shaper: {}", e),
             }
-            Err(e) => warn!("Unable to read /proc/sys/net/ipv4/ip_forward: {}", e),
+        } else {
+            warn!("shaper_bandwidth_kbit is only supported on Linux; ignoring");
         }
     }
-
-    match detect_default_interface() {
-        Some(iface) => {
-            if !has_nat_masquerade_rule(&iface, &config.network.dhcp_range) {
-                warn!(
-                    "NAT MASQUERADE rule appears missing for subnet {} via interface {}; full-tunnel Internet access may fail",
-                    config.network.dhcp_range, iface
-                );
-            } else {
-                info!(
-                    "Detected NAT MASQUERADE rule for subnet {} via interface {}",
-                    config.network.dhcp_range, iface
-                );
-            }
-        }
-        None => warn!("Could not detect default egress interface; verify NAT MASQUERADE setup manually"),
-    }
-}
-
-fn detect_default_interface() -> Option<String> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg("ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"dev\"){print $(i+1); exit}}'")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let iface = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if iface.is_empty() {
-        None
-    } else {
-        Some(iface)
-    }
-}
-
-fn has_nat_masquerade_rule(interface: &str, subnet: &str) -> bool {
-    let cmd = format!(
-        "iptables -t nat -C POSTROUTING -s {} -o {} -j MASQUERADE >/dev/null 2>&1",
-        subnet, interface
-    );
-    if let Ok(status) = Command::new("sh").arg("-c").arg(&cmd).status() {
-        if status.success() {
-            return true;
-        }
-    }
-
-    let legacy_cmd = format!(
-        "iptables -t nat -S POSTROUTING 2>/dev/null | grep -q -- '-s {} -o {} -j MASQUERADE'",
-        subnet, interface
-    );
-    Command::new("sh")
-        .arg("-c")
-        .arg(&legacy_cmd)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    Ok(())
 }
 
 /// Server TLS front-end. Either a static rustls acceptor, or the pair of
@@ -396,42 +404,74 @@ impl RvpnTlsAcceptor {
 /// - `[acme].enabled = true` → obtain and auto-renew a Let's Encrypt cert
 ///   via TLS-ALPN-01 on the existing `:443` listener. No `:80` needed.
 /// - `tls_cert_file` + `tls_key_file` present on disk → static cert path.
-/// - Neither → run in plain-WebSocket mode (reverse proxy expected).
+/// - Neither → plain WebSocket only with `allow_plaintext = true` for a
+///   trusted reverse proxy.
 ///
-/// Refuses at startup if both ACME and a static cert are configured, so
-/// there's exactly one authority for the served certificate.
+/// Missing or invalid certificates and conflicting ACME/static settings are
+/// fatal instead of silently exposing plaintext.
 async fn configure_tls(config: &ServerConfig) -> Result<Option<RvpnTlsAcceptor>> {
-    let static_cert_present = config.tls_cert_file.exists() && config.tls_key_file.exists();
+    let cert_exists = config.tls_cert_file.exists();
+    let key_exists = config.tls_key_file.exists();
+    if cert_exists != key_exists {
+        anyhow::bail!(
+            "TLS certificate and key must both exist. Missing {:?}; provide both files or remove both and explicitly set allow_plaintext=true only behind a trusted proxy",
+            if cert_exists { &config.tls_key_file } else { &config.tls_cert_file }
+        );
+    }
 
     if config.acme.enabled {
-        if static_cert_present {
+        if cert_exists {
             anyhow::bail!(
                 "[acme].enabled=true but static TLS cert files also exist at {:?} / {:?}. \
                  Move or remove them, or disable [acme] — the server won't guess which to serve.",
-                config.tls_cert_file, config.tls_key_file
+                config.tls_cert_file,
+                config.tls_key_file
             );
         }
         return Ok(Some(build_acme_acceptor(&config.acme).await?));
     }
 
-    if static_cert_present {
+    if cert_exists {
         info!("Loading TLS certificates...");
-        match load_tls_config(&config.tls_cert_file, &config.tls_key_file) {
-            Ok(tls_config) => {
-                info!("TLS enabled on {}", config.bind_address);
-                Ok(Some(RvpnTlsAcceptor::Static(
-                    tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)),
-                )))
-            }
-            Err(e) => {
-                warn!("Failed to load TLS certificates: {}. Running without TLS.", e);
-                Ok(None)
-            }
-        }
-    } else {
-        info!("No TLS certificates configured. Running in plain WebSocket mode (suitable for behind reverse proxy)");
-        Ok(None)
+        rvpn_server::private_files::require_private_file(&config.tls_key_file)?;
+        let tls_config = load_tls_config(&config.tls_cert_file, &config.tls_key_file)
+            .with_context(|| {
+                format!(
+                    "Cannot start with invalid TLS files {:?} / {:?}; replace or repair them (plaintext opt-in does not permit invalid files)",
+                    config.tls_cert_file, config.tls_key_file
+                )
+            })?;
+        info!("TLS enabled on {}", config.bind_address);
+        return Ok(Some(RvpnTlsAcceptor::Static(
+            tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)),
+        )));
     }
+
+    if config.allow_plaintext {
+        let exposed = config
+            .bind_address
+            .parse::<SocketAddr>()
+            .map(|address| !address.ip().is_loopback())
+            .unwrap_or(true);
+        if exposed {
+            warn!(
+                "Plain WebSocket is exposed on {} without TLS",
+                config.bind_address
+            );
+        } else {
+            warn!(
+                "Plain WebSocket enabled on {}; use only behind a trusted TLS-terminating proxy",
+                config.bind_address
+            );
+        }
+        return Ok(None);
+    }
+
+    anyhow::bail!(
+        "TLS certificates are missing at {:?} / {:?}; provide both files, enable [acme], or set allow_plaintext=true only behind a trusted TLS-terminating proxy",
+        config.tls_cert_file,
+        config.tls_key_file
+    )
 }
 
 /// Build a `tokio_rustls::TlsAcceptor` backed by `rustls-acme`.
@@ -439,16 +479,12 @@ async fn configure_tls(config: &ServerConfig) -> Result<Option<RvpnTlsAcceptor>>
 /// The same `:443` listener handles both live traffic and the TLS-ALPN-01
 /// challenge: rustls sees the `acme-tls/1` ALPN, calls the ACME resolver,
 /// which returns the challenge cert. A background task drives renewals.
-async fn build_acme_acceptor(
-    acme: &rvpn_server::config::AcmeConfig,
-) -> Result<RvpnTlsAcceptor> {
+async fn build_acme_acceptor(acme: &rvpn_server::config::AcmeConfig) -> Result<RvpnTlsAcceptor> {
     use futures_util::StreamExt as _;
     use rustls_acme::{caches::DirCache, AcmeConfig as RustlsAcmeConfig};
 
     if acme.domains.is_empty() {
-        anyhow::bail!(
-            "[acme].enabled=true but no [acme].domains listed — set at least one FQDN"
-        );
+        anyhow::bail!("[acme].enabled=true but no [acme].domains listed — set at least one FQDN");
     }
 
     tokio::fs::create_dir_all(&acme.cache_dir).await.with_context(|| {
@@ -464,7 +500,11 @@ async fn build_acme_acceptor(
     let cache_is_empty = acme_cache_is_empty(&acme.cache_dir).await;
     info!(
         "ACME: requesting Let's Encrypt {} cert for {:?}; cache at {:?}",
-        if acme.staging { "STAGING" } else { "production" },
+        if acme.staging {
+            "STAGING"
+        } else {
+            "production"
+        },
         acme.domains,
         acme.cache_dir
     );
@@ -558,7 +598,12 @@ fn parse_acme_rate_limit(msg: &str) -> Option<String> {
         .find(": see")
         .or_else(|| rest.find("\\n"))
         .unwrap_or_else(|| rest.len().min(40));
-    Some(rest[..end].trim().trim_end_matches(['"', '\\', ',']).to_string())
+    Some(
+        rest[..end]
+            .trim()
+            .trim_end_matches(['"', '\\', ','])
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -567,7 +612,7 @@ mod acme_tests {
 
     #[test]
     fn parses_le_rate_limit_retry_after() {
-        let msg = "Order(Acme(HttpRequest(Non2xxStatus { status_code: 429, body: \"{ \\\"type\\\": \\\"urn:ietf:params:acme:error:rateLimited\\\", \\\"detail\\\": \\\"too many failed authorizations (5) for \\\\\\\"003.hk.97688.io\\\\\\\" in the last 1h0m0s, retry after 2026-07-11 06:01:16 UTC: see https://letsencrypt.org/docs/rate-limits/\\\" }\" }))";
+        let msg = "Order(Acme(HttpRequest(Non2xxStatus { status_code: 429, body: \"{ \\\"type\\\": \\\"urn:ietf:params:acme:error:rateLimited\\\", \\\"detail\\\": \\\"too many failed authorizations (5) for \\\\\\\"003.hk.example.com\\\\\\\" in the last 1h0m0s, retry after 2026-07-11 06:01:16 UTC: see https://letsencrypt.org/docs/rate-limits/\\\" }\" }))";
         assert_eq!(
             parse_acme_rate_limit(msg).as_deref(),
             Some("2026-07-11 06:01:16 UTC")
@@ -583,7 +628,7 @@ mod acme_tests {
 /// Load TLS configuration from certificate files
 fn load_tls_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<rustls::ServerConfig> {
     use rustls_pemfile::{certs, private_key};
-    
+
     // Load certificates
     let cert_file = std::fs::read(cert_path)
         .with_context(|| format!("Failed to read certificate file: {:?}", cert_path))?;
@@ -591,11 +636,11 @@ fn load_tls_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<rustls::Se
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> = certs(cert_reader)
         .collect::<Result<Vec<_>, _>>()
         .context("Failed to parse certificates")?;
-    
+
     if certs.is_empty() {
         anyhow::bail!("No certificates found in {:?}", cert_path);
     }
-    
+
     // Load private key
     let key_file = std::fs::read(key_path)
         .with_context(|| format!("Failed to read key file: {:?}", key_path))?;
@@ -603,13 +648,13 @@ fn load_tls_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<rustls::Se
     let key = private_key(key_reader)
         .context("Failed to parse private key")?
         .ok_or_else(|| anyhow::anyhow!("No private key found in {:?}", key_path))?;
-    
+
     // Build TLS config
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("Failed to create TLS config")?;
-    
+
     Ok(config)
 }
 
@@ -620,29 +665,29 @@ async fn handle_http_port(
     redirect_https: bool,
 ) -> Result<()> {
     debug!("Handling HTTP request from {}", peer_addr);
-    
+
     // Read the HTTP request
     let mut buffer = vec![0u8; 8192];
     let mut total_read = 0;
-    
+
     loop {
         let n = stream.read(&mut buffer[total_read..]).await?;
         if n == 0 {
             return Ok(());
         }
         total_read += n;
-        
+
         if buffer[..total_read].windows(4).any(|w| w == b"\r\n\r\n") {
             break;
         }
-        
+
         if total_read >= buffer.len() {
             return Ok(());
         }
     }
-    
+
     let request = String::from_utf8_lossy(&buffer[..total_read]);
-    
+
     // Check for ACME challenge
     if request.contains("/.well-known/acme-challenge/") {
         let lines: Vec<&str> = request.lines().collect();
@@ -663,14 +708,15 @@ async fn handle_http_port(
             }
         }
     }
-    
+
     // Extract Host header from request
-    let host = request.lines()
+    let host = request
+        .lines()
         .find(|line| line.to_lowercase().starts_with("host:"))
         .and_then(|line| line.split_once(':').map(|x| x.1))
         .map(|h| h.trim())
         .unwrap_or("localhost");
-    
+
     // Redirect to HTTPS or serve decoy
     if redirect_https {
         let response = format!(
@@ -688,7 +734,7 @@ async fn handle_http_port(
         );
         stream.write_all(response.as_bytes()).await?;
     }
-    
+
     Ok(())
 }
 
@@ -859,14 +905,16 @@ where
     let request_path = Arc::new(std::sync::Mutex::new(String::new()));
     let request_path_clone = request_path.clone();
 
-    let callback = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request, response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-        // Extract the path from the request URI
-        let path = req.uri().path().to_string();
-        if let Ok(mut guard) = request_path_clone.lock() {
-            *guard = path;
-        }
-        Ok(response)
-    };
+    let callback =
+        move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+              response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            // Extract the path from the request URI
+            let path = req.uri().path().to_string();
+            if let Ok(mut guard) = request_path_clone.lock() {
+                *guard = path;
+            }
+            Ok(response)
+        };
 
     let ws_result = tokio_tungstenite::accept_hdr_async(stream, callback).await;
 
@@ -874,29 +922,60 @@ where
         Ok(ws) => {
             // WebSocket upgrade successful
             let path = request_path.lock().unwrap().clone();
-            info!("WebSocket upgrade accepted from {} on path: {}", peer_addr, path);
+            info!(
+                "WebSocket upgrade accepted from {} on path: {}",
+                peer_addr, path
+            );
 
             // Route based on path
             if path == tun_path || path.starts_with(&format!("{}/", tun_path)) {
-                if let Err(e) = tun_handler.read().await.handle_connection(ws, peer_addr).await {
+                if let Err(e) = tun_handler
+                    .read()
+                    .await
+                    .handle_connection(ws, peer_addr)
+                    .await
+                {
                     debug!("TUN handler error for {}: {}", peer_addr, e);
                 }
             } else if path == dns_path || path.starts_with(&format!("{}/", dns_path)) {
-                if let Err(e) = dns_handler.read().await.handle_connection(ws, peer_addr).await {
+                if let Err(e) = dns_handler
+                    .read()
+                    .await
+                    .handle_connection(ws, peer_addr)
+                    .await
+                {
                     debug!("DNS handler error for {}: {}", peer_addr, e);
                 }
             } else if path == mux_path || path.starts_with(&format!("{}/", mux_path)) {
                 // SOCKS5 multiplexed connection: single WebSocket, multiple TCP flows
-                if let Err(e) = mux_handler.read().await.handle_connection(ws, peer_addr, None, rvpn_server::config::TunNetworkConfig::default()).await {
+                if let Err(e) = mux_handler
+                    .read()
+                    .await
+                    .handle_connection(
+                        ws,
+                        peer_addr,
+                        None,
+                        rvpn_server::config::TunNetworkConfig::default(),
+                    )
+                    .await
+                {
                     debug!("MUX handler error for {}: {}", peer_addr, e);
                 }
             } else if path == ws_path || path == format!("{}/", ws_path.trim_end_matches('/')) {
-                if let Err(e) = handler.read().await.handle_ws_connection(ws, peer_addr).await {
+                if let Err(e) = handler
+                    .read()
+                    .await
+                    .handle_ws_connection(ws, peer_addr)
+                    .await
+                {
                     debug!("Handler error for {}: {}", peer_addr, e);
                 }
             } else {
                 // Unknown path - close connection
-                warn!("WebSocket connection on unknown path '{}' from {}", path, peer_addr);
+                warn!(
+                    "WebSocket connection on unknown path '{}' from {}",
+                    path, peer_addr
+                );
             }
 
             info!("Connection from {} closed", peer_addr);
@@ -1062,9 +1141,69 @@ async fn load_config(path: &PathBuf) -> ServerConfig {
     }
 }
 
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_certificates_are_fatal_by_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.tls_cert_file = directory.path().join("missing-cert.pem");
+        config.tls_key_file = directory.path().join("missing-key.pem");
+        let error = match configure_tls(&config).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("TLS configuration unexpectedly succeeded"),
+        };
+        assert!(error.contains("allow_plaintext=true"));
+    }
+
+    #[tokio::test]
+    async fn plaintext_requires_explicit_opt_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.tls_cert_file = directory.path().join("missing-cert.pem");
+        config.tls_key_file = directory.path().join("missing-key.pem");
+        config.allow_plaintext = true;
+        assert!(configure_tls(&config).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn partial_and_invalid_certificates_are_fatal_even_with_plaintext_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.tls_cert_file = directory.path().join("cert.pem");
+        config.tls_key_file = directory.path().join("key.pem");
+        config.allow_plaintext = true;
+        std::fs::write(&config.tls_cert_file, "invalid").unwrap();
+        assert!(configure_tls(&config).await.is_err());
+        std::fs::write(&config.tls_key_file, "invalid").unwrap();
+        assert!(configure_tls(&config).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tls_key_permissions_are_enforced() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::default();
+        config.tls_cert_file = directory.path().join("cert.pem");
+        config.tls_key_file = directory.path().join("key.pem");
+        std::fs::write(&config.tls_cert_file, "invalid").unwrap();
+        std::fs::write(&config.tls_key_file, "invalid").unwrap();
+        std::fs::set_permissions(&config.tls_key_file, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let error = match configure_tls(&config).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("TLS configuration unexpectedly succeeded"),
+        };
+        assert!(error.contains("chmod 600"));
+    }
+}
+
 fn keygen(config: &ServerConfig, output_path: Option<PathBuf>) -> Result<()> {
-    use rvpn_core::crypto::IdentityKey;
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use rvpn_core::crypto::IdentityKey;
 
     let path = output_path.unwrap_or_else(|| PathBuf::from(&config.identity_key_file));
 
@@ -1074,7 +1213,7 @@ fn keygen(config: &ServerConfig, output_path: Option<PathBuf>) -> Result<()> {
         BASE64.encode(identity.verifying_key.as_bytes()),
         BASE64.encode(identity.signing_key.to_bytes())
     );
-    std::fs::write(&path, key_data)?;
+    rvpn_server::private_files::atomic_write_private(&path, key_data.as_bytes())?;
     info!("Generated identity key: {:?}", path);
     Ok(())
 }
@@ -1086,18 +1225,20 @@ fn prekey_bundle(
     rotate_from: Option<PathBuf>,
     from_version: Option<u32>,
 ) -> Result<()> {
-    use rvpn_core::crypto::{IdentityKey, Signer, X3DHResponder};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use rvpn_core::crypto::{Signer, X3DHResponder};
     use rvpn_core::identity_pin::rotation_signature_message;
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use serde::Serialize;
 
     let identity_path = identity_path.unwrap_or_else(|| PathBuf::from(&config.identity_key_file));
     let output_path = output_path.unwrap_or_else(|| {
-        config.prekey_bundle_file.clone()
+        config
+            .prekey_bundle_file
+            .clone()
             .unwrap_or_else(|| PathBuf::from("prekey-bundle.json"))
     });
 
-    let identity = IdentityKey::load(&identity_path)?;
+    let identity = rvpn_server::private_files::load_identity(&identity_path)?;
     let responder = X3DHResponder::from_identity(identity);
     let mut bundle = responder.get_public_bundle();
 
@@ -1121,14 +1262,11 @@ fn prekey_bundle(
             info!("Bundle publishes identity_key_version=1 with no rotation signature (initial deployment)");
         }
         (Some(prev_path), Some(prev_ver)) => {
-            let prev_identity = IdentityKey::load(&prev_path)?;
+            let prev_identity = rvpn_server::private_files::load_identity(&prev_path)?;
             let new_version = prev_ver
                 .checked_add(1)
                 .context("Version rollover past u32::MAX not supported")?;
-            let msg = rotation_signature_message(
-                bundle.identity_key.as_slice(),
-                new_version,
-            );
+            let msg = rotation_signature_message(bundle.identity_key.as_slice(), new_version);
             let sig = prev_identity.signing_key.sign(&msg);
             bundle.identity_key_version = new_version;
             bundle.rotation_signature = Some(sig.to_bytes());
@@ -1153,6 +1291,7 @@ fn prekey_bundle(
     struct BundleJson {
         identity_key: String,
         identity_x25519_key: String,
+        identity_x25519_signature: Option<String>,
         signed_prekey: String,
         prekey_signature: String,
         one_time_prekey: Option<String>,
@@ -1163,6 +1302,9 @@ fn prekey_bundle(
     let json = serde_json::to_string_pretty(&BundleJson {
         identity_key: BASE64.encode(bundle.identity_key),
         identity_x25519_key: BASE64.encode(bundle.identity_x25519_key),
+        identity_x25519_signature: bundle
+            .identity_x25519_signature
+            .map(|sig| BASE64.encode(sig)),
         signed_prekey: BASE64.encode(bundle.signed_prekey),
         prekey_signature: BASE64.encode(bundle.prekey_signature),
         one_time_prekey: bundle.one_time_prekey.map(|k| BASE64.encode(k)),
@@ -1170,7 +1312,7 @@ fn prekey_bundle(
         rotation_signature: bundle.rotation_signature.map(|sig| BASE64.encode(sig)),
     })?;
 
-    std::fs::write(&output_path, json)?;
+    rvpn_server::private_files::atomic_write_private(&output_path, json.as_bytes())?;
     info!("Generated prekey bundle: {:?}", output_path);
 
     // Also save the private key
@@ -1186,7 +1328,10 @@ fn prekey_bundle(
         signed_prekey_private: BASE64.encode(private_key),
     })?;
 
-    std::fs::write(&private_output_path, private_json)?;
+    rvpn_server::private_files::atomic_write_private(
+        &private_output_path,
+        private_json.as_bytes(),
+    )?;
     info!("Generated private key: {:?}", private_output_path);
 
     Ok(())

@@ -19,15 +19,15 @@ use tracing::{debug, error, info, trace, warn};
 use ed25519_dalek::Verifier;
 use rvpn_core::crypto::x3dh::X3DHInitiator;
 use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
-use rvpn_core::protocol::{ControlMessage, HandshakeMessage, MultiplexedFrame, PayloadType};
+use rvpn_core::protocol::{HandshakeMessage, MultiplexedFrame};
 
 use crate::config::ServerIdentityConfig;
 use crate::identity_verification::{verify_server_identity, KnownHosts, VerificationResult};
-use rvpn_tls::{ResumptionStore, TlsFingerprint};
 use crate::websocket::{
     connect_websocket, split_websocket, Message, WebSocketReader, WebSocketTaskHandle,
     WebSocketWriter,
 };
+use rvpn_tls::{ResumptionStore, TlsFingerprint};
 
 /// VPN Tunnel for TUN mode
 ///
@@ -36,8 +36,10 @@ use crate::websocket::{
 pub struct VpnTunnel {
     /// WebSocket writer for sending data
     ws_writer: WebSocketWriter,
-    /// Channel receiver for raw multiplexed frames
-    recv_mux_rx: mpsc::UnboundedReceiver<MultiplexedFrame>,
+    /// Channel receiver for raw multiplexed frames. `Option` so the TUN
+    /// downlink task can take ownership (see `take_frame_rx`) — after that,
+    /// only `None` remains here.
+    recv_mux_rx: Option<mpsc::UnboundedReceiver<MultiplexedFrame>>,
     /// Double Ratchet for encryption/decryption
     ratchet: Arc<Mutex<DoubleRatchet>>,
     /// Connection state - atomic so receive_loop can set false on exit
@@ -92,8 +94,10 @@ impl VpnTunnel {
         let probe = crate::dashboard::HandshakeProbe::start();
 
         // Load identity key
-        let identity_key = Arc::new(IdentityKey::load(identity_key_file)
-            .map_err(|e| anyhow::anyhow!("Failed to load identity key: {}", e))?);
+        let identity_key = Arc::new(
+            IdentityKey::load(identity_key_file)
+                .map_err(|e| anyhow::anyhow!("Failed to load identity key: {}", e))?,
+        );
         debug!("Loaded client identity key");
 
         // Load server prekey bundle
@@ -147,23 +151,29 @@ impl VpnTunnel {
         let ratchet_clone = Arc::clone(&ratchet);
         let connected_clone = Arc::clone(&connected);
         tokio::spawn(async move {
-            if let Err(e) =
-                Self::receive_loop(ws_reader, recv_mux_tx, ratchet_clone, virtual_ip_tx, connected_clone).await
+            if let Err(e) = Self::receive_loop(
+                ws_reader,
+                recv_mux_tx,
+                ratchet_clone,
+                virtual_ip_tx,
+                connected_clone,
+            )
+            .await
             {
                 error!("Tunnel receive loop error: {}", e);
             }
         });
 
         // Wait for VirtualIp assignment from server (with timeout)
-        let virtual_ip_assignment = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            virtual_ip_rx.recv()
-        ).await;
+        let virtual_ip_assignment =
+            tokio::time::timeout(std::time::Duration::from_secs(5), virtual_ip_rx.recv()).await;
 
         let (virtual_ip, gateway_ip, mtu) = match virtual_ip_assignment {
             Ok(Some(vip)) => {
-                info!("Received VirtualIp assignment: ipv4={:?}, gateway={:?}, dns={:?}, mtu={}",
-                      vip.ipv4, vip.gateway_ip, vip.dns_servers, vip.mtu);
+                info!(
+                    "Received VirtualIp assignment: ipv4={:?}, gateway={:?}, dns={:?}, mtu={}",
+                    vip.ipv4, vip.gateway_ip, vip.dns_servers, vip.mtu
+                );
                 (vip.ipv4, vip.gateway_ip, vip.mtu)
             }
             Ok(None) => {
@@ -178,7 +188,7 @@ impl VpnTunnel {
 
         let tunnel = VpnTunnel {
             ws_writer,
-            recv_mux_rx,
+            recv_mux_rx: Some(recv_mux_rx),
             ratchet,
             connected,
             virtual_ip,
@@ -246,29 +256,33 @@ impl VpnTunnel {
                         identity_key: server_identity_key,
                         signed_prekey: server_signed_prekey,
                         prekey_signature: server_prekey_signature,
+                        ..
                     } => {
                         debug!("Received ServerHello with ephemeral key");
 
                         // Build a bundle from the SERVER'S ACTUAL KEYS (not the pre-loaded bundle)
                         // The ServerHello sends identity_key (Ed25519, 32 bytes) and signed_prekey (X25519, 32 bytes)
-                        let server_identity_key: [u8; 32] = server_identity_key
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("Server identity key has invalid length"))?;
-                        let server_signed_prekey: [u8; 32] = server_signed_prekey
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("Server signed prekey has invalid length"))?;
+                        let server_identity_key: [u8; 32] =
+                            server_identity_key.as_slice().try_into().map_err(|_| {
+                                anyhow::anyhow!("Server identity key has invalid length")
+                            })?;
+                        let server_signed_prekey: [u8; 32] =
+                            server_signed_prekey.as_slice().try_into().map_err(|_| {
+                                anyhow::anyhow!("Server signed prekey has invalid length")
+                            })?;
                         let prekey_signature: [u8; 64] = server_prekey_signature
                             .as_slice()
                             .try_into()
                             .map_err(|_| anyhow::anyhow!("Prekey signature has invalid length"))?;
 
                         // Verify the Ed25519 signature on signed_prekey using the server's identity_key
-                        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&server_identity_key)
-                            .map_err(|e| anyhow::anyhow!("Invalid server identity key: {}", e))?;
+                        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
+                            &server_identity_key,
+                        )
+                        .map_err(|e| anyhow::anyhow!("Invalid server identity key: {}", e))?;
                         let signature = ed25519_dalek::Signature::from_bytes(&prekey_signature);
-                        verifying_key.verify(&server_signed_prekey, &signature)
+                        verifying_key
+                            .verify(&server_signed_prekey, &signature)
                             .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
                         debug!("Server prekey signature verified");
 
@@ -288,6 +302,7 @@ impl VpnTunnel {
                             one_time_prekey: None,
                             identity_key_version: 1,
                             rotation_signature: None,
+                            identity_x25519_signature: None,
                         };
 
                         // Verify server identity if configured
@@ -310,6 +325,7 @@ impl VpnTunnel {
                             one_time_prekey: None,
                             identity_key_version: 1,
                             rotation_signature: None,
+                            identity_x25519_signature: None,
                         };
 
                         // Verify the server identity
@@ -435,7 +451,9 @@ impl VpnTunnel {
                         // Server sends padded VirtualIp JSON, need to unpad first
                         match rvpn_core::protocol::padding::unpad_packet(&plaintext) {
                             Ok(unpadded) => {
-                                match serde_json::from_slice::<rvpn_core::protocol::VirtualIp>(&unpadded) {
+                                match serde_json::from_slice::<rvpn_core::protocol::VirtualIp>(
+                                    &unpadded,
+                                ) {
                                     Ok(virtual_ip) => {
                                         info!("Received VirtualIp assignment: ipv4={:?}, dns={:?}, mtu={}",
                                               virtual_ip.ipv4, virtual_ip.dns_servers, virtual_ip.mtu);
@@ -474,8 +492,7 @@ impl VpnTunnel {
                     // batches multiple TUN packets into one padded+encrypted
                     // message (the 1KB-boundary padding amortises over the
                     // whole batch instead of inflating every packet).
-                    let (frames, consumed) =
-                        rvpn_core::protocol::multiplex::parse_frames(&data);
+                    let (frames, consumed) = rvpn_core::protocol::multiplex::parse_frames(&data);
                     if frames.is_empty() {
                         warn!("Failed to decode multiplexed frames");
                         continue;
@@ -524,44 +541,6 @@ impl VpnTunnel {
         Ok(())
     }
 
-    /// Send data through the tunnel with specified payload type
-    ///
-    /// Uses multiplexed framing for /connect/v2:
-    /// - Frame format: [flow_id: 4 bytes][payload_len: 2 bytes][payload]
-    /// - flow_id = 0 for TUN data
-    /// - Entire frame is encrypted with Double Ratchet using AAD = 0x01
-    ///
-    /// Note: The payload_type parameter determines flow_id:
-    /// - KeepAlive (Ping): flow_id=0 (ControlMessage, server expects it)
-    /// - Other data: flow_id=1 (DataPayload, server auto-creates flow)
-    pub async fn send_with_payload_type(
-        &mut self,
-        data: &[u8],
-        payload_type: PayloadType,
-    ) -> Result<()> {
-        // flow_id=0 is reserved for ControlMessages (Ping, CreateFlow, etc.)
-        // Data packets use flow_id=1 so server routes them to data handler
-        const CONTROL_FLOW_ID: u32 = 0;
-        const DATA_FLOW_ID: u32 = 1;
-
-        let (flow_id, payload) = if payload_type == PayloadType::KeepAlive {
-            // Server expects ControlMessage::Ping on flow_id=0
-            let ping = ControlMessage::Ping {
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
-            };
-            let serialized = bincode::serialize(&ping).context("Failed to serialize Ping")?;
-            (CONTROL_FLOW_ID, serialized)
-        } else {
-            (DATA_FLOW_ID, data.to_vec())
-        };
-
-        let frame = MultiplexedFrame::new_data(flow_id, payload);
-        self.send_multiplexed_frame(frame).await
-    }
-
     /// Send a raw multiplexed frame through the tunnel
     pub async fn send_multiplexed_frame(&mut self, frame: MultiplexedFrame) -> Result<()> {
         use rvpn_core::crypto::ratchet::RatchetMessage;
@@ -601,10 +580,36 @@ impl VpnTunnel {
 
     /// Receive the next raw multiplexed frame
     pub async fn recv_multiplexed_frame(&mut self) -> Result<MultiplexedFrame> {
-        match self.recv_mux_rx.recv().await {
-            Some(frame) => Ok(frame),
-            None => Err(anyhow::anyhow!("Multiplexed frame receiver closed")),
+        match self.recv_mux_rx.as_mut() {
+            Some(rx) => match rx.recv().await {
+                Some(frame) => Ok(frame),
+                None => Err(anyhow::anyhow!("Multiplexed frame receiver closed")),
+            },
+            None => Err(anyhow::anyhow!(
+                "Multiplexed frame receiver already taken (see take_frame_rx)"
+            )),
         }
+    }
+
+    /// Take ownership of the downlink frame receiver.
+    ///
+    /// Used by the TUN run loop to move frame reception into a dedicated
+    /// downlink task that needs no lock on the tunnel (decoupling RX from
+    /// uplink backpressure). Can only be taken once.
+    pub fn take_frame_rx(&mut self) -> Option<mpsc::UnboundedReceiver<MultiplexedFrame>> {
+        self.recv_mux_rx.take()
+    }
+
+    /// Clone of the WebSocket writer handle (cheap — the channel sender).
+    pub fn writer(&self) -> WebSocketWriter {
+        self.ws_writer.clone()
+    }
+
+    /// Shared handle to the Double Ratchet. The uplink task locks it only
+    /// around encrypt; the receive loop locks it around decrypt. Never hold
+    /// it across a send await (see AGENTS.md "Wire order").
+    pub fn ratchet(&self) -> Arc<Mutex<DoubleRatchet>> {
+        Arc::clone(&self.ratchet)
     }
 
     /// Send a raw IP packet through the tunnel (for TUN mode)
@@ -630,13 +635,6 @@ impl VpnTunnel {
     /// Check if tunnel is connected
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
-    }
-
-    /// Check if the WebSocket writer channel has been closed.
-    /// This detects half-open connections where the writer task exited
-    /// (e.g., due to a broken pipe) but the reader is still blocked.
-    pub fn is_writer_closed(&self) -> bool {
-        self.ws_writer.is_closed()
     }
 }
 

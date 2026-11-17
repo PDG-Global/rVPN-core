@@ -10,8 +10,8 @@ pub mod cipher;
 pub mod ratchet;
 pub mod x3dh;
 
-pub use x3dh::{X3DHResponder, X3DHPublicBundle};
-pub use ratchet::{DoubleRatchet, RatchetMessage, RatchetMessageRef, MessageHeader};
+pub use ratchet::{DoubleRatchet, MessageHeader, RatchetMessage, RatchetMessageRef};
+pub use x3dh::{verify_identity_x25519_signature, X3DHPublicBundle, X3DHResponder};
 
 /// Ed25519 identity key pair
 ///
@@ -59,13 +59,15 @@ impl IdentityKey {
     /// - New (4 lines): R-VPN-IDENTITY-v1\ned25519: <b64>\nx25519: <b64>\n<b64_signing>\n
     /// - Old (3 lines): R-VPN-IDENTITY-v1\n<b64_public>\n<b64_private>\n
     pub fn load(path: &std::path::Path) -> crate::Result<Self> {
-        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
         let content = std::fs::read_to_string(path)?;
         let lines: Vec<&str> = content.lines().collect();
 
         if lines.is_empty() || lines[0] != "R-VPN-IDENTITY-v1" {
-            return Err(crate::Error::InvalidKey("Invalid identity key file format".to_string()));
+            return Err(crate::Error::InvalidKey(
+                "Invalid identity key file format".to_string(),
+            ));
         }
 
         // New format: 4 lines with prefixed key types
@@ -92,15 +94,18 @@ impl IdentityKey {
         let signing_key = SigningKey::from_bytes(&signing_key_array);
         let verifying_key = signing_key.verifying_key();
 
-        Ok(Self { signing_key, verifying_key })
+        Ok(Self {
+            signing_key,
+            verifying_key,
+        })
     }
-    
+
     /// Sign a message
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         use ed25519_dalek::Signer;
         self.signing_key.sign(message).to_bytes()
     }
-    
+
     /// Verify a signature
     pub fn verify(&self, message: &[u8], signature: &[u8; 64]) -> crate::Result<()> {
         use ed25519_dalek::Verifier;
@@ -121,7 +126,7 @@ impl IdentityKey {
 
     /// Save identity key to file
     pub fn save(&self, path: &std::path::Path) -> crate::Result<()> {
-        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
         let content = zeroize::Zeroizing::new(format!(
             "R-VPN-IDENTITY-v1\n{}\n{}\n",
@@ -154,7 +159,7 @@ impl EphemeralKey {
             public_key,
         }
     }
-    
+
     /// Perform Diffie-Hellman key exchange
     pub fn diffie_hellman(&self, other_public: &X25519PublicKey) -> [u8; 32] {
         *self.private_key.diffie_hellman(other_public).as_bytes()
@@ -194,7 +199,7 @@ pub type SharedSecret = [u8; 32];
 pub fn hkdf_derive(salt: &[u8], ikm: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
     use hkdf::Hkdf;
     use sha2::Sha256;
-    
+
     let hkdf = Hkdf::<Sha256>::new(Some(salt), ikm);
     let mut okm = vec![0u8; out_len];
     hkdf.expand(info, &mut okm).expect("HKDF expand failed");

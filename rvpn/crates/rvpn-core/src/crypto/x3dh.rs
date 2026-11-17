@@ -11,6 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 
 use super::{hkdf_derive, EphemeralKey, IdentityKey, SharedSecret};
+use crate::Error;
 
 /// Serialize a fixed-size byte array as base64
 fn serialize_base64<S: Serializer, const N: usize>(
@@ -94,9 +95,9 @@ fn ed25519_public_key_to_x25519(ed25519_public: &[u8; 32]) -> crate::Result<[u8;
     let compressed = CompressedEdwardsY(*ed25519_public);
 
     // Decompress to get the Edwards point
-    let edwards_point = compressed
-        .decompress()
-        .ok_or_else(|| crate::Error::Crypto("Invalid Ed25519 public key: not a valid Edwards point".to_string()))?;
+    let edwards_point = compressed.decompress().ok_or_else(|| {
+        crate::Error::Crypto("Invalid Ed25519 public key: not a valid Edwards point".to_string())
+    })?;
 
     // Convert to Montgomery form (u-coordinate)
     let montgomery_point = edwards_point.to_montgomery();
@@ -119,6 +120,14 @@ pub struct X3DHPublicBundle {
         deserialize_with = "deserialize_base64"
     )]
     pub identity_x25519_key: [u8; 32],
+    /// Optional Ed25519 signature over the identity X25519 public key.
+    /// Legacy bundles omit this and use the unsigned migration path.
+    #[serde(
+        default,
+        serialize_with = "serialize_base64_opt",
+        deserialize_with = "deserialize_base64_opt"
+    )]
+    pub identity_x25519_signature: Option<[u8; 64]>,
     /// Signed prekey (X25519)
     #[serde(
         serialize_with = "serialize_base64",
@@ -251,9 +260,9 @@ impl X3DHInitiator {
         );
 
         // DH4: EK_client * OPK_server (if available)
-        let dh4 = server_bundle.one_time_prekey.map(|opk| {
-            x25519_diffie_hellman(&self.ephemeral_key.private_key.to_bytes(), &opk)
-        });
+        let dh4 = server_bundle
+            .one_time_prekey
+            .map(|opk| x25519_diffie_hellman(&self.ephemeral_key.private_key.to_bytes(), &opk));
 
         // Concatenate DH results
         let mut dh_concat = Vec::with_capacity(32 * if dh4.is_some() { 4 } else { 3 });
@@ -396,9 +405,10 @@ impl X3DHResponder {
 
         // DH4: OPK_server * EK_client (if client used an OTPK)
         let dh4 = if used_one_time_prekey {
-            self.private_bundle.one_time_prekey.as_ref().map(|opk| {
-                x25519_diffie_hellman(&opk.to_bytes(), client_ephemeral)
-            })
+            self.private_bundle
+                .one_time_prekey
+                .as_ref()
+                .map(|opk| x25519_diffie_hellman(&opk.to_bytes(), client_ephemeral))
         } else {
             None
         };
@@ -429,6 +439,11 @@ impl X3DHResponder {
             .private_bundle
             .identity_key
             .sign(&signed_prekey_public.to_bytes());
+        let identity_x25519_signature = self
+            .private_bundle
+            .identity_key
+            .sign(&identity_x25519_message(&identity_x25519_public.to_bytes()))
+            .to_bytes();
 
         // Include one-time prekey public key if available
         let one_time_prekey = self
@@ -440,6 +455,7 @@ impl X3DHResponder {
         X3DHPublicBundle {
             identity_key: self.private_bundle.identity_key.verifying_key().to_bytes(),
             identity_x25519_key: identity_x25519_public.to_bytes(),
+            identity_x25519_signature: Some(identity_x25519_signature),
             signed_prekey: signed_prekey_public.to_bytes(),
             prekey_signature: signature.to_bytes(),
             one_time_prekey,
@@ -456,6 +472,32 @@ impl X3DHResponder {
     pub fn get_signed_prekey_private(&self) -> [u8; 32] {
         self.private_bundle.signed_prekey.to_bytes()
     }
+}
+
+fn identity_x25519_message(identity_x25519_key: &[u8; 32]) -> Vec<u8> {
+    let mut message = b"rvpn-identity-x25519-v1".to_vec();
+    message.extend_from_slice(identity_x25519_key);
+    message
+}
+
+/// Verify the optional identity-X25519 signature using the server's Ed25519 key.
+pub fn verify_identity_x25519_signature(
+    identity_key: &[u8; 32],
+    identity_x25519_key: &[u8; 32],
+    signature: &[u8; 64],
+) -> crate::Result<()> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let identity = VerifyingKey::from_bytes(identity_key)
+        .map_err(|error| Error::HandshakeFailed(format!("invalid server identity key: {error}")))?;
+    identity
+        .verify(
+            &identity_x25519_message(identity_x25519_key),
+            &Signature::from_bytes(signature),
+        )
+        .map_err(|error| {
+            Error::HandshakeFailed(format!("invalid identity X25519 signature: {error}"))
+        })
 }
 
 impl Default for X3DHResponder {
@@ -503,9 +545,6 @@ mod tests {
     /// bundles when we ship the format bump.
     #[test]
     fn bundle_serde_backwards_compatible() {
-        // Take a real bundle, serialize it, strip out the two new fields
-        // and confirm it still deserializes — this is the "old client's
-        // bundle file loaded by the new client" migration case.
         let responder = X3DHResponder::new();
         let bundle = responder.get_public_bundle();
         let full_json = serde_json::to_value(&bundle).unwrap();
@@ -516,6 +555,7 @@ mod tests {
             .filter(|(k, _)| {
                 k.as_str() != "identity_key_version"
                     && k.as_str() != "rotation_signature"
+                    && k.as_str() != "identity_x25519_signature"
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -523,17 +563,64 @@ mod tests {
 
         let restored: X3DHPublicBundle =
             serde_json::from_str(&legacy).expect("legacy bundle decodes with defaults");
-        assert_eq!(restored.identity_key_version, 1, "missing version defaults to 1");
+        assert_eq!(
+            restored.identity_key_version, 1,
+            "missing version defaults to 1"
+        );
         assert!(restored.rotation_signature.is_none());
+        assert!(restored.identity_x25519_signature.is_none());
 
-        // A new bundle with both TOFU fields set round-trips exactly.
         let mut rotated = bundle.clone();
         rotated.identity_key_version = 3;
         rotated.rotation_signature = Some([0x55; 64]);
         let json = serde_json::to_string(&rotated).expect("rotated bundle serializes");
-        let back: X3DHPublicBundle = serde_json::from_str(&json).expect("rotated bundle round-trips");
+        let back: X3DHPublicBundle =
+            serde_json::from_str(&json).expect("rotated bundle round-trips");
         assert_eq!(back.identity_key_version, 3);
         assert_eq!(back.rotation_signature, Some([0x55; 64]));
+        assert_eq!(
+            back.identity_x25519_signature,
+            bundle.identity_x25519_signature
+        );
+    }
+
+    #[test]
+    fn identity_x25519_signature_binds_key_to_identity() {
+        let responder = X3DHResponder::new();
+        let bundle = responder.get_public_bundle();
+        let signature = bundle.identity_x25519_signature.unwrap();
+        verify_identity_x25519_signature(
+            &bundle.identity_key,
+            &bundle.identity_x25519_key,
+            &signature,
+        )
+        .unwrap();
+
+        let mut tampered_key = bundle.identity_x25519_key;
+        tampered_key[0] ^= 1;
+        assert!(
+            verify_identity_x25519_signature(&bundle.identity_key, &tampered_key, &signature,)
+                .is_err()
+        );
+
+        let other_identity = X3DHResponder::new().get_public_bundle().identity_key;
+        assert!(verify_identity_x25519_signature(
+            &other_identity,
+            &bundle.identity_x25519_key,
+            &signature,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn prekey_signature_cannot_be_reused_as_identity_x25519_proof() {
+        let bundle = X3DHResponder::new().get_public_bundle();
+        assert!(verify_identity_x25519_signature(
+            &bundle.identity_key,
+            &bundle.signed_prekey,
+            &bundle.prekey_signature,
+        )
+        .is_err());
     }
 
     #[test]
@@ -592,6 +679,7 @@ mod tests {
             one_time_prekey: server_bundle_full.one_time_prekey,
             identity_key_version: server_bundle_full.identity_key_version,
             rotation_signature: server_bundle_full.rotation_signature,
+            identity_x25519_signature: server_bundle_full.identity_x25519_signature,
         };
 
         // Create initiator (client)

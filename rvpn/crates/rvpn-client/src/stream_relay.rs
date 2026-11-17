@@ -16,14 +16,18 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use rvpn_core::crypto::{DoubleRatchet, IdentityKey, Signature, Verifier, VerifyingKey, X3DHPublicBundle};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
+use rvpn_core::crypto::{
+    DoubleRatchet, IdentityKey, Signature, Verifier, VerifyingKey, X3DHPublicBundle,
+};
 use rvpn_core::protocol::HandshakeMessage;
 
 use crate::config::ServerIdentityConfig;
 use crate::identity_verification::{verify_server_identity, KnownHosts, VerificationResult};
+use crate::websocket::{
+    connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter,
+};
 use rvpn_tls::{ResumptionStore, TlsFingerprint};
-use crate::websocket::{connect_websocket, split_websocket, Message, WebSocketReader, WebSocketWriter};
 
 /// Brook-style stream relay for one SOCKS5 connection
 ///
@@ -62,7 +66,12 @@ impl StreamRelay {
         server_bundle: &X3DHPublicBundle,
         server_identity_config: Option<&ServerIdentityConfig>,
         resumption: Option<&ResumptionStore>,
-    ) -> Result<(Self, WebSocketReader, WebSocketWriter, crate::websocket::WebSocketTaskHandle)> {
+    ) -> Result<(
+        Self,
+        WebSocketReader,
+        WebSocketWriter,
+        crate::websocket::WebSocketTaskHandle,
+    )> {
         info!("Connecting StreamRelay to {}:{}{}", host, port, path);
 
         // Times the handshake; records handshake_fail on any early error
@@ -138,8 +147,8 @@ impl StreamRelay {
             connection_nonce: None,
         };
 
-        let hello_bytes = serde_json::to_vec(&hello)
-            .context("Failed to serialize Hello message")?;
+        let hello_bytes =
+            serde_json::to_vec(&hello).context("Failed to serialize Hello message")?;
         ws_writer
             .send(Message::Binary(hello_bytes))
             .await
@@ -156,8 +165,8 @@ impl StreamRelay {
         match response {
             Message::Binary(data) => {
                 // ServerHello received, extract keys
-                let server_hello: HandshakeMessage = serde_json::from_slice(&data)
-                    .context("Failed to parse ServerHello message")?;
+                let server_hello: HandshakeMessage =
+                    serde_json::from_slice(&data).context("Failed to parse ServerHello message")?;
 
                 match server_hello {
                     HandshakeMessage::ServerHello {
@@ -165,6 +174,7 @@ impl StreamRelay {
                         identity_key: server_identity_key,
                         signed_prekey: server_signed_prekey,
                         prekey_signature: server_prekey_signature,
+                        ..
                     } => {
                         debug!("Received ServerHello with ephemeral key");
 
@@ -180,14 +190,14 @@ impl StreamRelay {
                         // `aead::Error`, immediately after a "successful" X3DH.
                         //
                         // Mirrors the correct pattern from rvpn-mobile ios_tun.rs.
-                        let server_identity_key: [u8; 32] = server_identity_key
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("Server identity key has invalid length"))?;
-                        let server_signed_prekey: [u8; 32] = server_signed_prekey
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("Server signed prekey has invalid length"))?;
+                        let server_identity_key: [u8; 32] =
+                            server_identity_key.as_slice().try_into().map_err(|_| {
+                                anyhow::anyhow!("Server identity key has invalid length")
+                            })?;
+                        let server_signed_prekey: [u8; 32] =
+                            server_signed_prekey.as_slice().try_into().map_err(|_| {
+                                anyhow::anyhow!("Server signed prekey has invalid length")
+                            })?;
                         let prekey_signature_bytes: [u8; 64] = server_prekey_signature
                             .as_slice()
                             .try_into()
@@ -221,6 +231,7 @@ impl StreamRelay {
                             // checks in verify_server_identity.
                             identity_key_version: server_bundle.identity_key_version,
                             rotation_signature: server_bundle.rotation_signature,
+                            identity_x25519_signature: None,
                         };
 
                         // Verify server identity if configured
@@ -230,8 +241,8 @@ impl StreamRelay {
                             // Load known hosts (mut — verify_server_identity
                             // writes canonical pins on TOFU capture and
                             // migrates legacy hex entries in-place).
-                            let mut known_hosts = KnownHosts::load(&config.known_hosts_file)
-                                .unwrap_or_default();
+                            let mut known_hosts =
+                                KnownHosts::load(&config.known_hosts_file).unwrap_or_default();
 
                             let (result, should_proceed) = verify_server_identity(
                                 &server_addr,
@@ -291,9 +302,7 @@ impl StreamRelay {
                     )),
                 }
             }
-            _ => Err(anyhow::anyhow!(
-                "Expected binary message during handshake"
-            )),
+            _ => Err(anyhow::anyhow!("Expected binary message during handshake")),
         }
     }
 
@@ -302,11 +311,7 @@ impl StreamRelay {
     /// # Arguments
     /// * `ws_writer` - WebSocket writer to send through
     /// * `data` - Plaintext data to send
-    pub async fn send_frame(
-        &mut self,
-        ws_writer: &WebSocketWriter,
-        data: &[u8],
-    ) -> Result<()> {
+    pub async fn send_frame(&mut self, ws_writer: &WebSocketWriter, data: &[u8]) -> Result<()> {
         // Pad to 1KB boundary before encryption — eliminates frame-size fingerprinting
         let padded = rvpn_core::protocol::padding::pad_packet(data)
             .map_err(|e| anyhow::anyhow!("Padding failed: {}", e))?;
@@ -318,7 +323,8 @@ impl StreamRelay {
             .map_err(|e| anyhow::anyhow!("Double Ratchet encryption failed: {:?}", e))?;
 
         // Serialize RatchetMessage to bytes
-        let encrypted = message.to_bytes()
+        let encrypted = message
+            .to_bytes()
             .context("Failed to serialize RatchetMessage")?;
 
         // Send via WebSocket
@@ -355,8 +361,8 @@ impl StreamRelay {
         };
 
         // Deserialize RatchetMessage
-        let message = RatchetMessage::from_bytes(&data)
-            .context("Failed to deserialize RatchetMessage")?;
+        let message =
+            RatchetMessage::from_bytes(&data).context("Failed to deserialize RatchetMessage")?;
 
         // Decrypt with Double Ratchet (0x01 = ProxyData payload type)
         let decrypted = self
@@ -442,13 +448,15 @@ impl StreamRelay {
                         // Encrypt with ratchet (0x01 = ProxyData payload type)
                         let message: RatchetMessage = {
                             let mut ratchet_guard = ratchet_clone.lock().await;
-                            ratchet_guard.encrypt(&padded, &[0x01])
+                            ratchet_guard
+                                .encrypt(&padded, &[0x01])
                                 .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))?
                         };
 
                         // Serialize and send
-                        let encrypted = message.to_bytes()
-                            .map_err(|e| anyhow::anyhow!("Failed to serialize RatchetMessage: {}", e))?;
+                        let encrypted = message.to_bytes().map_err(|e| {
+                            anyhow::anyhow!("Failed to serialize RatchetMessage: {}", e)
+                        })?;
 
                         // Send via WebSocket (bounded channel; awaits under backpressure)
                         let writer = ws_writer_clone.lock().await;
@@ -625,8 +633,7 @@ mod tests {
         // Local (browser) side of the flow.
         let local_listener = TcpListener::bind("127.0.0.1:0").await?;
         let local_addr = local_listener.local_addr()?;
-        let accept_local =
-            tokio::spawn(async move { local_listener.accept().await.unwrap().0 });
+        let accept_local = tokio::spawn(async move { local_listener.accept().await.unwrap().0 });
 
         let mut browser = tokio::net::TcpStream::connect(local_addr).await?;
         let local_stream = accept_local.await?;

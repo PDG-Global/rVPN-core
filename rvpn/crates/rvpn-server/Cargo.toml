@@ -67,6 +67,9 @@ ip_network_table.workspace = true
 # TUN interface
 tun-rs = { workspace = true, features = ["async"] }
 
+# TCP socket options (TCP_NOTSENT_LOWAT for bufferbloat control)
+socket2 = { version = "0.6", features = ["all"] }
+
 [features]
 default = []
 integration-tests = []

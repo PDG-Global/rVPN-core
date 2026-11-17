@@ -26,6 +26,7 @@ pub mod nat_rewrite;
 // Dynamic per-IP exit routing learned from DNS answers (pure std, shared by
 // the uplink demux in ios_tun.rs and the DNS layer in dns_server.rs).
 pub mod route_map;
+pub(crate) mod server_hello;
 // flow_connector references rvpn_tls::ChromeTlsStream (boring backend). It is
 // only used by android_tun_ffi (android-direct-tun), doh_client (dns), and
 // dns_proxy_ffi (dns + ios/macos-direct-tun). On the actual iOS build

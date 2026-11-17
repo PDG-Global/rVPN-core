@@ -15,8 +15,8 @@ use std::sync::Arc;
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 use tracing::{debug, info};
 
-use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
+use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
 use rvpn_core::protocol::HandshakeMessage;
 
 use rvpn_tls::TlsFingerprint;
@@ -32,11 +32,14 @@ type WsSink = SplitSink<WebSocketStream<rvpn_tls::RustlsTlsStream>, Message>;
 #[cfg(feature = "ios-direct-tun")]
 type WsStream = futures_util::stream::SplitStream<WebSocketStream<rvpn_tls::RustlsTlsStream>>;
 
-// Android: use tokio-tungstenite's built-in TLS (rustls)
-#[cfg(feature = "android-direct-tun")]
-type WsSink = SplitSink<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>;
-#[cfg(feature = "android-direct-tun")]
-type WsStream = futures_util::stream::SplitStream<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>;
+// Android and backend-agnostic builds use tokio-tungstenite's stream type.
+#[cfg(not(any(feature = "ios-direct-tun", feature = "macos-direct-tun")))]
+type WsSink =
+    SplitSink<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>;
+#[cfg(not(any(feature = "ios-direct-tun", feature = "macos-direct-tun")))]
+type WsStream = futures_util::stream::SplitStream<
+    WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
 
 /// Configuration for connecting to VPN server
 #[derive(Clone)]
@@ -47,6 +50,7 @@ pub struct FlowConnectorConfig {
     pub tls_fingerprint: TlsFingerprint,
     pub identity_key: std::sync::Arc<rvpn_core::crypto::IdentityKey>,
     pub server_bundle: X3DHPublicBundle,
+    pub(crate) security: crate::server_hello::ServerSecurity,
     /// TLS session resumption store for this exit server. Callers that hold a
     /// per-exit tunnel session pass THAT session's store so the persistent
     /// `/dns` WebSocket's reconnects resume (1-RTT PSK, no certificate
@@ -78,15 +82,18 @@ impl FlowConnection {
         let padded = rvpn_core::protocol::padding::pad_packet(data)
             .map_err(|e| anyhow::anyhow!("Padding failed: {}", e))?;
 
-        let encrypted = self.ratchet.encrypt(&padded, &[payload_type])
+        let encrypted = self
+            .ratchet
+            .encrypt(&padded, &[payload_type])
             .context("Failed to encrypt data")?;
 
-        let message = serde_json::to_vec(&encrypted)
-            .context("Failed to serialize encrypted data")?;
+        let message =
+            serde_json::to_vec(&encrypted).context("Failed to serialize encrypted data")?;
 
         // Send as binary message
         if let Some(sender) = &self.writer {
-            sender.send(Message::Binary(message))
+            sender
+                .send(Message::Binary(message))
                 .map_err(|_| anyhow::anyhow!("Flow connection closed"))?;
         }
 
@@ -102,28 +109,44 @@ pub async fn create_flow_connection(
 ) -> Result<FlowConnection> {
     let flow_id = rand_id();
 
-    info!("[FlowConnector] Creating new connection for {}:{} (flow_id: {})",
-          target_host, target_port, flow_id);
+    info!(
+        "[FlowConnector] Creating new connection for {}:{} (flow_id: {})",
+        target_host, target_port, flow_id
+    );
 
     // Step 1: Connect via TLS
-    let url = format!("wss://{}:{}{}", config.server_host, config.server_port, config.server_path);
+    let url = format!(
+        "wss://{}:{}{}",
+        config.server_host, config.server_port, config.server_path
+    );
 
     // Android: connect_async_tls_with_config handles TLS + WebSocket in one step.
     // iOS/macOS: establish TLS first, then upgrade to WebSocket via client_async.
     #[cfg(feature = "android-direct-tun")]
-    let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
-        &url, None, false, None,
-    )
-    .await
-    .context("FlowConnector connection failed")?;
+    let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(&url, None, false, None)
+        .await
+        .context("FlowConnector connection failed")?;
 
-    #[cfg(not(feature = "android-direct-tun"))]
+    #[cfg(not(any(
+        feature = "android-direct-tun",
+        feature = "ios-direct-tun",
+        feature = "macos-direct-tun"
+    )))]
+    let (ws_stream, _) = tokio_tungstenite::connect_async_with_config(&url, None, false)
+        .await
+        .context("FlowConnector connection failed")?;
+
+    #[cfg(any(feature = "ios-direct-tun", feature = "macos-direct-tun"))]
     let (ws_stream, _) = {
         let tls_stream = {
             #[cfg(feature = "ios-direct-tun")]
-            let s = rvpn_tls::connect_rustls(&config.server_host, config.server_port, Some(&config.server_host))
-                .await
-                .context("TLS handshake failed")?;
+            let s = rvpn_tls::connect_rustls(
+                &config.server_host,
+                config.server_port,
+                Some(&config.server_host),
+            )
+            .await
+            .context("TLS handshake failed")?;
             #[cfg(not(feature = "ios-direct-tun"))]
             let s = rvpn_tls::connect_chrome_like(
                 &config.server_host,
@@ -151,11 +174,15 @@ pub async fn create_flow_connection(
         &mut write,
         &config.identity_key,
         &config.server_bundle,
+        &config.security,
     )
     .await
     .context("X3DH handshake failed")?;
 
-    info!("[FlowConnector] X3DH handshake complete for flow {}", flow_id);
+    info!(
+        "[FlowConnector] X3DH handshake complete for flow {}",
+        flow_id
+    );
 
     // Step 4: Send target address
     let mut ratchet = ratchet;
@@ -163,7 +190,10 @@ pub async fn create_flow_connection(
         .await
         .context("Failed to send target address")?;
 
-    info!("[FlowConnector] Target {}:{} sent for flow {}", target_host, target_port, flow_id);
+    info!(
+        "[FlowConnector] Target {}:{} sent for flow {}",
+        target_host, target_port, flow_id
+    );
 
     // Step 5: Create writer channel (we need to keep the write half alive)
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
@@ -196,6 +226,7 @@ async fn perform_handshake(
     ws_writer: &mut WsSink,
     identity_key: &std::sync::Arc<IdentityKey>,
     server_bundle: &X3DHPublicBundle,
+    security: &crate::server_hello::ServerSecurity,
 ) -> Result<DoubleRatchet> {
     // Create X3DH initiator
     let initiator = X3DHInitiator::from_identity_key(Arc::clone(identity_key));
@@ -216,93 +247,36 @@ async fn perform_handshake(
         connection_nonce: None,
     };
 
-    let hello_bytes = serde_json::to_vec(&hello)
-        .context("Failed to serialize Hello message")?;
-    ws_writer.send(Message::Binary(hello_bytes)).await
+    let hello_bytes = serde_json::to_vec(&hello).context("Failed to serialize Hello message")?;
+    ws_writer
+        .send(Message::Binary(hello_bytes))
+        .await
         .context("Failed to send Hello message")?;
 
     debug!("Sent X3DH Hello message");
 
     // Receive ServerHello response
-    let response = ws_reader.next().await
+    let response = ws_reader
+        .next()
+        .await
         .ok_or_else(|| anyhow::anyhow!("WebSocket closed during handshake"))?
         .context("WebSocket error during handshake")?;
 
     match response {
         Message::Binary(data) => {
-            // ServerHello received, extract keys
-            let server_hello: HandshakeMessage = serde_json::from_slice(&data)
-                .context("Failed to parse ServerHello message")?;
+            let server_hello: HandshakeMessage =
+                serde_json::from_slice(&data).context("Failed to parse ServerHello message")?;
+            let validated = security.validate(server_hello, server_bundle)?;
+            let (shared_secret, _) = initiator
+                .agree(&validated.bundle)
+                .context("X3DH key agreement failed")?;
+            validated.commit(security);
 
-            match server_hello {
-                HandshakeMessage::ServerHello {
-                    ephemeral_key: _server_ephemeral,
-                    identity_key: server_identity_key,
-                    signed_prekey: server_signed_prekey,
-                    prekey_signature: server_prekey_signature,
-                } => {
-                    debug!("Received ServerHello with ephemeral key");
-
-                    // Use wire values for X3DH (see stream_relay.rs / ios_tun.rs).
-                    let server_identity_key: [u8; 32] = server_identity_key
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("Server identity key has invalid length"))?;
-                    let server_signed_prekey: [u8; 32] = server_signed_prekey
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("Server signed prekey has invalid length"))?;
-                    let prekey_signature: [u8; 64] = server_prekey_signature
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("Prekey signature has invalid length"))?;
-
-                    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
-                        &server_identity_key,
-                    )
-                    .map_err(|e| anyhow::anyhow!("Invalid server identity key: {}", e))?;
-                    let signature = ed25519_dalek::Signature::from_bytes(&prekey_signature);
-                    ed25519_dalek::Verifier::verify(
-                        &verifying_key,
-                        &server_signed_prekey,
-                        &signature,
-                    )
-                    .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
-                    debug!("Server prekey signature verified");
-
-                    let server_bundle_from_hello = X3DHPublicBundle {
-                        identity_key: server_identity_key,
-                        identity_x25519_key: server_bundle.identity_x25519_key,
-                        signed_prekey: server_signed_prekey,
-                        prekey_signature,
-                        one_time_prekey: None,
-                        identity_key_version: server_bundle.identity_key_version,
-                        rotation_signature: server_bundle.rotation_signature,
-                    };
-
-                    let (shared_secret, _x3dh_material) = initiator
-                        .agree(&server_bundle_from_hello)
-                        .context("X3DH key agreement failed")?;
-
-                    debug!("X3DH shared secret derived successfully");
-
-                    // Initialize Double Ratchet as Alice (initiator)
-                    // In X3DH, the server (Bob) doesn't generate an ephemeral key.
-                    // The _server_ephemeral field is empty - init_alice doesn't use this parameter.
-                    let ratchet = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-
-                    info!("Double Ratchet initialized as Alice (initiator)");
-
-                    Ok(ratchet)
-                }
-                _ => Err(anyhow::anyhow!(
-                    "Unexpected handshake message type from server"
-                )),
-            }
+            debug!("X3DH shared secret derived successfully");
+            info!("Double Ratchet initialized after server identity validation");
+            Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32]))
         }
-        _ => Err(anyhow::anyhow!(
-            "Expected binary message during handshake"
-        )),
+        _ => Err(anyhow::anyhow!("Expected binary message during handshake")),
     }
 }
 
@@ -325,15 +299,18 @@ async fn send_target_address(
     target_data.extend_from_slice(&target_port.to_be_bytes());
 
     // Encrypt with payload type 0x01 (Data)
-    let message = ratchet.encrypt(&target_data, &[0x01])
+    let message = ratchet
+        .encrypt(&target_data, &[0x01])
         .context("Failed to encrypt target address")?;
 
     // Serialize to JSON
-    let serialized = serde_json::to_vec(&message)
-        .context("Failed to serialize RatchetMessage")?;
+    let serialized = serde_json::to_vec(&message).context("Failed to serialize RatchetMessage")?;
 
     // Send as binary
-    ws_writer.send(Message::Binary(serialized)).await.context("Failed to send target address")?;
+    ws_writer
+        .send(Message::Binary(serialized))
+        .await
+        .context("Failed to send target address")?;
     ws_writer.flush().await.context("Failed to flush")?;
 
     Ok(())

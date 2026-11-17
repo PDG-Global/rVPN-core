@@ -10,11 +10,11 @@
 use std::ffi::{c_char, c_int, CStr};
 use std::sync::{Mutex, OnceLock};
 
-use rvpn_split_tunnel::DnsResolver;
-use rvpn_split_tunnel::{SplitTunnel, SplitTunnelConfig};
 use crate::dns_server::DnsServer;
 use crate::doh_client::DohClient;
 use crate::flow_connector::FlowConnectorConfig;
+use rvpn_split_tunnel::DnsResolver;
+use rvpn_split_tunnel::{SplitTunnel, SplitTunnelConfig};
 
 use rvpn_core::crypto::IdentityKey;
 
@@ -96,7 +96,11 @@ pub unsafe extern "C" fn rvpn_dns_proxy_start(config_json: *const c_char) -> c_i
 
     let builtin_bypass_countries: Vec<String> = config["builtin_bypass_countries"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_else(|| vec!["CN".to_string()]);
 
     let block_ads = config["block_ads"].as_bool().unwrap_or(true);
@@ -120,8 +124,6 @@ pub unsafe extern "C" fn rvpn_dns_proxy_start(config_json: *const c_char) -> c_i
         .spawn(move || {
             // Build Tokio runtime on this thread
             let runtime = match tokio::runtime::Builder::new_current_thread()
-                
-                
                 .enable_all()
                 .build()
             {
@@ -136,7 +138,8 @@ pub unsafe extern "C" fn rvpn_dns_proxy_start(config_json: *const c_char) -> c_i
 
             runtime.block_on(async move {
                 // Load identity key
-                let identity_key = match IdentityKey::load(std::path::Path::new(&identity_key_path)) {
+                let identity_key = match IdentityKey::load(std::path::Path::new(&identity_key_path))
+                {
                     Ok(k) => k,
                     Err(e) => {
                         tracing::error!("[DNS_PROXY] Failed to load identity key: {}", e);
@@ -162,9 +165,7 @@ pub unsafe extern "C" fn rvpn_dns_proxy_start(config_json: *const c_char) -> c_i
                     };
 
                 // Parse server URL
-                let cleaned = server_address
-                    .replace("wss://", "")
-                    .replace("ws://", "");
+                let cleaned = server_address.replace("wss://", "").replace("ws://", "");
                 let parts: Vec<&str> = cleaned.split('/').collect();
                 let host_port: Vec<&str> = parts[0].split(':').collect();
                 let server_host = host_port[0].to_string();
@@ -174,7 +175,32 @@ pub unsafe extern "C" fn rvpn_dns_proxy_start(config_json: *const c_char) -> c_i
                 } else {
                     "/connect".to_string()
                 };
-                let dns_path = format!("{}/dns", base_path.trim_end_matches("/tun").trim_end_matches('/'));
+                let dns_path = format!(
+                    "{}/dns",
+                    base_path.trim_end_matches("/tun").trim_end_matches('/')
+                );
+
+                let identity_pin =
+                    match rvpn_core::identity_pin::encode_identity_pin(&server_bundle.identity_key)
+                    {
+                        Ok(pin) => pin,
+                        Err(error) => {
+                            tracing::error!("[DNS_PROXY] Invalid server identity: {}", error);
+                            return;
+                        }
+                    };
+
+                let security = match crate::server_hello::ServerSecurity::new(
+                    Some(identity_pin),
+                    false,
+                    &server_bundle,
+                ) {
+                    Ok(security) => security,
+                    Err(error) => {
+                        tracing::error!("[DNS_PROXY] Invalid signed server bundle: {}", error);
+                        return;
+                    }
+                };
 
                 // Create DohClient. This standalone proxy has no tunnel
                 // session to borrow a resumption store from, so it gets its
@@ -186,6 +212,7 @@ pub unsafe extern "C" fn rvpn_dns_proxy_start(config_json: *const c_char) -> c_i
                     tls_fingerprint: rvpn_tls::TlsFingerprint::Chrome,
                     identity_key: std::sync::Arc::new(identity_key),
                     server_bundle,
+                    security,
                     resumption: Some(rvpn_tls::ResumptionStore::new()),
                 };
 
@@ -207,7 +234,8 @@ pub unsafe extern "C" fn rvpn_dns_proxy_start(config_json: *const c_char) -> c_i
                     ..Default::default()
                 };
 
-                let dns_resolver = std::sync::Arc::new(DnsResolver::new(true, 14400, 200, false, true, vec![]));
+                let dns_resolver =
+                    std::sync::Arc::new(DnsResolver::new(true, 14400, 200, false, true, vec![]));
                 dns_resolver.start_cleanup_task();
                 let split_tunnel = match SplitTunnel::new(split_tunnel_config, dns_resolver).await {
                     Ok(st) => st,

@@ -357,6 +357,7 @@ mod tests {
             one_time_prekey: None,
             identity_key_version: 1,
             rotation_signature: None,
+            identity_x25519_signature: None,
         }
     }
 
@@ -440,7 +441,10 @@ mod tests {
         );
         assert!(!ok);
         match result {
-            VerificationResult::Mismatch { expected: e, got: g } => {
+            VerificationResult::Mismatch {
+                expected: e,
+                got: g,
+            } => {
                 assert!(e.starts_with("ik:1:"));
                 assert!(g.starts_with("ik:1:"));
             }

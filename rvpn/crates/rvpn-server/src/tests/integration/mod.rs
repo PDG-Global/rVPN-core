@@ -246,7 +246,6 @@ redirect_http_to_https = false
 
 [server.network]
 nat_enabled = true
-dhcp_range = "10.200.0.0/24"
 dns_servers = ["1.1.1.1"]
 
 [server.rate_limit]

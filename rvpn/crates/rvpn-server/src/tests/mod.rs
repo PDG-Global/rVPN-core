@@ -1,5 +1,6 @@
 //! Tests for R-VPN server
 
+pub mod fixtures;
 mod server_tests;
 mod routing_tests;
 

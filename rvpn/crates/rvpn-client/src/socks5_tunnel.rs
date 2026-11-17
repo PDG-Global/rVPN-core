@@ -48,6 +48,12 @@ struct FlowState {
     /// server `WindowUpdate` control messages; consumed one byte per payload
     /// byte sent by `flow_to_ws_loop`.
     send_credits: Arc<FlowSendCredits>,
+    /// Last activity in either direction, as milliseconds since the tunnel's
+    /// `created_at` (`Instant` is not atomically updatable). Shared with
+    /// `flow_to_ws_loop`, which stamps it on every uplink frame; the receive
+    /// loop stamps it on every downlink dispatch. Drives idle-flow reaping
+    /// in pooled mode (`tunnel_pool.rs`).
+    last_activity_ms: Arc<AtomicU64>,
 }
 
 // ── Public types ────────────────────────────────────────────────────
@@ -384,6 +390,7 @@ impl Socks5Tunnel {
                 identity_key: server_identity_key,
                 signed_prekey: server_signed_prekey,
                 prekey_signature: server_prekey_signature,
+                ..
             } => {
                 let srv_id: [u8; 32] = server_identity_key
                     .as_slice()
@@ -417,6 +424,7 @@ impl Socks5Tunnel {
                     one_time_prekey: None,
                     identity_key_version: server_bundle.identity_key_version,
                     rotation_signature: server_bundle.rotation_signature,
+                    identity_x25519_signature: None,
                 };
 
                 // Optional identity verification. Load-mutate-save the
@@ -494,6 +502,7 @@ impl Socks5Tunnel {
         let (local_to_ws_tx, local_to_ws_rx) = mpsc::channel::<Vec<u8>>(256);
         let (ws_to_local_tx, ws_to_local_rx) = mpsc::channel::<Bytes>(256);
         let send_credits = Arc::new(FlowSendCredits::new());
+        let last_activity_ms = Arc::new(AtomicU64::new(self.now_ms()));
 
         {
             let mut states = self.flow_states.lock().await;
@@ -502,6 +511,7 @@ impl Socks5Tunnel {
                 FlowState {
                     ws_to_local_tx,
                     send_credits: Arc::clone(&send_credits),
+                    last_activity_ms: Arc::clone(&last_activity_ms),
                 },
             );
         }
@@ -517,6 +527,7 @@ impl Socks5Tunnel {
                 &sender,
                 &bytes_relayed,
                 &send_credits,
+                &last_activity_ms,
                 &tunnel_weak,
             )
             .await
@@ -747,6 +758,86 @@ impl Socks5Tunnel {
         self.bytes_relayed.load(Ordering::Relaxed)
     }
 
+    /// Milliseconds since this tunnel was created — the basis for the
+    /// per-flow `last_activity_ms` stamps.
+    fn now_ms(&self) -> u64 {
+        self.created_at.elapsed().as_millis() as u64
+    }
+
+    /// Number of flows with activity in either direction within `idle`.
+    ///
+    /// Used by the pool's rotation policy (`tunnel_pool.rs`): the age
+    /// threshold only fires when this returns zero, so a tunnel carrying
+    /// only idle keep-alive flows rotates on schedule while an actively
+    /// used tunnel is left alone until the byte threshold fires.
+    ///
+    /// On lock contention (rare and brief) the tunnel is reported as fully
+    /// busy — deferring age rotation by one poll is the safe direction.
+    pub fn busy_flow_count(&self, idle: std::time::Duration) -> usize {
+        let cutoff = self.now_ms().saturating_sub(idle.as_millis() as u64);
+        match self.flow_states.try_lock() {
+            Ok(states) => states
+                .values()
+                .filter(|s| s.last_activity_ms.load(Ordering::Relaxed) >= cutoff)
+                .count(),
+            Err(_) => usize::MAX,
+        }
+    }
+
+    /// Close every flow idle LONGER than `idle`, exactly like a normal
+    /// client-initiated close. Returns the number of reaped flows.
+    ///
+    /// Per reaped flow this is indistinguishable from `close_flow`: the
+    /// state is removed (keeping the `flow_count` mirror correct) and the
+    /// credit gate closed, the removed `ws_to_local_tx` is dropped so the
+    /// downlink relay observes closure and terminates the local socket
+    /// (which in turn ends the uplink relay), and `CloseFlow` is sent
+    /// upstream through the ordered [`TunnelSender`] path. The idle check
+    /// and the removal happen under one lock, so a flow that becomes
+    /// active again mid-reap is never closed.
+    ///
+    /// Called by the pool watcher while a tunnel drains: keep-alive flows
+    /// (browser H2, push sockets) would otherwise pin a draining tunnel
+    /// until the drain backstop mass-fails them. The app reconnects
+    /// transparently onto a fresh tunnel on its next request.
+    pub async fn reap_idle_flows(&self, idle: std::time::Duration) -> usize {
+        let cutoff = self.now_ms().saturating_sub(idle.as_millis() as u64);
+        let reaped: Vec<u32> = {
+            let mut states = self.flow_states.lock().await;
+            let idle_ids: Vec<u32> = states
+                .iter()
+                .filter(|(_, s)| s.last_activity_ms.load(Ordering::Relaxed) < cutoff)
+                .map(|(id, _)| *id)
+                .collect();
+            let mut removed = Vec::with_capacity(idle_ids.len());
+            for flow_id in idle_ids {
+                if let Some(state) = states.remove(&flow_id) {
+                    state.send_credits.close();
+                    self.flow_count.fetch_sub(1, Ordering::Relaxed);
+                    removed.push(flow_id);
+                }
+                // `state` drops here, closing the flow's ws→local channel.
+            }
+            removed
+        };
+        {
+            let mut pending = self.pending_flows.lock().await;
+            for flow_id in &reaped {
+                pending.remove(flow_id);
+            }
+        }
+        let count = reaped.len();
+        for flow_id in reaped {
+            if let Err(e) = send_close_frame(&self.sender, flow_id).await {
+                debug!(
+                    "Failed to send CloseFlow for reaped flow {}: {}",
+                    flow_id, e
+                );
+            }
+        }
+        count
+    }
+
     /// Force-close the tunnel: mark dead, fail all pending flow-creation
     /// waiters, and drop every flow's receive channel so relay loops exit.
     ///
@@ -836,7 +927,11 @@ impl Socks5Tunnel {
             // per frame) and drop — blocking the demux loop would stall
             // every other flow on the tunnel.
             match state.ws_to_local_tx.try_send(data) {
-                Ok(()) => {}
+                Ok(()) => {
+                    state
+                        .last_activity_ms
+                        .store(self.now_ms(), Ordering::Relaxed);
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     warn!(
                         "Flow {} dispatch channel full, dropping frame — peer is exceeding its credit window",
@@ -860,6 +955,7 @@ impl Socks5Tunnel {
         sender: &TunnelSender,
         bytes_relayed: &AtomicU64,
         send_credits: &Arc<FlowSendCredits>,
+        last_activity_ms: &Arc<AtomicU64>,
         tunnel: &Weak<Socks5Tunnel>,
     ) -> Result<()> {
         // Chunk that exceeded the remaining credit window; the unsent tail
@@ -932,6 +1028,11 @@ impl Socks5Tunnel {
             sender
                 .send_encrypted(&padded, &[PayloadType::Data as u8])
                 .await?;
+            // Re-stamp via the tunnel's clock; if the tunnel is gone its
+            // flow map is gone too and the stamp no longer matters.
+            if let Some(t) = tunnel.upgrade() {
+                last_activity_ms.store(t.now_ms(), Ordering::Relaxed);
+            }
             trace!("Flow {} → {} bytes", flow_id, frame.payload.len());
         }
         Ok(())
@@ -1086,5 +1187,114 @@ mod tests {
                 assert!(payloads.contains(&format!("task{}-msg{}", t, i)));
             }
         }
+    }
+
+    /// Build a `Socks5Tunnel` over dummy channels (no network I/O) for
+    /// exercising flow-state bookkeeping directly. Returns the tunnel, the
+    /// receiving end of its writer channel, and the peer ratchet for
+    /// decrypting whatever the tunnel sends.
+    fn test_tunnel() -> (Socks5Tunnel, mpsc::Receiver<Message>, DoubleRatchet) {
+        let shared_secret = [0x42u8; 32];
+        let alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
+        let bob = DoubleRatchet::init_bob(shared_secret);
+        let (tx, rx) = mpsc::channel::<Message>(64);
+        let ratchet = Arc::new(Mutex::new(alice));
+        let tunnel = Socks5Tunnel {
+            sender: TunnelSender {
+                ws_writer: WebSocketWriter::from_sender(tx),
+                ratchet: Arc::clone(&ratchet),
+                send_lock: Arc::new(Mutex::new(())),
+            },
+            ratchet,
+            next_flow_id: AtomicU32::new(1),
+            pending_flows: Mutex::new(HashMap::new()),
+            flow_states: Mutex::new(HashMap::new()),
+            alive: AtomicBool::new(true),
+            flow_count: AtomicUsize::new(0),
+            bytes_relayed: Arc::new(AtomicU64::new(0)),
+            created_at: std::time::Instant::now(),
+            _ws_tasks: WebSocketTaskHandle::noop(),
+        };
+        (tunnel, rx, bob)
+    }
+
+    /// Register a flow with a chosen activity stamp; returns the receiving
+    /// end of its ws→local channel so the test can observe closure.
+    async fn insert_test_flow(
+        tunnel: &Socks5Tunnel,
+        flow_id: u32,
+        last_activity_ms: u64,
+    ) -> mpsc::Receiver<Bytes> {
+        let (ws_to_local_tx, ws_to_local_rx) = mpsc::channel::<Bytes>(16);
+        tunnel.flow_states.lock().await.insert(
+            flow_id,
+            FlowState {
+                ws_to_local_tx,
+                send_credits: Arc::new(FlowSendCredits::new()),
+                last_activity_ms: Arc::new(AtomicU64::new(last_activity_ms)),
+            },
+        );
+        tunnel.flow_count.fetch_add(1, Ordering::Relaxed);
+        ws_to_local_rx
+    }
+
+    /// Last-activity tracking + `busy_flow_count` / `reap_idle_flows`:
+    /// downlink dispatch re-stamps a flow, and a reap closes idle flows
+    /// exactly like a normal client-initiated close.
+    #[tokio::test]
+    async fn activity_tracking_busy_count_and_idle_reaping() {
+        const IDLE: std::time::Duration = std::time::Duration::from_millis(50);
+        let (tunnel, mut rx, mut bob) = test_tunnel();
+
+        // Flow 1 will be kept busy; flow 2's stamp is 0 — idle once the
+        // tunnel is older than IDLE.
+        let mut busy_rx = insert_test_flow(&tunnel, 1, tunnel.now_ms()).await;
+        let mut idle_rx = insert_test_flow(&tunnel, 2, 0).await;
+        tokio::time::sleep(2 * IDLE).await;
+
+        // A downlink frame to flow 1 re-stamps it (and is forwarded).
+        tunnel
+            .dispatch_data_frame(1, Bytes::from_static(b"ping"))
+            .await;
+        assert_eq!(busy_rx.recv().await.map(|b| b.len()), Some(4));
+
+        assert_eq!(tunnel.busy_flow_count(IDLE), 1);
+        assert_eq!(tunnel.active_flow_count(), 2);
+
+        // The reap closes only flow 2, indistinguishably from a normal
+        // close: state removed and the count mirror decremented, the
+        // downlink channel dropped (relay observes None), and a CloseFlow
+        // control frame sent upstream through the ordered sender.
+        let reaped = tunnel.reap_idle_flows(IDLE).await;
+        assert_eq!(reaped, 1);
+        assert_eq!(tunnel.active_flow_count(), 1);
+        assert_eq!(tunnel.busy_flow_count(IDLE), 1);
+        assert!(
+            idle_rx.recv().await.is_none(),
+            "reaped flow's channel must close"
+        );
+        assert!(
+            tunnel.flow_states.lock().await.contains_key(&1),
+            "busy flow must survive the reap"
+        );
+
+        // Exactly one frame on the wire: CloseFlow { flow_id: 2 }.
+        let msg = rx.recv().await.expect("CloseFlow frame");
+        let Message::Binary(bytes) = msg else {
+            panic!("expected binary frame");
+        };
+        let parsed = RatchetMessage::from_bytes(&bytes).expect("deserialize failed");
+        let plain = bob
+            .decrypt(&parsed, &[PayloadType::Admin as u8])
+            .expect("decrypt failed");
+        let unpadded = rvpn_core::protocol::padding::unpad_packet(&plain).expect("unpad");
+        let wire_flow = u32::from_be_bytes([unpadded[0], unpadded[1], unpadded[2], unpadded[3]]);
+        assert_eq!(wire_flow, 0, "control messages travel on flow 0");
+        let plen = u16::from_be_bytes([unpadded[4], unpadded[5]]) as usize;
+        match bincode::deserialize::<ControlMessage>(&unpadded[6..6 + plen]).expect("control msg") {
+            ControlMessage::CloseFlow { flow_id } => assert_eq!(flow_id, 2),
+            other => panic!("expected CloseFlow, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "only one frame must be sent");
     }
 }

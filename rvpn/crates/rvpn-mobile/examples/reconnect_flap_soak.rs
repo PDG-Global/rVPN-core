@@ -159,6 +159,8 @@ fn main() {
         enable_dns_proxy: true,
         stealth_fingerprint: None,
         server_identity_pin: None,
+        signed_x25519_seen: false,
+        trust_on_first_use: true,
         country_ips_file: None,
         extra_servers: vec![],
         routing: Default::default(),

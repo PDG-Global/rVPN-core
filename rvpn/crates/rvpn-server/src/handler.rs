@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use ip_network::IpNetwork;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::lookup_host;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -22,82 +21,22 @@ use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::{ServerConfig, TunNetworkConfig};
+use crate::egress::is_blocked_egress;
 use crate::TunWriter;
 use rvpn_core::crypto::ratchet::RatchetMessage;
-use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHResponder};
-use rvpn_core::protocol::multiplex::{
-    ControlMessage, FlowSendCredits, FLOW_CREDIT_STALL_TIMEOUT,
-};
+use rvpn_core::crypto::{DoubleRatchet, X3DHPublicBundle, X3DHResponder};
+use rvpn_core::protocol::multiplex::{ControlMessage, FlowSendCredits, FLOW_CREDIT_STALL_TIMEOUT};
 use rvpn_core::protocol::HandshakeMessage;
 use rvpn_core::protocol::{AuthMethod, PayloadType, ProtocolVersion};
 
-/// Check if an IP address is private or reserved (and should be blocked for outbound connections).
-///
-/// Returns `true` if the address should be blocked. If `allowed_cidr` is provided,
-/// addresses falling within that CIDR range are allowed (returns `false`).
-fn should_block_address(addr: &IpAddr, allowed_cidr: Option<&str>) -> bool {
-    // Check if address is within the allowed CIDR (e.g., tunnel subnet)
-    let is_allowed = allowed_cidr.and_then(|cidr| {
-        let network = cidr.parse::<IpNetwork>().ok()?;
-        Some(network.contains(*addr))
-    });
-
-    if is_allowed == Some(true) {
-        return false;
-    }
-
-    match addr {
-        IpAddr::V4(ipv4) => {
-            // Loopback: 127.0.0.0/8
-            if ipv4.is_loopback() {
-                return true;
-            }
-            // Private: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-            if ipv4.is_private() {
-                return true;
-            }
-            // Link-local: 169.254.0.0/16
-            if ipv4.is_link_local() {
-                return true;
-            }
-            // Multicast: 224.0.0.0/4
-            if ipv4.is_multicast() {
-                return true;
-            }
-            // Unspecified: 0.0.0.0
-            if ipv4.is_unspecified() {
-                return true;
-            }
-            // IPv4-mapped IPv6 handled in IpAddr::V6 branch
-            false
-        }
-        IpAddr::V6(ipv6) => {
-            // Loopback: ::1
-            if ipv6.is_loopback() {
-                return true;
-            }
-            // Private (ULA): fc00::/7
-            if (ipv6.segments()[0] & 0xfe00) == 0xfc00 {
-                return true;
-            }
-            // Link-local: fe80::/10
-            if (ipv6.segments()[0] & 0xffc0) == 0xfe80 {
-                return true;
-            }
-            // Multicast: ff00::/8
-            if ipv6.is_multicast() {
-                return true;
-            }
-            // Unspecified: ::
-            if ipv6.is_unspecified() {
-                return true;
-            }
-            // IPv4-mapped IPv6: ::ffff:0:0/96 — check inner IPv4
-            if let Some(mapped_ipv4) = ipv6.to_ipv4_mapped() {
-                return should_block_address(&IpAddr::V4(mapped_ipv4), allowed_cidr);
-            }
-            false
-        }
+fn server_hello(bundle: &X3DHPublicBundle) -> HandshakeMessage {
+    HandshakeMessage::ServerHello {
+        ephemeral_key: Vec::new(),
+        signed_prekey: bundle.signed_prekey.to_vec(),
+        prekey_signature: bundle.prekey_signature.to_vec(),
+        identity_key: bundle.identity_key.to_vec(),
+        identity_x25519_key: Some(bundle.identity_x25519_key.to_vec()),
+        identity_x25519_signature: bundle.identity_x25519_signature.map(|sig| sig.to_vec()),
     }
 }
 
@@ -106,16 +45,12 @@ fn should_block_address(addr: &IpAddr, allowed_cidr: Option<&str>) -> bool {
 /// Spawns a task per address with a 5-second timeout. Returns the first
 /// successful `TcpStream`. Prevents a single blackholed address from stalling
 /// the entire flow for 10 seconds.
-async fn connect_fastest(
-    addrs: Vec<SocketAddr>,
-    allowed_cidr: Option<&str>,
-    target: &str,
-) -> Result<TcpStream> {
+async fn connect_fastest(addrs: Vec<SocketAddr>, target: &str) -> Result<TcpStream> {
     let mut join_set = JoinSet::new();
     let mut blocked_count = 0;
 
     for addr in addrs {
-        if should_block_address(&addr.ip(), allowed_cidr) {
+        if is_blocked_egress(addr.ip()) {
             blocked_count += 1;
             continue;
         }
@@ -141,10 +76,7 @@ async fn connect_fastest(
     }
 
     if blocked_count > 0 && last_error.is_none() {
-        return Err(anyhow::anyhow!(
-            "All addresses blocked for {}",
-            target
-        ));
+        return Err(anyhow::anyhow!("All addresses blocked for {}", target));
     }
 
     Err(anyhow::anyhow!(
@@ -152,6 +84,27 @@ async fn connect_fastest(
         target,
         last_error
     ))
+}
+
+fn select_udp_target(addrs: Vec<SocketAddr>) -> Option<SocketAddr> {
+    addrs.into_iter().find(|addr| !is_blocked_egress(addr.ip()))
+}
+
+fn permitted_dns_addresses(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+) -> (Vec<std::net::Ipv4Addr>, Vec<std::net::Ipv6Addr>) {
+    let mut ipv4_addrs = Vec::new();
+    let mut ipv6_addrs = Vec::new();
+    for addr in addrs {
+        if is_blocked_egress(addr.ip()) {
+            continue;
+        }
+        match addr.ip() {
+            IpAddr::V4(addr) => ipv4_addrs.push(addr),
+            IpAddr::V6(addr) => ipv6_addrs.push(addr),
+        }
+    }
+    (ipv4_addrs, ipv6_addrs)
 }
 
 /// Protocol type for target connection
@@ -213,67 +166,7 @@ pub struct VpnHandler {
 
 impl VpnHandler {
     pub fn new(config: ServerConfig) -> Result<Self> {
-        // Load identity key and create X3DH responder
-        let x3dh_responder = if config.identity_key_file.exists() {
-            match IdentityKey::load(&config.identity_key_file) {
-                Ok(identity) => {
-                    info!(
-                        "Loaded server identity key from {:?}",
-                        config.identity_key_file
-                    );
-
-                    // Try to load signed_prekey from private key file
-                    // The private key is stored in prekey-bundle.private.json alongside the public bundle
-                    let signed_prekey = config.prekey_bundle_file.as_ref()
-                        .and_then(|bundle_path| {
-                            // Derive the private key file path from the bundle path
-                            let private_key_path = bundle_path.with_extension("private.json");
-                            if private_key_path.exists() {
-                                match Self::load_signed_prekey_private(&private_key_path) {
-                                    Ok(key) => {
-                                        info!("Loaded signed_prekey from private key file: {:?}", private_key_path);
-                                        Some(key)
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to load private key file: {}. Generating new signed_prekey.", e);
-                                        None
-                                    }
-                                }
-                            } else if bundle_path.exists() {
-                                // Fallback: try to load from the old format (public bundle - this won't work correctly!)
-                                warn!("Private key file not found at {:?}. Cannot use deterministic prekey.", private_key_path);
-                                None
-                            } else {
-                                None
-                            }
-                        });
-
-                    match signed_prekey {
-                        Some(prekey) => {
-                            info!("Using existing signed_prekey from prekey bundle");
-                            Some(X3DHResponder::from_identity_with_bundle(identity, prekey))
-                        }
-                        None => {
-                            warn!("No prekey bundle found. Generating new signed_prekey (clients will need updated bundle!)");
-                            Some(X3DHResponder::from_identity(identity))
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to load identity key: {}. X3DH handshake will not be available.",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            warn!(
-                "No identity key file found at {:?}. X3DH handshake will not be available.",
-                config.identity_key_file
-            );
-            None
-        };
+        let x3dh_responder = Some(crate::private_files::load_responder(&config)?);
 
         // Read rate limit values before moving config into the struct
         let max_connections_per_ip = config.rate_limit.max_connections_per_ip;
@@ -290,46 +183,6 @@ impl VpnHandler {
             )),
             x3dh_responder,
         })
-    }
-
-    /// Load signed_prekey private key from private key JSON file
-    fn load_signed_prekey_private(private_key_path: &std::path::Path) -> Result<[u8; 32]> {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-
-        let content = std::fs::read_to_string(private_key_path).with_context(|| {
-            format!(
-                "Failed to read private key file from {:?}",
-                private_key_path
-            )
-        })?;
-
-        #[derive(serde::Deserialize)]
-        struct PrivateKeyJson {
-            #[serde(rename = "signed_prekey_private")]
-            signed_prekey_private: String,
-        }
-
-        let private_key: PrivateKeyJson = serde_json::from_str(&content).with_context(|| {
-            format!(
-                "Failed to parse private key file from {:?}",
-                private_key_path
-            )
-        })?;
-
-        let decoded = BASE64
-            .decode(&private_key.signed_prekey_private)
-            .with_context(|| "Failed to decode base64 signed_prekey_private")?;
-
-        if decoded.len() != 32 {
-            anyhow::bail!(
-                "signed_prekey_private must be 32 bytes, got {}",
-                decoded.len()
-            );
-        }
-
-        let mut result = [0u8; 32];
-        result.copy_from_slice(&decoded);
-        Ok(result)
     }
 
     /// Handle incoming WebSocket connection (Brook-style 1:1)
@@ -622,12 +475,7 @@ impl VpnHandler {
                 // Note: Server doesn't generate an ephemeral key in X3DH - only the client does.
                 // The ephemeral_key field is kept for protocol compatibility but is empty.
                 let public_bundle = responder.get_public_bundle();
-                let response = HandshakeMessage::ServerHello {
-                    ephemeral_key: Vec::new(),
-                    signed_prekey: public_bundle.signed_prekey.to_vec(),
-                    prekey_signature: public_bundle.prekey_signature.to_vec(),
-                    identity_key: public_bundle.identity_key.to_vec(),
-                };
+                let response = server_hello(&public_bundle);
 
                 ws_write
                     .send(Message::Binary(serde_json::to_vec(&response)?))
@@ -760,7 +608,10 @@ impl VpnHandler {
         // Validate hostname length per DNS spec (max 253 bytes total)
         const MAX_HOSTNAME_LEN: usize = 253;
         if host_len > MAX_HOSTNAME_LEN {
-            debug!("Rejecting target: hostname too long ({} bytes, max {})", host_len, MAX_HOSTNAME_LEN);
+            debug!(
+                "Rejecting target: hostname too long ({} bytes, max {})",
+                host_len, MAX_HOSTNAME_LEN
+            );
             return None;
         }
 
@@ -825,7 +676,6 @@ impl VpnHandler {
     /// Connect to target server
     async fn connect_to_target(&self, target: &TargetAddress) -> Result<TcpStream> {
         let cache_key = format!("{}:{}", target.host, target.port);
-        let allowed_cidr = Some(self.config.tun.tun_ip.as_str());
 
         // Check DNS cache
         let addrs: Vec<SocketAddr> = {
@@ -845,7 +695,7 @@ impl VpnHandler {
         };
 
         // Connect to the first available address in parallel
-        connect_fastest(addrs, allowed_cidr, &target.host).await
+        connect_fastest(addrs, &target.host).await
     }
 
     /// Resolve hostname and cache results
@@ -889,10 +739,7 @@ impl VpnHandler {
     /// Relay data bidirectionally between WebSocket and TCP target
     pub(crate) async fn relay_tcp<S>(
         &self,
-        ws_write: futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<S>,
-            Message,
-        >,
+        ws_write: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
         mut ws_read: futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>,
         target: TcpStream,
         ratchet: DoubleRatchet,
@@ -1096,22 +943,18 @@ impl VpnHandler {
         let local_addr = SocketAddr::from(([0, 0, 0, 0], 0));
         let udp_socket = UdpSocket::bind(local_addr).await?;
 
-        // Resolve target address
+        // Resolve and select only an address allowed by the shared egress policy.
         let target_socket_addr = match self
             .resolve_and_cache(&target_addr.host, target_addr.port)
             .await
         {
-            Ok(addrs) => {
-                if let Some(addr) = addrs.first() {
-                    *addr
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "No addresses resolved for {}:{}",
-                        target_addr.host,
-                        target_addr.port
-                    ));
-                }
-            }
+            Ok(addrs) => select_udp_target(addrs).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No permitted addresses resolved for {}:{}",
+                    target_addr.host,
+                    target_addr.port
+                )
+            })?,
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "Failed to resolve {}:{}: {}",
@@ -1121,20 +964,6 @@ impl VpnHandler {
                 ));
             }
         };
-
-        // Block connections to private/reserved addresses (except tunnel subnet)
-        let allowed_cidr = Some(self.config.tun.tun_ip.as_str());
-        if should_block_address(&target_socket_addr.ip(), allowed_cidr) {
-            debug!(
-                "Blocking UDP relay to private/reserved address {} for {}",
-                target_socket_addr.ip(),
-                target_addr.host
-            );
-            return Err(anyhow::anyhow!(
-                "Connection to private/reserved address {} is not allowed",
-                target_socket_addr.ip()
-            ));
-        }
 
         info!("UDP relay to {} ({})", target_socket_addr, target_addr.host);
 
@@ -1397,9 +1226,8 @@ impl RateLimiter {
         let now = Instant::now();
 
         // Lazy cleanup: remove stale entries older than 60 seconds
-        self.requests.retain(|_, (_, start)| {
-            now.duration_since(*start).as_secs() < 60
-        });
+        self.requests
+            .retain(|_, (_, start)| now.duration_since(*start).as_secs() < 60);
 
         if let Some((count, start)) = self.requests.get(ip) {
             let elapsed = now.duration_since(*start);
@@ -1450,109 +1278,13 @@ pub struct MultiplexerHandler {
 
 impl MultiplexerHandler {
     pub fn new(config: ServerConfig) -> Result<Self> {
-        // Load identity key and create X3DH responder (same as VpnHandler)
-        let x3dh_responder = if config.identity_key_file.exists() {
-            match IdentityKey::load(&config.identity_key_file) {
-                Ok(identity) => {
-                    info!(
-                        "Loaded server identity key from {:?}",
-                        config.identity_key_file
-                    );
-
-                    // Try to load signed_prekey from private key file
-                    let signed_prekey = config.prekey_bundle_file.as_ref()
-                        .and_then(|bundle_path| {
-                            let private_key_path = bundle_path.with_extension("private.json");
-                            if private_key_path.exists() {
-                                match Self::load_signed_prekey_private(&private_key_path) {
-                                    Ok(key) => {
-                                        info!("Loaded signed_prekey from private key file: {:?}", private_key_path);
-                                        Some(key)
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to load private key file: {}. Generating new signed_prekey.", e);
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            }
-                        });
-
-                    match signed_prekey {
-                        Some(prekey) => {
-                            info!("Using existing signed_prekey from prekey bundle");
-                            Some(Arc::new(X3DHResponder::from_identity_with_bundle(
-                                identity, prekey,
-                            )))
-                        }
-                        None => {
-                            warn!("No prekey bundle found. Generating new signed_prekey (clients will need updated bundle!)");
-                            Some(Arc::new(X3DHResponder::from_identity(identity)))
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to load identity key: {}. X3DH handshake will not be available.",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            warn!(
-                "No identity key file found at {:?}. X3DH handshake will not be available.",
-                config.identity_key_file
-            );
-            None
-        };
+        let x3dh_responder = Some(Arc::new(crate::private_files::load_responder(&config)?));
 
         Ok(Self {
             config,
             x3dh_responder,
             dns_cache: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
-    }
-
-    /// Load signed_prekey private key from private key JSON file
-    fn load_signed_prekey_private(private_key_path: &std::path::Path) -> Result<[u8; 32]> {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-
-        let content = std::fs::read_to_string(private_key_path).with_context(|| {
-            format!(
-                "Failed to read private key file from {:?}",
-                private_key_path
-            )
-        })?;
-
-        #[derive(serde::Deserialize)]
-        struct PrivateKeyJson {
-            #[serde(rename = "signed_prekey_private")]
-            signed_prekey_private: String,
-        }
-
-        let private_key: PrivateKeyJson = serde_json::from_str(&content).with_context(|| {
-            format!(
-                "Failed to parse private key file from {:?}",
-                private_key_path
-            )
-        })?;
-
-        let decoded = BASE64
-            .decode(&private_key.signed_prekey_private)
-            .with_context(|| "Failed to decode base64 signed_prekey_private")?;
-
-        if decoded.len() != 32 {
-            anyhow::bail!(
-                "signed_prekey_private must be 32 bytes, got {}",
-                decoded.len()
-            );
-        }
-
-        let mut result = [0u8; 32];
-        result.copy_from_slice(&decoded);
-        Ok(result)
     }
 
     /// Handle multiplexed WebSocket connection
@@ -1680,7 +1412,8 @@ pub(crate) async fn remove_flow(flows: &FlowMap, flow_id: u32) -> Option<Arc<Ser
 
 /// Pending per-flow data buffered before a flow is established.
 /// Maps flow ID to a queue of (payload, sequence_number, age).
-type PendingFlows = tokio::sync::Mutex<std::collections::HashMap<u32, Vec<(Vec<u8>, u64, Duration)>>>;
+type PendingFlows =
+    tokio::sync::Mutex<std::collections::HashMap<u32, Vec<(Vec<u8>, u64, Duration)>>>;
 
 /// Pre-created TCP connections ready for immediate use.
 /// Key: "target:port", Value: queue of (insertion time, TcpStream).
@@ -1806,17 +1539,28 @@ where
 
         info!("Multiplexed session established for {}", self.peer_addr);
 
-        debug!("MultiplexerSession: peer={}, tun_enabled={}, tun_server_some={}, dns_count={}, mtu={}",
-            self.peer_addr, self.tun_config.enabled, self.tun_server.is_some(),
-            self.tun_config.dns_servers.len(), self.tun_config.mtu);
+        debug!(
+            "MultiplexerSession: peer={}, tun_enabled={}, tun_server_some={}, dns_count={}, mtu={}",
+            self.peer_addr,
+            self.tun_config.enabled,
+            self.tun_server.is_some(),
+            self.tun_config.dns_servers.len(),
+            self.tun_config.mtu
+        );
 
         // 2. In TUN mode: allocate IP and send VirtualIp after X3DH
         //    Do this BEFORE splitting the WebSocket so we can send directly
         let mut allocated_ip_for_tun: Option<std::net::IpAddr> = None;
         if self.tun_config.enabled {
-            info!("TUN_MODE: tun_config.enabled=true for client {}", self.peer_addr);
+            info!(
+                "TUN_MODE: tun_config.enabled=true for client {}",
+                self.peer_addr
+            );
             if let Some(ref tun_server) = self.tun_server {
-                info!("TUN_MODE: tun_server is Some, proceeding with allocation for {}", self.peer_addr);
+                info!(
+                    "TUN_MODE: tun_server is Some, proceeding with allocation for {}",
+                    self.peer_addr
+                );
                 // Allocate IP from pool, keyed by client identity so a
                 // reconnecting client reclaims its previous tunnel IP
                 let client_id = self.tun_client_id();
@@ -1899,7 +1643,10 @@ where
         let tun_client_id = self.tun_client_id();
         let (ws_write, mut ws_read) = self.ws.split();
         let rx = self.rx.take().expect("rx should be present");
-        let control_rx = self.control_rx.take().expect("control_rx should be present");
+        let control_rx = self
+            .control_rx
+            .take()
+            .expect("control_rx should be present");
         let mut tun_write_rx = self
             .tun_write_rx
             .take()
@@ -1937,10 +1684,19 @@ where
         if let Some(allocated_ip) = allocated_ip_for_tun {
             info!("About to register client {} with TUN server", allocated_ip);
             if let Some(ref ts) = tun_server {
-                info!("tun_server is Some, calling register_client for {}", allocated_ip);
-                match ts.register_client(allocated_ip, tun_response_tx.clone()).await {
+                info!(
+                    "tun_server is Some, calling register_client for {}",
+                    allocated_ip
+                );
+                match ts
+                    .register_client(allocated_ip, tun_response_tx.clone())
+                    .await
+                {
                     Ok(()) => {
-                        info!("Successfully registered client {} with TUN server", allocated_ip);
+                        info!(
+                            "Successfully registered client {} with TUN server",
+                            allocated_ip
+                        );
                     }
                     Err(e) => {
                         error!(
@@ -1950,7 +1706,10 @@ where
                     }
                 }
             } else {
-                warn!("Cannot register client {} - tun_server is None!", allocated_ip);
+                warn!(
+                    "Cannot register client {} - tun_server is None!",
+                    allocated_ip
+                );
             }
         } else {
             warn!("Cannot register client - allocated_ip_for_tun is None!");
@@ -2029,8 +1788,8 @@ where
             async move {
                 let idle_timeout = Duration::from_secs(90);
                 loop {
-                    let remaining = idle_timeout
-                        .saturating_sub(last_activity.lock().unwrap().elapsed());
+                    let remaining =
+                        idle_timeout.saturating_sub(last_activity.lock().unwrap().elapsed());
                     if remaining.is_zero() {
                         warn!(
                             "TUN client {} idle timeout (no traffic for {}s), closing",
@@ -2065,7 +1824,9 @@ where
                             match decrypt_result {
                                 Ok(frames) => {
                                     let batch_size = frames.len();
-                                    for (idx, (flow_id, payload, aad_type)) in frames.into_iter().enumerate() {
+                                    for (idx, (flow_id, payload, aad_type)) in
+                                        frames.into_iter().enumerate()
+                                    {
                                         if let Err(e) = Self::dispatch_decrypted_frame(
                                             flow_id,
                                             &payload,
@@ -2082,10 +1843,15 @@ where
                                             &tcp_pool,
                                             frame_num,
                                             elapsed,
-                                        ).await {
+                                        )
+                                        .await
+                                        {
                                             error!(
                                                 "FRAME: [#{:05}] dispatch {}/{} failed: {}",
-                                                frame_num, idx + 1, batch_size, e
+                                                frame_num,
+                                                idx + 1,
+                                                batch_size,
+                                                e
                                             );
                                         }
                                     }
@@ -2107,9 +1873,7 @@ where
                             // layer auto-pongs our pings even though nobody
                             // is reading the flow on the client side.
                         }
-                        Ok(Some(Ok(Message::Close(_)))) |
-                        Ok(None) |
-                        Ok(Some(Err(_))) => {
+                        Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
                             break;
                         }
                         Ok(Some(Ok(_))) => {
@@ -2195,7 +1959,10 @@ where
                     .unregister_client(client_ip, &tun_client_id, tun_response_tx)
                     .await
                 {
-                    warn!("Failed to unregister client {} from TUN server: {}", client_ip, e);
+                    warn!(
+                        "Failed to unregister client {} from TUN server: {}",
+                        client_ip, e
+                    );
                 }
             }
         }
@@ -2259,11 +2026,17 @@ where
                 MuxMessage::Control(control) => {
                     let frame = match rvpn_core::protocol::MultiplexedFrame::new_control(control) {
                         Ok(f) => f,
-                        Err(e) => { error!("Failed to create control frame: {}", e); break; }
+                        Err(e) => {
+                            error!("Failed to create control frame: {}", e);
+                            break;
+                        }
                     };
                     let encoded = match frame.encode() {
                         Ok(e) => e,
-                        Err(e) => { error!("Failed to encode control frame: {}", e); break; }
+                        Err(e) => {
+                            error!("Failed to encode control frame: {}", e);
+                            break;
+                        }
                     };
                     (encoded.to_vec(), vec![0x02u8])
                 }
@@ -2272,7 +2045,10 @@ where
             // Step 2: Pad (no locks needed)
             let padded = match rvpn_core::protocol::padding::pad_packet(&plaintext) {
                 Ok(p) => p,
-                Err(e) => { error!("Padding failed: {}", e); break; }
+                Err(e) => {
+                    error!("Padding failed: {}", e);
+                    break;
+                }
             };
 
             // Serialize encrypt→enqueue against the other ratchet-encrypting
@@ -2287,9 +2063,15 @@ where
                 match ratchet_guard.encrypt(&padded, &aad) {
                     Ok(message) => match message.to_bytes() {
                         Ok(bytes) => bytes,
-                        Err(e) => { error!("Serialization failed: {}", e); break; }
+                        Err(e) => {
+                            error!("Serialization failed: {}", e);
+                            break;
+                        }
                     },
-                    Err(e) => { error!("Encryption failed: {}", e); break; }
+                    Err(e) => {
+                        error!("Encryption failed: {}", e);
+                        break;
+                    }
                 }
             };
             // ratchet_guard dropped here — other tasks can decrypt now
@@ -2438,8 +2220,7 @@ where
             let mut disconnected = false;
 
             // Drain packets that are already queued without blocking.
-            while frame_count < Self::TUN_BATCH_MAX_FRAMES
-                && byte_count < Self::TUN_BATCH_MAX_BYTES
+            while frame_count < Self::TUN_BATCH_MAX_FRAMES && byte_count < Self::TUN_BATCH_MAX_BYTES
             {
                 match tun_response_rx.try_recv() {
                     Ok(packet) => {
@@ -2632,7 +2413,7 @@ where
         // Detailed frame reception logging with timing information
         if flow_id == 0 {
             // Control message
-            info!(
+            trace!(
                 "FRAME: [#{:05}] RECEIVED CONTROL frame from {} after {:.3}s (msg_num: {}, payload_type: {})",
                 frame_number, peer_addr, elapsed.as_secs_f64(),
                 message.header.message_number, message.header.payload_type
@@ -2640,10 +2421,21 @@ where
             // Dead code path — pass empty pool (this function is #[allow(dead_code)])
             let dummy_pool: TcpPool = Arc::new(Mutex::new(HashMap::new()));
             let (dummy_control_tx, _dummy_control_rx) = tokio::sync::mpsc::channel(1);
-            Self::handle_control(payload, flows, tx, &dummy_control_tx, peer_addr, dns_cache, tun_config, pending_flows, &dummy_pool).await
+            Self::handle_control(
+                payload,
+                flows,
+                tx,
+                &dummy_control_tx,
+                peer_addr,
+                dns_cache,
+                tun_config,
+                pending_flows,
+                &dummy_pool,
+            )
+            .await
         } else {
             // Data for existing flow
-            info!(
+            trace!(
                 "FRAME: [#{:05}] RECEIVED DATA frame for flow_id {} from {} after {:.3}s ({} bytes, msg_num: {}, payload_type: {})",
                 frame_number, flow_id, peer_addr, elapsed.as_secs_f64(), payload.len(),
                 message.header.message_number, message.header.payload_type
@@ -2654,9 +2446,12 @@ where
             let flow_exists = flows_guard.contains_key(&flow_id);
             drop(flows_guard);
 
-            info!(
+            trace!(
                 "FRAME: [#{:05}] flow_exists={}, tun_enabled={}, tun_server={}",
-                frame_number, flow_exists, tun_config.enabled, tun_server.is_some()
+                frame_number,
+                flow_exists,
+                tun_config.enabled,
+                tun_server.is_some()
             );
 
             if flow_exists {
@@ -2665,7 +2460,7 @@ where
             } else if tun_config.enabled {
                 // TUN mode: write packet directly to TUN interface instead of creating TCP flow
                 // Extract source IP from packet to identify the client for response routing
-                info!(
+                trace!(
                     "FRAME: [#{:05}] TUN mode: attempting to route {} bytes (tun_server is {})",
                     frame_number,
                     payload.len(),
@@ -2689,7 +2484,9 @@ where
                     Some(ip) => ip,
                     None => {
                         // Log first bytes of payload for debugging
-                        let preview: String = payload.iter().take(20)
+                        let preview: String = payload
+                            .iter()
+                            .take(20)
                             .map(|b| format!("{:02x}", b))
                             .collect::<Vec<_>>()
                             .join(" ");
@@ -2697,13 +2494,17 @@ where
                             "FRAME: [#{:05}] TUN mode: failed to extract source IP from packet (first 20 bytes: {})",
                             frame_number, preview
                         );
-                        return Err(anyhow::anyhow!("TUN mode: cannot extract source IP from packet"));
+                        return Err(anyhow::anyhow!(
+                            "TUN mode: cannot extract source IP from packet"
+                        ));
                     }
                 };
 
-                info!(
+                trace!(
                     "FRAME: [#{:05}] TUN mode: writing {} bytes to TUN (client IP: {})",
-                    frame_number, payload.len(), client_ip_str
+                    frame_number,
+                    payload.len(),
+                    client_ip_str
                 );
 
                 if let Err(e) = ts.write_to_tun(payload).await {
@@ -2713,7 +2514,7 @@ where
                     );
                     return Err(e);
                 }
-                info!(
+                trace!(
                     "FRAME: [#{:05}] Successfully wrote packet to TUN",
                     frame_number
                 );
@@ -2900,14 +2701,8 @@ where
     async fn connect_with_dns_cache(
         target: &str,
         dns_cache: &DnsCache,
-        tun_config: &TunNetworkConfig,
+        _tun_config: &TunNetworkConfig,
     ) -> Result<TcpStream> {
-        let allowed_cidr = if tun_config.enabled {
-            Some(tun_config.tun_ip.as_str())
-        } else {
-            None
-        };
-
         // If target is an IP literal, use it directly without DNS resolution
         let addrs: Vec<SocketAddr> = if let Some(addr) = Self::parse_socket_addr_literal(target) {
             vec![addr]
@@ -2929,7 +2724,7 @@ where
         };
 
         // Connect to the first available address in parallel
-        connect_fastest(addrs, allowed_cidr, target).await
+        connect_fastest(addrs, target).await
     }
 
     /// Resolve hostname and cache results
@@ -2975,7 +2770,10 @@ where
         let msg = match msg {
             Ok(Some(Ok(m))) => m,
             Ok(Some(Err(e))) => {
-                info!("WebSocket error during handshake from {}: {}", self.peer_addr, e);
+                info!(
+                    "WebSocket error during handshake from {}: {}",
+                    self.peer_addr, e
+                );
                 return Ok(None);
             }
             Ok(None) => {
@@ -3115,12 +2913,7 @@ where
                 // Send ServerHello response
                 info!("Preparing ServerHello for {}", self.peer_addr);
                 let public_bundle = responder.get_public_bundle();
-                let response = HandshakeMessage::ServerHello {
-                    ephemeral_key: Vec::new(),
-                    signed_prekey: public_bundle.signed_prekey.to_vec(),
-                    prekey_signature: public_bundle.prekey_signature.to_vec(),
-                    identity_key: public_bundle.identity_key.to_vec(),
-                };
+                let response = server_hello(&public_bundle);
 
                 info!("Serializing ServerHello for {} (signed_prekey={} bytes, sig={} bytes, identity={} bytes)",
                     self.peer_addr,
@@ -3131,12 +2924,19 @@ where
                 let response_bytes = match serde_json::to_vec(&response) {
                     Ok(b) => b,
                     Err(e) => {
-                        info!("Failed to serialize ServerHello for {}: {}", self.peer_addr, e);
+                        info!(
+                            "Failed to serialize ServerHello for {}: {}",
+                            self.peer_addr, e
+                        );
                         return Ok(None);
                     }
                 };
 
-                info!("ServerHello serialized ({} bytes), sending to {}", response_bytes.len(), self.peer_addr);
+                info!(
+                    "ServerHello serialized ({} bytes), sending to {}",
+                    response_bytes.len(),
+                    self.peer_addr
+                );
 
                 if let Err(e) = self.ws.send(Message::Binary(response_bytes)).await {
                     info!("Failed to send ServerHello to {}: {:?}", self.peer_addr, e);
@@ -3215,10 +3015,15 @@ where
                         flow_id, peer_addr, flow_count, MAX_FLOWS_PER_SESSION
                     );
                     // Send FlowFailed back to client
-                    let _ = control_tx.send(ControlMessage::FlowFailed {
-                        flow_id,
-                        error: format!("Too many flows: {} (limit {})", flow_count, MAX_FLOWS_PER_SESSION),
-                    }).await;
+                    let _ = control_tx
+                        .send(ControlMessage::FlowFailed {
+                            flow_id,
+                            error: format!(
+                                "Too many flows: {} (limit {})",
+                                flow_count, MAX_FLOWS_PER_SESSION
+                            ),
+                        })
+                        .await;
                     return Ok(());
                 }
 
@@ -3287,7 +3092,13 @@ where
                             pool.get(&target_clone).map_or(0, |q| q.len())
                         };
                         if pool_size < MAX_POOL_PER_TARGET {
-                            match Self::connect_with_dns_cache(&target_clone, &dns_clone, &tun_clone).await {
+                            match Self::connect_with_dns_cache(
+                                &target_clone,
+                                &dns_clone,
+                                &tun_clone,
+                            )
+                            .await
+                            {
                                 Ok(s) => {
                                     let mut pool = pool_clone.lock().await;
                                     pool.entry(target_clone)
@@ -3393,9 +3204,16 @@ where
                                     pending.len() - MAX_FLUSH_FRAMES, flow_id
                                 );
                             }
-                            for (data, _frame_num, _elapsed) in pending.into_iter().take(MAX_FLUSH_FRAMES) {
-                                if let Err(e) = Self::handle_flow_data(flow_id, &data, flows, control_tx).await {
-                                    debug!("Failed to flush pending data for flow {}: {}", flow_id, e);
+                            for (data, _frame_num, _elapsed) in
+                                pending.into_iter().take(MAX_FLUSH_FRAMES)
+                            {
+                                if let Err(e) =
+                                    Self::handle_flow_data(flow_id, &data, flows, control_tx).await
+                                {
+                                    debug!(
+                                        "Failed to flush pending data for flow {}: {}",
+                                        flow_id, e
+                                    );
                                 }
                             }
                             if flushed > 0 {
@@ -3446,7 +3264,11 @@ where
                 );
             }
             ControlMessage::Ping { timestamp } => {
-                trace!("Received ping from {}: {}, sending pong", peer_addr, timestamp);
+                trace!(
+                    "Received ping from {}: {}, sending pong",
+                    peer_addr,
+                    timestamp
+                );
                 let _ = control_tx.send(ControlMessage::Pong { timestamp }).await;
             }
             ControlMessage::Pong { timestamp } => {
@@ -3465,13 +3287,16 @@ where
                 if let Some(flow) = flow {
                     trace!(
                         "WindowUpdate for flow {} from {}: +{} credits",
-                        flow_id, peer_addr, window_size
+                        flow_id,
+                        peer_addr,
+                        window_size
                     );
                     flow.send_credits.grant(window_size as u64);
                 } else {
                     trace!(
                         "WindowUpdate for unknown flow {} from {}",
-                        flow_id, peer_addr
+                        flow_id,
+                        peer_addr
                     );
                 }
             }
@@ -3500,10 +3325,7 @@ where
 
         if let Some(flow) = flow {
             trace!("DATA: Queuing {} bytes for flow {}", data.len(), flow_id);
-            match flow
-                .to_target_tx
-                .try_send(Bytes::copy_from_slice(data))
-            {
+            match flow.to_target_tx.try_send(Bytes::copy_from_slice(data)) {
                 Ok(()) => Ok(()),
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     // The queue is bounded well above the credit window, so a
@@ -3515,9 +3337,7 @@ where
                         flow_id
                     );
                     remove_flow(flows, flow_id).await;
-                    let _ = control_tx
-                        .send(ControlMessage::CloseFlow { flow_id })
-                        .await;
+                    let _ = control_tx.send(ControlMessage::CloseFlow { flow_id }).await;
                     Err(anyhow::anyhow!("Flow {} uplink queue full", flow_id))
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -3594,9 +3414,7 @@ where
                         "Flow {} closed after target write failure for {}",
                         flow_id, peer_addr
                     );
-                    let _ = control_tx
-                        .send(ControlMessage::CloseFlow { flow_id })
-                        .await;
+                    let _ = control_tx.send(ControlMessage::CloseFlow { flow_id }).await;
                 }
             }
         })
@@ -3654,7 +3472,10 @@ where
         if consumed != plaintext.len() {
             tracing::warn!(
                 "FRAME: [#{:05}] Parsed {} bytes out of {} ({} frames); trailing data ignored",
-                frame_number, consumed, plaintext.len(), frames.len()
+                frame_number,
+                consumed,
+                plaintext.len(),
+                frames.len()
             );
         }
 
@@ -3669,7 +3490,10 @@ where
 
         tracing::trace!(
             "FRAME: [#{:05}] Decrypted {} frame(s) from {} ({} bytes)",
-            frame_number, parsed.len(), peer_addr, consumed
+            frame_number,
+            parsed.len(),
+            peer_addr,
+            consumed
         );
 
         Ok(parsed)
@@ -3698,14 +3522,27 @@ where
     ) -> Result<()> {
         if flow_id == 0 {
             // Control message
-            info!(
+            trace!(
                 "FRAME: [#{:05}] RECEIVED CONTROL frame from {} after {:.3}s",
-                frame_number, peer_addr, elapsed.as_secs_f64()
+                frame_number,
+                peer_addr,
+                elapsed.as_secs_f64()
             );
-            Self::handle_control(payload, flows, tx, control_tx, peer_addr, dns_cache, tun_config, pending_flows, tcp_pool).await
+            Self::handle_control(
+                payload,
+                flows,
+                tx,
+                control_tx,
+                peer_addr,
+                dns_cache,
+                tun_config,
+                pending_flows,
+                tcp_pool,
+            )
+            .await
         } else {
             // Data for existing flow
-            info!(
+            trace!(
                 "FRAME: [#{:05}] RECEIVED DATA frame for flow_id {} from {} after {:.3}s ({} bytes)",
                 frame_number, flow_id, peer_addr, elapsed.as_secs_f64(), payload.len()
             );
@@ -3719,11 +3556,15 @@ where
                 Self::handle_flow_data(flow_id, payload, flows, control_tx).await?;
             } else if tun_config.enabled {
                 // TUN mode: write packet directly to TUN interface
-                info!(
+                trace!(
                     "FRAME: [#{:05}] TUN mode: attempting to route {} bytes (tun_server is {})",
                     frame_number,
                     payload.len(),
-                    if _tun_server.is_some() { "Some" } else { "None" }
+                    if _tun_server.is_some() {
+                        "Some"
+                    } else {
+                        "None"
+                    }
                 );
 
                 let ts = match _tun_server {
@@ -3740,7 +3581,9 @@ where
                 let client_ip_str = match Self::extract_source_ip(payload) {
                     Some(ip) => ip,
                     None => {
-                        let preview: String = payload.iter().take(20)
+                        let preview: String = payload
+                            .iter()
+                            .take(20)
                             .map(|b| format!("{:02x}", b))
                             .collect::<Vec<_>>()
                             .join(" ");
@@ -3748,13 +3591,17 @@ where
                             "FRAME: [#{:05}] TUN mode: failed to extract source IP from packet (first 20 bytes: {})",
                             frame_number, preview
                         );
-                        return Err(anyhow::anyhow!("TUN mode: cannot extract source IP from packet"));
+                        return Err(anyhow::anyhow!(
+                            "TUN mode: cannot extract source IP from packet"
+                        ));
                     }
                 };
 
-                info!(
+                trace!(
                     "FRAME: [#{:05}] TUN mode: writing {} bytes to TUN (client IP: {})",
-                    frame_number, payload.len(), client_ip_str
+                    frame_number,
+                    payload.len(),
+                    client_ip_str
                 );
 
                 if let Err(e) = ts.write_to_tun(payload).await {
@@ -3764,7 +3611,7 @@ where
                     );
                     return Err(e);
                 }
-                info!(
+                trace!(
                     "FRAME: [#{:05}] Successfully wrote packet to TUN",
                     frame_number
                 );
@@ -3776,11 +3623,10 @@ where
                     frame_number, flow_id
                 );
                 let mut pending = pending_flows.lock().await;
-                pending.entry(flow_id).or_default().push((
-                    payload.to_vec(),
-                    frame_number,
-                    elapsed,
-                ));
+                pending
+                    .entry(flow_id)
+                    .or_default()
+                    .push((payload.to_vec(), frame_number, elapsed));
             }
             Ok(())
         }
@@ -3838,9 +3684,7 @@ where
                             if let Some(flow) = flows.lock().await.remove(&flow_id) {
                                 flow.writer_task.abort();
                             }
-                            let _ = control_tx
-                                .send(ControlMessage::CloseFlow { flow_id })
-                                .await;
+                            let _ = control_tx.send(ControlMessage::CloseFlow { flow_id }).await;
                             break;
                         }
                     }
@@ -3873,9 +3717,7 @@ where
                 let bytes_read = if let Some(n) = read_result {
                     n
                 } else {
-                    let _ = control_tx
-                        .send(ControlMessage::CloseFlow { flow_id })
-                        .await;
+                    let _ = control_tx.send(ControlMessage::CloseFlow { flow_id }).await;
                     break;
                 };
 
@@ -3910,40 +3752,7 @@ pub struct DnsHandler {
 
 impl DnsHandler {
     pub fn new(config: ServerConfig) -> Result<Self> {
-        // Reuse the same X3DH loading logic as VpnHandler
-        let x3dh_responder = if config.identity_key_file.exists() {
-            match IdentityKey::load(&config.identity_key_file) {
-                Ok(identity) => {
-                    let signed_prekey =
-                        config.prekey_bundle_file.as_ref().and_then(|bundle_path| {
-                            let private_key_path = bundle_path.with_extension("private.json");
-                            if private_key_path.exists() {
-                                match VpnHandler::load_signed_prekey_private(&private_key_path) {
-                                    Ok(key) => Some(key),
-                                    Err(e) => {
-                                        warn!("DnsHandler: failed to load prekey private: {}", e);
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            }
-                        });
-                    match signed_prekey {
-                        Some(prekey) => {
-                            Some(X3DHResponder::from_identity_with_bundle(identity, prekey))
-                        }
-                        None => Some(X3DHResponder::from_identity(identity)),
-                    }
-                }
-                Err(e) => {
-                    warn!("DnsHandler: failed to load identity key: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let x3dh_responder = Some(crate::private_files::load_responder(&config)?);
 
         Ok(Self {
             x3dh_responder,
@@ -4064,7 +3873,10 @@ impl DnsHandler {
                     // its watchdog tears down the whole connection.
                     let permit = in_flight.clone().try_acquire_owned().ok();
                     if permit.is_none() {
-                        warn!("DNS handler: too many in-flight queries, failing fast: {}", query.domain);
+                        warn!(
+                            "DNS handler: too many in-flight queries, failing fast: {}",
+                            query.domain
+                        );
                     }
 
                     let ratchet_clone = Arc::clone(&ratchet);
@@ -4177,15 +3989,9 @@ impl DnsHandler {
         let result = lookup_host(target.as_str()).await;
         match result {
             Ok(addrs) => {
-                let mut ipv4_addrs = Vec::new();
-                let mut ipv6_addrs = Vec::new();
-
-                for addr in addrs {
-                    match addr.ip() {
-                        std::net::IpAddr::V4(v4) => ipv4_addrs.push(v4),
-                        std::net::IpAddr::V6(v6) => ipv6_addrs.push(v6),
-                    }
-                }
+                // Special-use answers are removed before qtype filtering. If no
+                // permitted answers remain, the successful empty response is NODATA.
+                let (mut ipv4_addrs, mut ipv6_addrs) = permitted_dns_addresses(addrs);
 
                 // Filter based on query type: 1=A (IPv4), 28=AAAA (IPv6).
                 // Any other qtype (NS/TXT/MX/HTTPS/...) is not representable
@@ -4203,7 +4009,10 @@ impl DnsHandler {
 
                 info!(
                     "DNS resolved {} (type={}): ipv4={}, ipv6={}",
-                    query.domain, query.query_type, ipv4_addrs.len(), ipv6_addrs.len()
+                    query.domain,
+                    query.query_type,
+                    ipv4_addrs.len(),
+                    ipv6_addrs.len()
                 );
 
                 ProtoDnsResponse {
@@ -4343,12 +4152,7 @@ impl DnsHandler {
                 let ratchet = DoubleRatchet::init_bob(shared_secret);
 
                 let public_bundle = responder.get_public_bundle();
-                let server_hello = HandshakeMessage::ServerHello {
-                    ephemeral_key: Vec::new(),
-                    signed_prekey: public_bundle.signed_prekey.to_vec(),
-                    prekey_signature: public_bundle.prekey_signature.to_vec(),
-                    identity_key: public_bundle.identity_key.to_vec(),
-                };
+                let server_hello = server_hello(&public_bundle);
 
                 let hello_bytes = serde_json::to_vec(&server_hello)
                     .context("DNS handler: failed to serialize ServerHello")?;
@@ -4367,6 +4171,37 @@ impl DnsHandler {
                 warn!("DNS handler: unexpected message type from {}", peer_addr);
                 Ok(None)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod server_hello_tests {
+    use super::*;
+
+    #[test]
+    fn emits_signed_identity_x25519_proof() {
+        let bundle = X3DHResponder::new().get_public_bundle();
+        match server_hello(&bundle) {
+            HandshakeMessage::ServerHello {
+                identity_key,
+                identity_x25519_key,
+                identity_x25519_signature,
+                ..
+            } => {
+                assert_eq!(identity_key, bundle.identity_key);
+                assert_eq!(
+                    identity_x25519_key.as_deref(),
+                    Some(&bundle.identity_x25519_key[..])
+                );
+                assert_eq!(
+                    identity_x25519_signature,
+                    bundle
+                        .identity_x25519_signature
+                        .map(|signature| signature.to_vec())
+                );
+            }
+            _ => panic!("wrong handshake variant"),
         }
     }
 }
@@ -4393,7 +4228,7 @@ mod tcp_pool_tests {
     async fn closed_connection_is_rejected() {
         let (client, server) = loopback_pair().await;
         drop(server); // sends FIN
-        // Wait until the FIN is delivered to the client's socket buffer
+                      // Wait until the FIN is delivered to the client's socket buffer
         for _ in 0..100 {
             if !tcp_pool_entry_usable(std::time::Instant::now(), &client) {
                 return;
@@ -4410,5 +4245,103 @@ mod tcp_pool_tests {
             .checked_sub(TCP_POOL_MAX_IDLE + Duration::from_secs(1))
             .unwrap();
         assert!(!tcp_pool_entry_usable(old, &client));
+    }
+}
+
+#[cfg(test)]
+mod egress_policy_tests {
+    use super::*;
+
+    fn addr(value: &str) -> SocketAddr {
+        value.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn tcp_uses_shared_policy_without_connecting_to_denied_targets() {
+        let _guard = crate::egress::host_policy_test_lock().lock().unwrap();
+        crate::egress::set_host_policy_for_test(&[]);
+        for target in ["127.0.0.1:80", "100.64.0.1:80", "[fd00::1]:80"] {
+            let error = connect_fastest(vec![addr(target)], target)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("All addresses blocked"));
+        }
+    }
+
+    #[tokio::test]
+    async fn relays_deny_the_servers_own_interface_addresses() {
+        // The firewall never sees server-originated relay connections, so the
+        // userspace policy must deny the host's own addresses on every relay
+        // path (TCP, UDP, DNS) and on raw TUN.
+        let _guard = crate::egress::host_policy_test_lock().lock().unwrap();
+        crate::egress::set_host_policy_for_test(&[
+            "203.0.113.20".parse().unwrap(),
+            "2606:4700:4700::1111".parse().unwrap(),
+        ]);
+
+        let error = connect_fastest(vec![addr("203.0.113.20:443")], "203.0.113.20:443")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("All addresses blocked"));
+
+        // A mixed answer list skips the host's address, like any denied target.
+        let mixed = vec![addr("203.0.113.20:53"), addr("8.8.8.8:53")];
+        assert_eq!(select_udp_target(mixed), Some(addr("8.8.8.8:53")));
+        assert_eq!(select_udp_target(vec![addr("203.0.113.20:53")]), None);
+
+        let (ipv4, ipv6) = permitted_dns_addresses(vec![
+            addr("203.0.113.20:0"),
+            addr("8.8.8.8:0"),
+            addr("[2606:4700:4700::1111]:0"),
+            addr("[2606:4700:4700::2222]:0"),
+        ]);
+        assert_eq!(ipv4, vec!["8.8.8.8".parse::<std::net::Ipv4Addr>().unwrap()]);
+        assert_eq!(
+            ipv6,
+            vec!["2606:4700:4700::2222"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()]
+        );
+    }
+
+    #[test]
+    fn udp_skips_denied_answers_and_denies_an_all_private_answer() {
+        let _guard = crate::egress::host_policy_test_lock().lock().unwrap();
+        crate::egress::set_host_policy_for_test(&[]);
+        let mixed = vec![
+            addr("10.0.0.1:53"),
+            addr("100.64.0.1:53"),
+            addr("8.8.8.8:53"),
+        ];
+        assert_eq!(select_udp_target(mixed), Some(addr("8.8.8.8:53")));
+        assert_eq!(select_udp_target(vec![addr("127.0.0.1:53")]), None);
+    }
+
+    #[test]
+    fn dns_filters_mixed_and_all_private_answers_with_the_shared_policy() {
+        let _guard = crate::egress::host_policy_test_lock().lock().unwrap();
+        crate::egress::set_host_policy_for_test(&[]);
+        let (ipv4, ipv6) = permitted_dns_addresses(vec![
+            addr("10.0.0.1:0"),
+            addr("8.8.8.8:0"),
+            addr("[64:ff9b::7f00:1]:0"),
+            addr("[2606:4700:4700::1111]:0"),
+        ]);
+        assert_eq!(ipv4, vec!["8.8.8.8".parse::<std::net::Ipv4Addr>().unwrap()]);
+        assert_eq!(
+            ipv6,
+            vec!["2606:4700:4700::1111"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()]
+        );
+
+        let (ipv4, ipv6) = permitted_dns_addresses(vec![
+            addr("127.0.0.1:0"),
+            addr("100.64.0.1:0"),
+            addr("[::ffff:10.0.0.1]:0"),
+            addr("[fd00::1]:0"),
+        ]);
+        assert!(ipv4.is_empty());
+        assert!(ipv6.is_empty());
     }
 }

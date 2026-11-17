@@ -39,6 +39,7 @@ use rvpn_tls::TlsFingerprint;
 use crate::android_server_session::{AndroidServerSession, AndroidSharedContext};
 use crate::ffi::{MobileServerEntry, TunConfig};
 use crate::route_map::RouteMap;
+use crate::server_hello::ServerSecurity;
 
 // Use logcat macros for Android logging
 macro_rules! tun_log {
@@ -78,6 +79,13 @@ pub fn android_log(tag: &str, msg: &str, _prio: i32) {
 }
 
 /// Connection state
+///
+/// `Error` is transient — the reconnect loop is still running and will move
+/// back to `Connecting` on its own (network switch, brief server outage).
+/// `Terminal` means the reconnect loop has given up (server security failure,
+/// max attempts, or reconnect disabled): the only way out is an explicit
+/// stop/retry from the app. Kotlin's state poll tears the service down only
+/// on `Terminal`, so a routine relay end must never strand the user.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TunClientState {
     Init = 0,
@@ -85,6 +93,7 @@ pub enum TunClientState {
     IpAssigned = 2,
     Connected = 3,
     Error = 4,
+    Terminal = 5,
 }
 
 impl From<i32> for TunClientState {
@@ -94,7 +103,8 @@ impl From<i32> for TunClientState {
             1 => TunClientState::Connecting,
             2 => TunClientState::IpAssigned,
             3 => TunClientState::Connected,
-            _ => TunClientState::Error,
+            4 => TunClientState::Error,
+            _ => TunClientState::Terminal,
         }
     }
 }
@@ -160,6 +170,10 @@ impl AndroidTunClient {
     /// the Runtime from being transitively dropped inside a tokio worker,
     /// which would panic in `BlockingPool::shutdown`.
     pub fn new(config: &TunConfig, handle: tokio::runtime::Handle) -> Result<Self> {
+        crate::ffi::ensure_tofu_allowed(
+            config.server_identity_pin.as_deref(),
+            config.trust_on_first_use,
+        )?;
         // Parse server URL
         let (host, port, path) = Self::parse_server_url(&config.server_address)?;
 
@@ -187,7 +201,7 @@ impl AndroidTunClient {
 
         // Load prekey bundle and enforce the TOFU pin (if configured) for the
         // default server.
-        let (server_bundle, server_identity_pin_actual) = Self::load_bundle_and_pin(
+        let (server_bundle, _) = Self::load_bundle_and_pin(
             &config.prekey_bundle_path,
             config.server_identity_pin.as_deref(),
         )?;
@@ -225,8 +239,12 @@ impl AndroidTunClient {
             server_ip,
             port,
             path,
-            server_bundle,
-            server_identity_pin_actual,
+            server_bundle.clone(),
+            ServerSecurity::new(
+                config.server_identity_pin.clone(),
+                config.signed_x25519_seen,
+                &server_bundle,
+            )?,
             chan_cap,
             true, // is_default
         ));
@@ -245,6 +263,10 @@ impl AndroidTunClient {
 
             let mut known: Vec<&str> = vec![DEFAULT_SERVER_NAME];
             for entry in &config.extra_servers {
+                crate::ffi::ensure_tofu_allowed(
+                    entry.server_identity_pin.as_deref(),
+                    config.trust_on_first_use,
+                )?;
                 let (host, port, path) = Self::parse_server_url(&entry.address)
                     .with_context(|| format!("extraServers[{}]: invalid address", entry.name))?;
                 // Pre-resolve to an IP for the same DNS-circularity reason as
@@ -269,7 +291,7 @@ impl AndroidTunClient {
                     server_ip
                 );
 
-                let (bundle, pin) = Self::load_bundle_and_pin(
+                let (bundle, _) = Self::load_bundle_and_pin(
                     &entry.prekey_bundle_path,
                     entry.server_identity_pin.as_deref(),
                 )
@@ -281,8 +303,12 @@ impl AndroidTunClient {
                     server_ip,
                     port,
                     path,
-                    bundle,
-                    pin,
+                    bundle.clone(),
+                    ServerSecurity::new(
+                        entry.server_identity_pin.clone(),
+                        entry.signed_x25519_seen,
+                        &bundle,
+                    )?,
                     chan_cap,
                     false, // is_default
                 ));
@@ -434,6 +460,11 @@ impl AndroidTunClient {
         &self.config.dns_bind_addr
     }
 
+    /// Check whether split tunnel routing is enabled for this profile.
+    pub fn is_split_tunnel_enabled(&self) -> bool {
+        self.config.split_tunnel_enabled
+    }
+
     /// Get builtin bypass countries from config
     pub fn get_builtin_bypass_countries(&self) -> &[String] {
         &self.config.builtin_bypass_countries
@@ -484,16 +515,23 @@ impl AndroidTunClient {
     /// Canonical `ik:1:<base32>` pin of the server this client was
     /// constructed against — read by the JNI wrapper for
     /// `rvpn_tun_get_server_identity()` after `Connected`.
-    pub fn server_identity_pin(&self) -> &str {
+    pub fn server_identity_pin(&self) -> String {
         self.default_session.server_identity_pin()
     }
 
     /// Canonical `ik:1:<base32>` pin of the named exit server, for per-exit
     /// TOFU pin capture. Returns `None` for unknown names.
     pub fn server_identity_pin_for(&self, name: &str) -> Option<String> {
-        self.sessions
-            .get(name)
-            .map(|s| s.server_identity_pin().to_string())
+        self.sessions.get(name).map(|s| s.server_identity_pin())
+    }
+
+    pub fn signed_x25519_seen_for(&self, name: &str) -> Option<bool> {
+        self.sessions.get(name).map(|s| s.signed_x25519_seen())
+    }
+
+    #[allow(dead_code)] // Used by the DNS proxy startup in android_tun_ffi.rs (dns feature)
+    pub(crate) fn default_security(&self) -> ServerSecurity {
+        self.default_session.security()
     }
 
     /// The compiled multi-server router, if any (shared with the DNS layer).
@@ -508,12 +546,18 @@ impl AndroidTunClient {
         self.route_map.clone()
     }
 
-    /// Per-extra-exit connection info for the DNS layer's DoH client pool:
-    /// (name, host, port, base path, prekey bundle). Empty when single-server.
+    /// Per-extra-exit connection and security info for the DNS layer's DoH pool.
     #[allow(dead_code)] // Used by the DNS proxy startup in android_tun_ffi.rs (dns feature)
     pub(crate) fn extra_session_dns_info(
         &self,
-    ) -> Vec<(String, String, u16, String, X3DHPublicBundle)> {
+    ) -> Vec<(
+        String,
+        String,
+        u16,
+        String,
+        X3DHPublicBundle,
+        ServerSecurity,
+    )> {
         self.sessions
             .iter()
             .filter(|(name, _)| name.as_str() != DEFAULT_SERVER_NAME)
@@ -524,6 +568,7 @@ impl AndroidTunClient {
                     s.server_port(),
                     s.server_path().to_string(),
                     s.server_bundle().clone(),
+                    s.security(),
                 )
             })
             .collect()
@@ -720,7 +765,11 @@ mod tests {
         assert_eq!(TunClientState::from(2), TunClientState::IpAssigned);
         assert_eq!(TunClientState::from(3), TunClientState::Connected);
         assert_eq!(TunClientState::from(4), TunClientState::Error);
-        assert_eq!(TunClientState::from(99), TunClientState::Error);
+        assert_eq!(TunClientState::from(5), TunClientState::Terminal);
+        // Unknown values must fail closed (Terminal), never collapse to a
+        // retryable Error — Kotlin tears the service down only on Terminal.
+        assert_eq!(TunClientState::from(99), TunClientState::Terminal);
+        assert_eq!(TunClientState::from(-1), TunClientState::Terminal);
     }
 
     #[test]
@@ -744,6 +793,7 @@ mod tests {
             address: "wss://127.0.0.1:443/connect".to_string(),
             prekey_bundle_path: "/nonexistent/bundle.json".to_string(),
             server_identity_pin: None,
+            signed_x25519_seen: false,
             sni_hostname: None,
         }
     }
