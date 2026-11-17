@@ -827,4 +827,17 @@ mod tests {
         assert!(matches_ad_domain("googleadservices.com"));
         assert!(!matches_ad_domain("example.com"));
     }
+
+    /// Claims register C9 (private rvpn `docs/claims-register.md`): the
+    /// store listing, README and AGENTS say "200+ ad and tracking
+    /// domains". If this list shrinks below that, the public copy has to
+    /// change in the same PR.
+    #[test]
+    fn ad_domain_count_backs_public_claim() {
+        assert!(
+            AD_DOMAINS.len() >= 200,
+            "AD_DOMAINS has {} entries; public copy claims 200+ (claims register C9)",
+            AD_DOMAINS.len()
+        );
+    }
 }
