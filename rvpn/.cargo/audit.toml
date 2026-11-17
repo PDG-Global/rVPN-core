@@ -1,0 +1,47 @@
+# cargo audit ignore list — each entry is a KNOWN, triaged advisory with a
+# reason and a review date. Anything NOT listed here fails the audit job, so
+# new advisories turn CI red immediately. Review by 2026-12-17.
+#
+# Groups (triage per the 2026-11-17 audit of v1.3.7, #rVPN thread 386ce86d):
+# A. rustls 0.22.4 — the 0.22 line receives no fixes; resolved by the
+#    rustls 0.22 → 0.23 workspace migration (next sprint; also unblocks
+#    rustls-acme ≥0.15.4 and retires the tolerant-challenge fork).
+# B. rustls 0.23.37 / webpki 0.103.9 / webpki-roots — semver-compatible
+#    bumps; the lockfile-bump PR removes these entries and the audit job
+#    is what proves they are gone.
+# C. rustls-webpki 0.102.8 — rides with rustls 0.22; resolved by the same
+#    migration as group A.
+# D. hickory-proto 0.24.4 (on-device DNS proxy in rvpn-mobile) — needs the
+#    0.26 major bump; scheduled after the migration. The amplification /
+#    O(n²) / panic entries are the reachable ones for a DNS proxy; the
+#    DNSSEC-validation entries matter only if validation is enabled.
+
+[advisories]
+ignore = [
+    # A. rustls 0.22.4 (EOL line — migration, review 2026-12-17)
+    "RUSTSEC-2026-0346", # Debug impls expose TLS session secrets
+    "RUSTSEC-2026-0349", # unauthenticated ServerHello downgrade
+    # B. fixed by semver-compatible bumps (lockfile PR removes these)
+    "RUSTSEC-2026-0285", # rustls 0.23.37: handshake messages across encryption levels
+    "RUSTSEC-2026-0348", # rustls 0.23.37: brotli cert decompression allocation
+    "RUSTSEC-2026-0381", # webpki-roots 1.0.6: distrusted emSign intermediates
+    # C. rustls-webpki 0.102.8 (migration, review 2026-12-17)
+    "RUSTSEC-2026-0104", # CRL parsing panic
+    "RUSTSEC-2026-0098", # URI name constraints
+    "RUSTSEC-2026-0099", # name constraints
+    "RUSTSEC-2026-0049", # CRL distribution-point authority
+    "RUSTSEC-2026-0382", # distrusted intermediates accepted
+    # D. hickory-proto 0.24.4 (0.26 bump after the migration, review 2026-12-17)
+    "RUSTSEC-2026-0119", # O(n²) CPU on name compression
+    "RUSTSEC-2026-0487", # panic on malformed alpn in SVCB/HTTPS
+    "RUSTSEC-2026-0489", # panic on lone-quote SVCB/HTTPS parameter
+    "RUSTSEC-2026-0490", # zone lexer panic on 4096+ char token
+    "RUSTSEC-2026-0491", # memory amplification from record counts
+    "RUSTSEC-2026-0505", # DNSSEC: NSEC3 owner names unchecked
+    "RUSTSEC-2026-0511", # DNSSEC: NXDOMAIN for empty non-terminal
+    "RUSTSEC-2026-0512", # DNSSEC: unrelated signed RRset accepted
+    "RUSTSEC-2026-0530", # DNSSEC: parent-side NSEC at zone cut
+    "RUSTSEC-2026-0531", # DNSSEC: child-side NSEC/NSEC3 as delegation proof
+    "RUSTSEC-2026-0550", # DNSSEC: unsigned NSEC/NSEC3 in nonexistence proof
+    "RUSTSEC-2026-0551", # DNSSEC: wrong-class records marked secure
+]
