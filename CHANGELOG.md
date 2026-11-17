@@ -2,7 +2,29 @@
 
 All notable changes to rVPN are documented in this file.
 
-## [Unreleased]
+## [1.3.7] — 2026-11-17
+
+This release replays seven weeks of development from the private
+repository onto the public core: tunnel-pool, stats, reconnect and
+ACME hardening across client and server, the egress/firewall modules,
+and the mobile API surface. It also fixes crate metadata: the license
+field now reads AGPL-3.0-or-later (the LICENSE file was always the text
+that matters; the SPDX string was wrong), the repository link points at
+this repo, and the minimum Rust version is 1.88 (the locked graph needs
+it: time 0.3.47 via rustls-acme declares 1.88, base64ct 1.8.3 is
+edition-2024).
+
+**Fork owners: rebase onto this release** — it carries two
+security-relevant fixes (below).
+
+### Privacy
+
+- **The server no longer logs client IP addresses, tunnel IPs,
+  destinations or DNS names at the default `INFO` level.** Those appear
+  only at `debug`/`trace` (`-v`/`-vv`). A build-time test fails if a
+  default-level log line names a client identifier again. Operators on
+  earlier versions should treat their logs as containing connection
+  records.
 
 ### Security
 

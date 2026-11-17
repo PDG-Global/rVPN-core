@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 use crate::config::TunNetworkConfig;
 use crate::egress::permitted_tun_destination;
@@ -139,7 +139,7 @@ impl IpPool {
             return true;
         }
         // If not in allocated, it was never ours to release - this indicates a bug elsewhere
-        warn!("Attempted to release IP {} that was not allocated!", ip);
+        debug!("Attempted to release IP {} that was not allocated!", ip);
         false
     }
 
@@ -307,7 +307,7 @@ impl TunServer {
     ) -> Result<()> {
         let mut senders = self.client_senders.write().await;
         senders.insert(client_ip, sender);
-        info!("Registered client {} for TUN response routing", client_ip);
+        debug!("Registered client {} for TUN response routing", client_ip);
         Ok(())
     }
 
@@ -339,7 +339,7 @@ impl TunServer {
             if owner != client_id {
                 // Another client now owns this IP — skip cleanup to avoid
                 // corrupting the new connection's state
-                warn!("Skipping unregister for IP {} — owned by {}, not {}",
+                debug!("Skipping unregister for IP {} — owned by {}, not {}",
                       client_ip, owner, client_id);
                 return Ok(());
             }
@@ -356,7 +356,7 @@ impl TunServer {
         match senders.get(&client_ip) {
             Some(existing) if existing.same_channel(sender) => {
                 senders.remove(&client_ip);
-                info!("Unregistered client {} (IP {}) from TUN server", client_id, client_ip);
+                debug!("Unregistered client {} (IP {}) from TUN server", client_id, client_ip);
             }
             Some(_) => {
                 debug!("Skipping unregister for IP {} ({}): sender belongs to a newer connection",
@@ -378,7 +378,7 @@ impl TunServer {
 
         match self.ip_pool.allocate(client_id) {
             Some(ip) => {
-                info!("Allocated IP {} to client {}", ip, client_id);
+                debug!("Allocated IP {} to client {}", ip, client_id);
                 Ok(ip)
             }
             None => Err(anyhow::anyhow!("No available IPs in pool")),
@@ -390,9 +390,9 @@ impl TunServer {
     pub async fn release_ip(&self, ip: IpAddr) -> bool {
         let released = self.ip_pool.release(ip);
         if released {
-            info!("Released IP {} back to pool", ip);
+            debug!("Released IP {} back to pool", ip);
         } else {
-            warn!("Failed to release IP {} - was not allocated", ip);
+            debug!("Failed to release IP {} - was not allocated", ip);
         }
         released
     }
@@ -497,16 +497,14 @@ impl TunServer {
                                             );
                                         }
                                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                            error!(
-                                                "Packet channel for {} closed - removing stale sender",
-                                                dst_ip
-                                            );
+                                            error!("Packet channel closed - removing stale sender");
+                                            debug!("Stale sender was for {}", dst_ip);
                                             let mut senders = client_senders.write().await;
                                             senders.remove(&dst_ip);
                                         }
                                     }
                                 } else {
-                                    warn!("TUN READ: No channel registered for destination IP {} - packet dropped!", dst_ip);
+                                    debug!("TUN READ: No channel registered for destination IP {} - packet dropped!", dst_ip);
                                 }
                             } else {
                                 debug!("TUN READ: Could not parse destination IP from packet");

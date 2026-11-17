@@ -254,12 +254,12 @@ impl VpnHandler {
         let target_addr = match self.read_target_address(&mut ws_read, &mut ratchet).await? {
             Some(addr) => addr,
             None => {
-                info!("No target address received from {}", peer_addr);
+                debug!("No target address received from {}", peer_addr);
                 return Ok(());
             }
         };
 
-        info!(
+        debug!(
             "Connecting to target {}:{} ({:?}) for {}",
             target_addr.host, target_addr.port, target_addr.protocol, peer_addr
         );
@@ -270,7 +270,7 @@ impl VpnHandler {
                 let target = match self.connect_to_target(&target_addr).await {
                     Ok(stream) => stream,
                     Err(e) => {
-                        error!(
+                        debug!(
                             "Failed to connect to {}:{}: {}",
                             target_addr.host, target_addr.port, e
                         );
@@ -278,7 +278,7 @@ impl VpnHandler {
                     }
                 };
 
-                info!(
+                debug!(
                     "Connected to {}:{} for {}",
                     target_addr.host, target_addr.port, peer_addr
                 );
@@ -294,7 +294,7 @@ impl VpnHandler {
                     )
                     .await
                 {
-                    Ok(_) => info!("Relay completed for {}", peer_addr),
+                    Ok(_) => debug!("Relay completed for {}", peer_addr),
                     Err(e) => debug!("Relay ended for {}: {}", peer_addr, e),
                 }
             }
@@ -304,7 +304,7 @@ impl VpnHandler {
                     .relay_udp(ws_write, ws_read, &target_addr, ratchet)
                     .await
                 {
-                    Ok(_) => info!("UDP Relay completed for {}", peer_addr),
+                    Ok(_) => debug!("UDP Relay completed for {}", peer_addr),
                     Err(e) => debug!("UDP Relay ended for {}: {}", peer_addr, e),
                 }
             }
@@ -348,7 +348,7 @@ impl VpnHandler {
         let hello: HandshakeMessage = match serde_json::from_slice(&msg.into_data()) {
             Ok(h) => h,
             Err(e) => {
-                info!("Failed to parse Hello message from {}: {}", peer_addr, e);
+                debug!("Failed to parse Hello message from {}: {}", peer_addr, e);
                 return Ok(None);
             }
         };
@@ -362,7 +362,7 @@ impl VpnHandler {
                 ..
             } => {
                 // Protocol version detection and compatibility check
-                info!(
+                debug!(
                     "Client protocol version from {}: {} (server: {})",
                     peer_addr,
                     version,
@@ -373,7 +373,7 @@ impl VpnHandler {
                 // V2 clients (1.x) use oneshot synchronization
                 // V1 clients (legacy) may have race conditions
                 if !version.is_compatible_with(&ProtocolVersion::CURRENT) {
-                    warn!(
+                    debug!(
                         "Protocol version mismatch from {}: {} (expected {})",
                         peer_addr,
                         version,
@@ -391,17 +391,17 @@ impl VpnHandler {
 
                 // Log client type for debugging
                 if version.minor >= 1 {
-                    info!(
+                    debug!(
                         "V2 client detected from {} (enhanced synchronization)",
                         peer_addr
                     );
                 } else {
-                    info!("V1 client detected from {} (legacy mode)", peer_addr);
+                    debug!("V1 client detected from {} (legacy mode)", peer_addr);
                 }
 
                 // Check authentication method
                 if auth_method != AuthMethod::X3DH {
-                    warn!(
+                    debug!(
                         "Unsupported auth method from {}: {:?}",
                         peer_addr, auth_method
                     );
@@ -439,7 +439,7 @@ impl VpnHandler {
                         arr
                     }
                     _ => {
-                        info!("Invalid or missing ephemeral key from {}", peer_addr);
+                        debug!("Invalid or missing ephemeral key from {}", peer_addr);
                         return Ok(None);
                     }
                 };
@@ -451,7 +451,7 @@ impl VpnHandler {
                         arr
                     }
                     _ => {
-                        info!("Invalid or missing identity key from {}", peer_addr);
+                        debug!("Invalid or missing identity key from {}", peer_addr);
                         return Ok(None);
                     }
                 };
@@ -461,12 +461,12 @@ impl VpnHandler {
                     match responder.agree(&client_identity, &client_ephemeral, false) {
                         Ok(secret) => secret,
                         Err(e) => {
-                            info!("X3DH agreement failed from {}: {}", peer_addr, e);
+                            debug!("X3DH agreement failed from {}: {}", peer_addr, e);
                             return Ok(None);
                         }
                     };
 
-                info!("X3DH handshake successful from {}", peer_addr);
+                debug!("X3DH handshake successful from {}", peer_addr);
 
                 // Initialize Double Ratchet as Bob (responder)
                 let ratchet = DoubleRatchet::init_bob(shared_secret);
@@ -482,7 +482,7 @@ impl VpnHandler {
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to send ServerHello: {:?}", e))?;
 
-                info!("X3DH handshake completed with {}", peer_addr);
+                debug!("X3DH handshake completed with {}", peer_addr);
 
                 Ok(Some(ratchet))
             }
@@ -965,7 +965,7 @@ impl VpnHandler {
             }
         };
 
-        info!("UDP relay to {} ({})", target_socket_addr, target_addr.host);
+        debug!("UDP relay to {} ({})", target_socket_addr, target_addr.host);
 
         // Share ratchet between tasks using Arc<Mutex>
         let ratchet = std::sync::Arc::new(tokio::sync::Mutex::new(ratchet));
@@ -1298,7 +1298,7 @@ impl MultiplexerHandler {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        info!("MUX: New multiplexed connection from {}", peer_addr);
+        debug!("MUX: New multiplexed connection from {}", peer_addr);
 
         // Create and run the session handler
         let session = MultiplexerSession::new(
@@ -1532,12 +1532,12 @@ where
         let mut ratchet = match self.perform_handshake().await? {
             Some(r) => r,
             None => {
-                info!("Handshake failed or rejected for {}", self.peer_addr);
+                debug!("Handshake failed or rejected for {}", self.peer_addr);
                 return Ok(());
             }
         };
 
-        info!("Multiplexed session established for {}", self.peer_addr);
+        debug!("Multiplexed session established for {}", self.peer_addr);
 
         debug!(
             "MultiplexerSession: peer={}, tun_enabled={}, tun_server_some={}, dns_count={}, mtu={}",
@@ -1552,12 +1552,12 @@ where
         //    Do this BEFORE splitting the WebSocket so we can send directly
         let mut allocated_ip_for_tun: Option<std::net::IpAddr> = None;
         if self.tun_config.enabled {
-            info!(
+            debug!(
                 "TUN_MODE: tun_config.enabled=true for client {}",
                 self.peer_addr
             );
             if let Some(ref tun_server) = self.tun_server {
-                info!(
+                debug!(
                     "TUN_MODE: tun_server is Some, proceeding with allocation for {}",
                     self.peer_addr
                 );
@@ -1566,7 +1566,7 @@ where
                 let client_id = self.tun_client_id();
                 match tun_server.allocate_ip(client_id).await {
                     Ok(allocated_ip) => {
-                        info!(
+                        debug!(
                             "Allocated IP {} for client {}",
                             allocated_ip, self.peer_addr
                         );
@@ -1611,14 +1611,15 @@ where
                         if let Err(e) = self.ws.send(Message::Binary(serialized)).await {
                             error!("Failed to send VirtualIp: {}", e);
                         } else {
-                            info!(
+                            debug!(
                                 "Sent VirtualIp {} to client {}",
                                 allocated_ip, self.peer_addr
                             );
                         }
                     }
                     Err(e) => {
-                        error!("Failed to allocate IP for client {}: {}", self.peer_addr, e);
+                        error!("Failed to allocate a tunnel IP for a client: {}", e);
+                        debug!("Tunnel IP allocation failed for {}: {}", self.peer_addr, e);
                     }
                 }
             }
@@ -1682,9 +1683,9 @@ where
 
         // Register client with TunServer for TUN response routing
         if let Some(allocated_ip) = allocated_ip_for_tun {
-            info!("About to register client {} with TUN server", allocated_ip);
+            debug!("About to register client {} with TUN server", allocated_ip);
             if let Some(ref ts) = tun_server {
-                info!(
+                debug!(
                     "tun_server is Some, calling register_client for {}",
                     allocated_ip
                 );
@@ -1693,20 +1694,18 @@ where
                     .await
                 {
                     Ok(()) => {
-                        info!(
+                        debug!(
                             "Successfully registered client {} with TUN server",
                             allocated_ip
                         );
                     }
                     Err(e) => {
-                        error!(
-                            "Failed to register client {} with TUN server: {}",
-                            allocated_ip, e
-                        );
+                        error!("Failed to register a client with the TUN server: {}", e);
+                        debug!("TUN registration failed for {}: {}", allocated_ip, e);
                     }
                 }
             } else {
-                warn!(
+                debug!(
                     "Cannot register client {} - tun_server is None!",
                     allocated_ip
                 );
@@ -1791,7 +1790,7 @@ where
                     let remaining =
                         idle_timeout.saturating_sub(last_activity.lock().unwrap().elapsed());
                     if remaining.is_zero() {
-                        warn!(
+                        debug!(
                             "TUN client {} idle timeout (no traffic for {}s), closing",
                             peer_addr,
                             idle_timeout.as_secs()
@@ -1901,7 +1900,7 @@ where
                 // ping and let the receiver time out cleanly instead of sending
                 // on a potentially dead socket.
                 if last_activity_for_ping.lock().unwrap().elapsed() > Duration::from_secs(75) {
-                    warn!("Skipping ping for {}: client idle too long", peer_addr);
+                    debug!("Skipping ping for {}: client idle too long", peer_addr);
                     break;
                 }
                 let mut guard = ws_write_for_ping.lock().await;
@@ -1943,7 +1942,7 @@ where
         }
         flows_guard.clear();
         if count > 0 {
-            info!("Cleaned up {} flows for {}", count, peer_addr);
+            debug!("Cleaned up {} flows for {}", count, peer_addr);
         }
 
         // Clean up connection pool
@@ -1959,7 +1958,7 @@ where
                     .unregister_client(client_ip, &tun_client_id, tun_response_tx)
                     .await
                 {
-                    warn!(
+                    debug!(
                         "Failed to unregister client {} from TUN server: {}",
                         client_ip, e
                     );
@@ -2524,7 +2523,7 @@ where
                 // TCP mode: try to auto-create flow from the packet data
                 // This supports mobile clients that send data without explicit CreateFlow
                 if let Some((target, port)) = Self::parse_packet_for_destination(payload) {
-                    info!(
+                    debug!(
                         "FRAME: [#{:05}] Auto-creating flow {} for {}:{} (client sent data without CreateFlow)",
                         frame_number, flow_id, target, port
                     );
@@ -2538,7 +2537,7 @@ where
                     Ok(())
                 } else if let Some((target, port)) = Self::parse_legacy_connect_payload(payload) {
                     // Fallback to legacy CONNECT format parsing
-                    warn!(
+                    debug!(
                         "FRAME: [#{:05}] Legacy CONNECT payload detected for unknown flow_id {} from {} -> {}:{}",
                         frame_number, flow_id, peer_addr, target, port
                     );
@@ -2770,18 +2769,18 @@ where
         let msg = match msg {
             Ok(Some(Ok(m))) => m,
             Ok(Some(Err(e))) => {
-                info!(
+                debug!(
                     "WebSocket error during handshake from {}: {}",
                     self.peer_addr, e
                 );
                 return Ok(None);
             }
             Ok(None) => {
-                info!("Connection closed by {} before handshake", self.peer_addr);
+                debug!("Connection closed by {} before handshake", self.peer_addr);
                 return Ok(None);
             }
             Err(_) => {
-                info!("Handshake timeout from {}", self.peer_addr);
+                debug!("Handshake timeout from {}", self.peer_addr);
                 return Ok(None);
             }
         };
@@ -2806,7 +2805,7 @@ where
                 identity_key,
                 ..
             } => {
-                info!(
+                debug!(
                     "Client protocol version from {}: {} (server: {})",
                     self.peer_addr,
                     version,
@@ -2815,7 +2814,7 @@ where
 
                 // Check protocol version compatibility
                 if !version.is_compatible_with(&ProtocolVersion::CURRENT) {
-                    warn!(
+                    debug!(
                         "Protocol version mismatch from {}: {} (expected {})",
                         self.peer_addr,
                         version,
@@ -2834,7 +2833,7 @@ where
 
                 // Check authentication method
                 if auth_method != AuthMethod::X3DH {
-                    warn!(
+                    debug!(
                         "Unsupported auth method from {}: {:?}",
                         self.peer_addr, auth_method
                     );
@@ -2874,7 +2873,7 @@ where
                         arr
                     }
                     _ => {
-                        info!("Invalid or missing ephemeral key from {}", self.peer_addr);
+                        debug!("Invalid or missing ephemeral key from {}", self.peer_addr);
                         return Ok(None);
                     }
                 };
@@ -2886,7 +2885,7 @@ where
                         arr
                     }
                     _ => {
-                        info!("Invalid or missing identity key from {}", self.peer_addr);
+                        debug!("Invalid or missing identity key from {}", self.peer_addr);
                         return Ok(None);
                     }
                 };
@@ -2899,23 +2898,23 @@ where
                     match responder.agree(&client_identity, &client_ephemeral, false) {
                         Ok(secret) => secret,
                         Err(e) => {
-                            info!("X3DH agreement failed from {}: {}", self.peer_addr, e);
+                            debug!("X3DH agreement failed from {}: {}", self.peer_addr, e);
                             return Ok(None);
                         }
                     };
 
-                info!("X3DH handshake successful from {}", self.peer_addr);
+                debug!("X3DH handshake successful from {}", self.peer_addr);
 
                 // Initialize Double Ratchet as Bob (responder)
-                info!("Initializing DoubleRatchet as Bob for {}", self.peer_addr);
+                debug!("Initializing DoubleRatchet as Bob for {}", self.peer_addr);
                 let ratchet = DoubleRatchet::init_bob(shared_secret);
 
                 // Send ServerHello response
-                info!("Preparing ServerHello for {}", self.peer_addr);
+                debug!("Preparing ServerHello for {}", self.peer_addr);
                 let public_bundle = responder.get_public_bundle();
                 let response = server_hello(&public_bundle);
 
-                info!("Serializing ServerHello for {} (signed_prekey={} bytes, sig={} bytes, identity={} bytes)",
+                debug!("Serializing ServerHello for {} (signed_prekey={} bytes, sig={} bytes, identity={} bytes)",
                     self.peer_addr,
                     public_bundle.signed_prekey.len(),
                     public_bundle.prekey_signature.len(),
@@ -2924,7 +2923,7 @@ where
                 let response_bytes = match serde_json::to_vec(&response) {
                     Ok(b) => b,
                     Err(e) => {
-                        info!(
+                        debug!(
                             "Failed to serialize ServerHello for {}: {}",
                             self.peer_addr, e
                         );
@@ -2932,19 +2931,19 @@ where
                     }
                 };
 
-                info!(
+                debug!(
                     "ServerHello serialized ({} bytes), sending to {}",
                     response_bytes.len(),
                     self.peer_addr
                 );
 
                 if let Err(e) = self.ws.send(Message::Binary(response_bytes)).await {
-                    info!("Failed to send ServerHello to {}: {:?}", self.peer_addr, e);
+                    debug!("Failed to send ServerHello to {}: {:?}", self.peer_addr, e);
                     return Ok(None);
                 }
 
-                info!("ServerHello sent to {}", self.peer_addr);
-                info!("X3DH handshake completed with {}", self.peer_addr);
+                debug!("ServerHello sent to {}", self.peer_addr);
+                debug!("X3DH handshake completed with {}", self.peer_addr);
 
                 Ok(Some(ratchet))
             }
@@ -3010,7 +3009,7 @@ where
                     guard.len()
                 };
                 if flow_count >= MAX_FLOWS_PER_SESSION {
-                    warn!(
+                    debug!(
                         "CONTROL: [CreateFlow] Rejecting flow_id={} from {} — too many flows ({} active, limit {})",
                         flow_id, peer_addr, flow_count, MAX_FLOWS_PER_SESSION
                     );
@@ -3027,7 +3026,7 @@ where
                     return Ok(());
                 }
 
-                info!(
+                debug!(
                     "CONTROL: [CreateFlow] Received flow_id={} -> {}:{} from {}",
                     flow_id, target, port, peer_addr
                 );
@@ -3062,14 +3061,14 @@ where
 
                 let stream = match stream {
                     Some(s) => {
-                        info!(
+                        debug!(
                             "CONTROL: [CreateFlow] TCP pool hit for {} (flow_id={})",
                             connect_target, flow_id
                         );
                         s
                     }
                     None => {
-                        info!(
+                        debug!(
                             "CONTROL: [CreateFlow] Starting DNS resolution and TCP connection for {}",
                             connect_target
                         );
@@ -3183,7 +3182,7 @@ where
                             );
                         }
 
-                        info!(
+                        debug!(
                             "CONTROL: [CreateFlow] Flow {} created successfully for {}",
                             flow_id, peer_addr
                         );
@@ -3225,7 +3224,7 @@ where
                         }
                     }
                     Err(e) => {
-                        error!(
+                        debug!(
                             "CONTROL: [CreateFlow] Connection failed for flow_id={} to {}:{}: {}",
                             flow_id, target, port, e
                         );
@@ -3242,23 +3241,23 @@ where
                 }
             }
             ControlMessage::CloseFlow { flow_id } => {
-                info!("Closing flow {} for {}", flow_id, peer_addr);
+                debug!("Closing flow {} for {}", flow_id, peer_addr);
                 // remove_flow aborts the flow's relay/writer tasks, so a
                 // relay parked at zero credits dies now instead of lingering
                 // until the stall valve fires.
                 if remove_flow(flows, flow_id).await.is_some() {
-                    info!("Flow {} closed for {}", flow_id, peer_addr);
+                    debug!("Flow {} closed for {}", flow_id, peer_addr);
                 }
             }
             ControlMessage::FlowCreated { flow_id, .. } => {
                 // Client should not send this, but handle gracefully
-                warn!(
+                debug!(
                     "Received unexpected FlowCreated for flow {} from {}",
                     flow_id, peer_addr
                 );
             }
             ControlMessage::FlowFailed { flow_id, error } => {
-                warn!(
+                debug!(
                     "Received unexpected FlowFailed for flow {} from {}: {}",
                     flow_id, peer_addr, error
                 );
@@ -3410,7 +3409,7 @@ where
                     flow.is_some()
                 };
                 if removed {
-                    info!(
+                    debug!(
                         "Flow {} closed after target write failure for {}",
                         flow_id, peer_addr
                     );
@@ -3701,12 +3700,12 @@ where
                         if let Some(flow) = flows.lock().await.remove(&flow_id) {
                             flow.writer_task.abort();
                         }
-                        info!("Flow {} closed by remote for {}", flow_id, peer_addr);
+                        debug!("Flow {} closed by remote for {}", flow_id, peer_addr);
                         None
                     }
                     Ok(n) => Some(n),
                     Err(e) => {
-                        error!("Read error on flow {} for {}: {}", flow_id, peer_addr, e);
+                        debug!("Read error on flow {} for {}: {}", flow_id, peer_addr, e);
                         if let Some(flow) = flows.lock().await.remove(&flow_id) {
                             flow.writer_task.abort();
                         }
@@ -3771,7 +3770,7 @@ impl DnsHandler {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        info!("DNS WebSocket connection from {}", peer_addr);
+        debug!("DNS WebSocket connection from {}", peer_addr);
 
         // Rate limit check
         {
@@ -3793,7 +3792,7 @@ impl DnsHandler {
             None => return Ok(()),
         };
 
-        info!("DNS handler: handshake complete for {}", peer_addr);
+        debug!("DNS handler: handshake complete for {}", peer_addr);
 
         // DNS query/response loop.
         //
@@ -3873,7 +3872,7 @@ impl DnsHandler {
                     // its watchdog tears down the whole connection.
                     let permit = in_flight.clone().try_acquire_owned().ok();
                     if permit.is_none() {
-                        warn!(
+                        debug!(
                             "DNS handler: too many in-flight queries, failing fast: {}",
                             query.domain
                         );
@@ -3891,7 +3890,7 @@ impl DnsHandler {
                             {
                                 Ok(r) => r,
                                 Err(_) => {
-                                    warn!("DNS handler: resolution timeout for {}", query.domain);
+                                    debug!("DNS handler: resolution timeout for {}", query.domain);
                                     ProtoDnsResponse {
                                         query_id: query.query_id,
                                         success: false,
@@ -3930,7 +3929,7 @@ impl DnsHandler {
                         )
                         .await
                         {
-                            error!(
+                            debug!(
                                 "DNS handler: failed to send response for {}: {}",
                                 query.domain, e
                             );
@@ -3950,7 +3949,7 @@ impl DnsHandler {
         }
 
         writer_task.abort();
-        info!("DNS handler: connection closed for {}", peer_addr);
+        debug!("DNS handler: connection closed for {}", peer_addr);
         Ok(())
     }
 
@@ -4007,7 +4006,7 @@ impl DnsHandler {
                     ipv6_addrs.clear();
                 }
 
-                info!(
+                debug!(
                     "DNS resolved {} (type={}): ipv4={}, ipv6={}",
                     query.domain,
                     query.query_type,
@@ -4030,7 +4029,7 @@ impl DnsHandler {
                 }
             }
             Err(e) => {
-                info!("DNS resolution failed for {}: {}", query.domain, e);
+                debug!("DNS resolution failed for {}: {}", query.domain, e);
                 ProtoDnsResponse {
                     query_id: query.query_id,
                     success: false,
@@ -4096,12 +4095,12 @@ impl DnsHandler {
                 ..
             } => {
                 if !version.is_compatible_with(&ProtocolVersion::CURRENT) {
-                    warn!("DNS handler: protocol version mismatch from {}", peer_addr);
+                    debug!("DNS handler: protocol version mismatch from {}", peer_addr);
                     return Ok(None);
                 }
 
                 if auth_method != AuthMethod::X3DH {
-                    warn!("DNS handler: unsupported auth method from {}", peer_addr);
+                    debug!("DNS handler: unsupported auth method from {}", peer_addr);
                     return Ok(None);
                 }
 
@@ -4120,7 +4119,7 @@ impl DnsHandler {
                         arr
                     }
                     _ => {
-                        warn!("DNS handler: invalid ephemeral key from {}", peer_addr);
+                        debug!("DNS handler: invalid ephemeral key from {}", peer_addr);
                         return Ok(None);
                     }
                 };
@@ -4132,7 +4131,7 @@ impl DnsHandler {
                         arr
                     }
                     _ => {
-                        warn!("DNS handler: invalid identity key from {}", peer_addr);
+                        debug!("DNS handler: invalid identity key from {}", peer_addr);
                         return Ok(None);
                     }
                 };
@@ -4141,7 +4140,7 @@ impl DnsHandler {
                     match responder.agree(&client_identity, &client_ephemeral, false) {
                         Ok(s) => s,
                         Err(e) => {
-                            warn!(
+                            debug!(
                                 "DNS handler: X3DH agreement failed for {}: {}",
                                 peer_addr, e
                             );
@@ -4164,11 +4163,11 @@ impl DnsHandler {
                         anyhow::anyhow!("DNS handler: failed to send ServerHello: {:?}", e)
                     })?;
 
-                info!("DNS handler: X3DH handshake complete for {}", peer_addr);
+                debug!("DNS handler: X3DH handshake complete for {}", peer_addr);
                 Ok(Some(ratchet))
             }
             _ => {
-                warn!("DNS handler: unexpected message type from {}", peer_addr);
+                debug!("DNS handler: unexpected message type from {}", peer_addr);
                 Ok(None)
             }
         }
