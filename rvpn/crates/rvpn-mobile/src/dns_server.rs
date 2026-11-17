@@ -980,9 +980,63 @@ impl DnsServer {
 mod tests {
     use super::*;
 
+    /// Minimal UDP nameserver for tests: answers A queries from a fixed map so
+    /// the routing tests don't depend on live DNS. GeoDNS would otherwise make
+    /// the builtin-bypass decision depend on where the test runs — a resolver
+    /// outside China gets non-CN IPs back for CN domains, and the rebinding
+    /// guard then (correctly) routes them through the tunnel.
+    async fn spawn_fake_nameserver(
+        answers: std::collections::HashMap<String, std::net::Ipv4Addr>,
+    ) -> std::net::SocketAddr {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let q = &buf[..n];
+                if n < 12 {
+                    continue;
+                }
+                // Extract the QNAME from the query.
+                let mut pos = 12;
+                let mut name = String::new();
+                while pos < n && q[pos] != 0 {
+                    let len = q[pos] as usize;
+                    pos += 1;
+                    if pos + len > n {
+                        break;
+                    }
+                    if !name.is_empty() {
+                        name.push('.');
+                    }
+                    name.push_str(&String::from_utf8_lossy(&q[pos..pos + len]));
+                    pos += len;
+                }
+                let mut resp = Vec::with_capacity(64);
+                resp.extend_from_slice(&[q[0], q[1]]); // echo TXID
+                resp.extend_from_slice(&[0x81, 0x80]); // QR|RD|RA, RCODE=0
+                resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+                let ip = answers.get(&name);
+                resp.extend_from_slice(&(ip.is_some() as u16).to_be_bytes()); // ANCOUNT
+                resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // NSCOUNT/ARCOUNT
+                resp.extend_from_slice(&q[12..]); // echo question
+                if let Some(ip) = ip {
+                    resp.extend_from_slice(&[0xC0, 0x0C]); // name -> question
+                    resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A, IN
+                    resp.extend_from_slice(&60u32.to_be_bytes()); // TTL
+                    resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH
+                    resp.extend_from_slice(&ip.octets());
+                }
+                let _ = sock.send_to(&resp, peer).await;
+            }
+        });
+        addr
+    }
+
     #[tokio::test]
     async fn test_routing_decision_with_split_tunnel() {
         use rvpn_split_tunnel::SplitTunnelConfig;
+        use std::collections::HashMap;
 
         // Create a SplitTunnel config with built-in China domains enabled
         let config = SplitTunnelConfig {
@@ -992,18 +1046,33 @@ mod tests {
             ..Default::default()
         };
 
-        let split_tunnel = SplitTunnel::new(config, std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![]))).await.unwrap();
+        // 223.5.5.5 (AliDNS) is inside the builtin CN CIDR set, 8.8.8.8 is
+        // not. The bypass arm exercises the same CIDR lookup the bypass path
+        // uses, so a list update that drops these fixtures fails loudly here
+        // instead of silently changing what the test means.
+        let cn_ip: std::net::Ipv4Addr = "223.5.5.5".parse().unwrap();
+        let edge_ip: std::net::Ipv4Addr = "8.8.8.8".parse().unwrap();
+
+        // Builtin China domain whose resolved IPs are in China: bypass.
+        let ns = spawn_fake_nameserver(HashMap::from([("www.baidu.com".to_string(), cn_ip)])).await;
+        let split_tunnel = SplitTunnel::new(config.clone(), std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![ns]))).await.unwrap();
         let server = DnsServer::new(split_tunnel);
-
-        // Test China domain (should be bypass)
         let name = Name::from_ascii("www.baidu.com").unwrap();
-        let decision = server.route_query(&name).await;
-        assert_eq!(decision, RoutingDecision::Bypass);
+        assert_eq!(server.route_query(&name).await, RoutingDecision::Bypass);
 
-        // Test non-China domain (should be tunnel)
+        // DNS-rebinding guard: the same domain, but the resolved IPs are
+        // outside China — it must go through the tunnel, not bypass.
+        let ns = spawn_fake_nameserver(HashMap::from([("www.baidu.com".to_string(), edge_ip)])).await;
+        let split_tunnel = SplitTunnel::new(config.clone(), std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![ns]))).await.unwrap();
+        let server = DnsServer::new(split_tunnel);
+        assert_eq!(server.route_query(&name).await, RoutingDecision::Tunnel);
+
+        // Non-China domain stays in the tunnel.
+        let ns = spawn_fake_nameserver(HashMap::new()).await;
+        let split_tunnel = SplitTunnel::new(config, std::sync::Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![ns]))).await.unwrap();
+        let server = DnsServer::new(split_tunnel);
         let name = Name::from_ascii("www.google.com").unwrap();
-        let decision = server.route_query(&name).await;
-        assert_eq!(decision, RoutingDecision::Tunnel);
+        assert_eq!(server.route_query(&name).await, RoutingDecision::Tunnel);
     }
 
     #[tokio::test]
