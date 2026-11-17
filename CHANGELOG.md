@@ -2,6 +2,21 @@
 
 All notable changes to rVPN are documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Certificate issuance no longer dies at startup when the CA offers an
+  ACME challenge type the client doesn't implement.** Let's Encrypt began
+  offering `dns-persist-01`, and the bundled ACME client rejected the
+  whole order on the unknown variant, refusing to serve. Unknown
+  challenge types are now ignored during selection: issuance proceeds
+  with `tls-alpn-01` and fails only when no supported challenge is
+  offered. The same change tolerates challenge types that omit the
+  `token` field, which RFC 8555 only requires for http-01/dns-01/
+  tls-alpn-01. Shipped as a pinned backport of the upstream rustls-acme
+  fixes; see the `[patch.crates-io]` note in `rvpn/Cargo.toml`. (#1)
+
 ## [1.3.7] — 2026-11-17
 
 This release replays seven weeks of development from the private
