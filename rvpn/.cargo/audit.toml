@@ -21,6 +21,10 @@ ignore = [
     # A. rustls 0.22.4 (EOL line — migration, review 2026-12-17)
     "RUSTSEC-2026-0346", # Debug impls expose TLS session secrets
     "RUSTSEC-2026-0349", # unauthenticated ServerHello downgrade
+    # NOTE: ignores apply to an advisory ID, not a version — the two
+    # entries above also cover the 0.23 line. The rustls 0.23 migration
+    # PR must delete both lines in the same commit that removes the 0.22
+    # dependency, so a future 0.23 regression on these IDs turns red.
     # C. rustls-webpki 0.102.8 (migration, review 2026-12-17)
     "RUSTSEC-2026-0104", # CRL parsing panic
     "RUSTSEC-2026-0098", # URI name constraints
