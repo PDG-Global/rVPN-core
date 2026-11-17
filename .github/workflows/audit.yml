@@ -25,5 +25,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install cargo-audit --locked
+      - run: cargo install cargo-audit --locked --version 0.23.0
       - run: cargo audit
