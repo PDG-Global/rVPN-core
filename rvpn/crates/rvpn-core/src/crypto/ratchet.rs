@@ -196,8 +196,7 @@ impl DoubleRatchet {
         let current_number = self.recv_message_number;
         let associated_data = &[message.header.payload_type];
 
-        let header_bytes = message.header.to_bytes();
-        let key = (header_bytes.clone(), target_number);
+        let key = message.header.skipped_key_id();
 
         if self.skipped_keys.contains(&key) {
             let message_key = self.skipped_keys.pop(&key).unwrap();
@@ -272,7 +271,7 @@ impl DoubleRatchet {
         // steady-state in-order path this map is empty, so this avoids a
         // per-frame allocation.
         if !self.skipped_keys.is_empty() {
-            let key = (message.header.to_bytes(), target_number);
+            let key = message.header.skipped_key_id();
             if self.skipped_keys.contains(&key) {
                 let message_key = self.skipped_keys.pop(&key).unwrap();
                 let cipher = Cipher::new(&message_key);
@@ -392,8 +391,7 @@ impl DoubleRatchet {
         let associated_data = &[message.header.payload_type];
         
         // Try to decrypt with skipped keys first (for out-of-order messages we've seen before)
-        let header_bytes = message.header.to_bytes();
-        let key = (header_bytes.clone(), target_number);
+        let key = message.header.skipped_key_id();
 
         if self.skipped_keys.contains(&key) {
             let message_key = self.skipped_keys.pop(&key).unwrap(); // safe since we just checked
@@ -462,10 +460,14 @@ impl DoubleRatchet {
         while self.recv_message_number < until {
             let (message_key, next_ck) = kdf_ck(&current_ck);
             
-            // Store skipped key
-            let header_bytes = self.remote_dh_key.map(|k| k.to_vec()).unwrap_or_default();
+            // Store skipped key. The key id MUST match
+            // `MessageHeader::skipped_key_id` used on the lookup side: while
+            // skipping within a chain, `remote_dh_key` is the same DH key the
+            // sender stamps on every header of that chain (including the
+            // headers of the skipped messages, when they eventually arrive).
+            let key_id = self.remote_dh_key.map(|k| k.to_vec()).unwrap_or_default();
             self.skipped_keys.put(
-                (header_bytes, self.recv_message_number),
+                (key_id, self.recv_message_number),
                 message_key,
             );
             
@@ -718,13 +720,19 @@ impl SplitRatchet {
             }
         }
         
+        // Key id for the skipped-key cache, fetched before the receiving lock
+        // is taken (lock order is remote_dh_key -> receiving everywhere; a
+        // concurrent dh_ratchet_step takes them in that order). After a
+        // ratchet step above this is the NEW remote key, which is exactly
+        // what the skipped messages of the new chain carry in their headers.
+        let skipped_key_dh = *self.remote_dh_key.lock().await;
+
         // Now lock only receiving chain for decryption
         let mut receiving = self.receiving_chain.lock().await;
         let current_number = receiving.message_number;
         
         // Try skipped keys first (for out-of-order messages we've seen before)
-        let header_bytes = message.header.to_bytes();
-        let key = (header_bytes.clone(), target_number);
+        let key = message.header.skipped_key_id();
 
         if receiving.skipped_keys.contains(&key) {
             let message_key = receiving.skipped_keys.pop(&key).unwrap(); // safe since we just checked
@@ -741,7 +749,7 @@ impl SplitRatchet {
         
         // Handle future messages (out-of-order): skip ahead and store keys
         if target_number > current_number {
-            Self::skip_message_keys(&mut receiving, target_number).await?;
+            Self::skip_message_keys(&mut receiving, skipped_key_dh, target_number).await?;
         }
         
         // Decrypt with current chain key
@@ -766,24 +774,29 @@ impl SplitRatchet {
     }
     
     /// Skip message keys for out-of-order handling (internal, assumes receiving lock is held)
-    async fn skip_message_keys(receiving: &mut ReceivingChain, until: u32) -> crate::Result<()> {
+    async fn skip_message_keys(
+        receiving: &mut ReceivingChain,
+        remote_dh: Option<[u8; 32]>,
+        until: u32,
+    ) -> crate::Result<()> {
         if (receiving.message_number + MAX_SKIP as u32) < until {
             return Err(crate::Error::DecryptionFailed(
                 "Too many skipped messages".to_string()
             ));
         }
-        
+
         let chain_key = receiving.chain_key
             .ok_or_else(|| crate::Error::DecryptionFailed("No receiving chain".to_string()))?;
-        
+
         let mut current_ck = chain_key;
-        
+
         while receiving.message_number < until {
             let (message_key, next_ck) = kdf_ck(&current_ck);
-            
-            // Store skipped key (use empty vec for dh_public since we don't have access to it here)
+
+            // Store skipped key under the same id `MessageHeader::skipped_key_id`
+            // computes on the lookup side (remote DH key + message number).
             receiving.skipped_keys.put(
-                (Vec::new(), receiving.message_number),
+                (remote_dh.map(|k| k.to_vec()).unwrap_or_default(), receiving.message_number),
                 message_key,
             );
             
@@ -893,6 +906,23 @@ pub struct MessageHeader {
 }
 
 impl MessageHeader {
+    /// Key under which the skipped-message-key cache stores this message's
+    /// message key: the sender's DH ratchet public key (empty when absent)
+    /// paired with the message number.
+    ///
+    /// This MUST match the store side in `skip_message_keys`: while skipping
+    /// within a chain, `DoubleRatchet::remote_dh_key` is the same key the
+    /// sender stamps on every message header of that chain. Keying by the
+    /// full serialized header would break lookups, and cannot work on the
+    /// store side anyway (payload_type and previous_chain_length of the
+    /// skipped messages are not known until the messages themselves arrive).
+    fn skipped_key_id(&self) -> (Vec<u8>, u32) {
+        (
+            self.dh_public.map(|k| k.to_vec()).unwrap_or_default(),
+            self.message_number,
+        )
+    }
+
     /// Serialize to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut result = Vec::new();
@@ -1208,6 +1238,237 @@ mod tests {
         let reply4 = alice.decrypt(&msg4, &[0x05]).expect("Alice decrypt failed 2");
         assert_eq!(&reply4, b"I'm fine!");
     }
+
+    #[test]
+    fn test_double_ratchet_out_of_order_recovery() {
+        // Simulates reorder on the wire: four messages are sent in order but
+        // the receiver decrypts 0, 2, 1, 3. Message 1's key gets stored in
+        // the skipped-key cache when message 2 arrives; the late message 1
+        // must then decrypt from that cache. Before the skipped_key_id fix
+        // the stored key was unfindable (stored under the 32-byte remote DH
+        // key, looked up under the 42-byte serialized header) and message 1
+        // failed permanently with "Message too old".
+        let shared_secret = [0x42u8; 32];
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
+        let mut bob = DoubleRatchet::init_bob(shared_secret);
+
+        let messages: Vec<RatchetMessage> = (0..4)
+            .map(|i| {
+                alice
+                    .encrypt(format!("Message {}", i).as_bytes(), &[0x05])
+                    .expect("encrypt failed")
+            })
+            .collect();
+
+        // In-order first...
+        let d0 = bob.decrypt(&messages[0], &[0x05]).expect("decrypt 0 failed");
+        assert_eq!(d0.as_slice(), b"Message 0");
+        // ...then a gap: message 2 arrives before message 1.
+        let d2 = bob.decrypt(&messages[2], &[0x05]).expect("decrypt 2 failed");
+        assert_eq!(d2.as_slice(), b"Message 2");
+        // The skipped message 1 must now decrypt from the skipped-key cache.
+        let d1 = bob.decrypt(&messages[1], &[0x05]).expect("decrypt skipped 1 failed");
+        assert_eq!(d1.as_slice(), b"Message 1");
+        // And the chain continues in order afterwards.
+        let d3 = bob.decrypt(&messages[3], &[0x05]).expect("decrypt 3 failed");
+        assert_eq!(d3.as_slice(), b"Message 3");
+
+        // A replay of the recovered message must not decrypt twice.
+        let replay = bob.decrypt(&messages[1], &[0x05]);
+        assert!(replay.is_err(), "replayed message must be rejected");
+    }
+
+    #[test]
+    fn test_decrypt_to_out_of_order_recovery() {
+        // Same reorder scenario through the buffer-reuse decrypt_to path
+        // used by the Apple-platform Swift relay (swift_crypto.rs).
+        let shared_secret = [0x42u8; 32];
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
+        let mut bob = DoubleRatchet::init_bob(shared_secret);
+
+        let messages: Vec<RatchetMessage> = (0..3)
+            .map(|i| {
+                alice
+                    .encrypt(format!("Message {}", i).as_bytes(), &[0x05])
+                    .expect("encrypt failed")
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        let n = bob.decrypt_to(&messages[0], &[0x05], &mut out).unwrap();
+        assert_eq!(&out[..n], b"Message 0");
+        // Skip ahead: message 2 before message 1.
+        let n = bob.decrypt_to(&messages[2], &[0x05], &mut out).unwrap();
+        assert_eq!(&out[..n], b"Message 2");
+        // Late message 1 recovers from the skipped-key cache.
+        let n = bob.decrypt_to(&messages[1], &[0x05], &mut out).unwrap();
+        assert_eq!(&out[..n], b"Message 1");
+    }
+
+    #[test]
+    fn test_decrypt_to_ref_out_of_order_recovery() {
+        // Same reorder scenario through the zero-copy decrypt_to_ref path
+        // used on the iOS direct-TUN hot path, including bincode wire
+        // (de)serialization like real WebSocket frames.
+        let shared_secret = [0x42u8; 32];
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
+        let mut bob = DoubleRatchet::init_bob(shared_secret);
+
+        let wires: Vec<Vec<u8>> = (0..3)
+            .map(|i| {
+                alice
+                    .encrypt(format!("Message {}", i).as_bytes(), &[0x05])
+                    .expect("encrypt failed")
+                    .to_bytes()
+                    .expect("serialize failed")
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        let m0 = RatchetMessageRef::from_bytes(&wires[0]).unwrap();
+        let n = bob.decrypt_to_ref(&m0, &[0x05], &mut out).unwrap();
+        assert_eq!(&out[..n], b"Message 0");
+        // Skip ahead: message 2 before message 1.
+        let m2 = RatchetMessageRef::from_bytes(&wires[2]).unwrap();
+        let n = bob.decrypt_to_ref(&m2, &[0x05], &mut out).unwrap();
+        assert_eq!(&out[..n], b"Message 2");
+        // Late message 1 recovers from the skipped-key cache.
+        let m1 = RatchetMessageRef::from_bytes(&wires[1]).unwrap();
+        let n = bob.decrypt_to_ref(&m1, &[0x05], &mut out).unwrap();
+        assert_eq!(&out[..n], b"Message 1");
+    }
+
+    #[test]
+    fn test_skipped_key_cache_evicts_oldest_at_capacity() {
+        // Pins the skipped-key cache's eviction policy at the capacity bound
+        // (Adam's gate note on the lru bump): pushing MAX_SKIP + 1 skipped
+        // keys through a cache that holds MAX_SKIP must evict exactly the
+        // oldest and keep the newest. Eviction is silent and permanent, so
+        // the cost shows up as a very late message failing to decrypt with
+        // "Message too old" even though it was never seen before.
+        let shared_secret = [0x42u8; 32];
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
+        let mut bob = DoubleRatchet::init_bob(shared_secret);
+
+        // Messages 0..=MAX_SKIP+2, one chain, no DH steps in between.
+        let messages: Vec<RatchetMessage> = (0..=MAX_SKIP as u32 + 2)
+            .map(|i| {
+                alice
+                    .encrypt(format!("Message {}", i).as_bytes(), &[0x05])
+                    .expect("encrypt failed")
+            })
+            .collect();
+        let key_id = alice.get_dh_public_key().unwrap().to_vec();
+
+        // Message 1 first: one skipped key (message 0) goes in the cache.
+        bob.decrypt(&messages[1], &[0x05]).expect("decrypt 1 failed");
+        assert!(bob.skipped_keys.contains(&(key_id.clone(), 0)));
+
+        // Then a jump to the last message: skip_message_keys stores keys for
+        // messages 2..=MAX_SKIP+1, so MAX_SKIP + 1 keys have been pushed
+        // through a cache of capacity MAX_SKIP and exactly one eviction has
+        // happened.
+        bob.decrypt(&messages[MAX_SKIP + 2], &[0x05])
+            .expect("decrypt last failed");
+
+        assert_eq!(bob.skipped_keys.len(), MAX_SKIP);
+        // The oldest key (message 0) is gone; the newest (MAX_SKIP+1) is kept.
+        assert!(
+            !bob.skipped_keys.contains(&(key_id.clone(), 0)),
+            "oldest skipped key must be evicted at capacity"
+        );
+        assert!(
+            bob.skipped_keys.contains(&(key_id.clone(), MAX_SKIP as u32 + 1)),
+            "newest skipped key must survive"
+        );
+
+        // The behavioural cost: the evicted message is now permanently
+        // undecryptable, while the newest skipped message still recovers.
+        assert!(
+            bob.decrypt(&messages[0], &[0x05]).is_err(),
+            "evicted skipped message must fail"
+        );
+        let late = bob
+            .decrypt(&messages[MAX_SKIP + 1], &[0x05])
+            .expect("newest skipped message must decrypt");
+        assert_eq!(
+            late.as_slice(),
+            format!("Message {}", MAX_SKIP + 1).as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_skipped_key_cache_maximal_gap_evicts_all_prior_keys() {
+        // Records the capacity/skip-window coupling (Harry's design note):
+        // MAX_SKIP is both the cache capacity and the protocol skip-window
+        // bound, so one inbound message with a maximal gap derives exactly
+        // MAX_SKIP skipped keys — filling the cache exactly and evicting
+        // every previously stored skipped key. Whether to decouple the two
+        // constants is a design-review question; this test pins today's
+        // behaviour so the coupling reads as a decision, not an accident.
+        // Records CURRENT coupling pending the DH-ratchet design review —
+        // not settled behaviour; if capacity is raised above the skip
+        // window there, the assertions below change deliberately.
+        let shared_secret = [0x42u8; 32];
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
+        let mut bob = DoubleRatchet::init_bob(shared_secret);
+
+        // Messages 0..=2*MAX_SKIP+1 needed to reach the maximal-gap message.
+        let messages: Vec<RatchetMessage> = (0..=2 * MAX_SKIP as u32 + 1)
+            .map(|i| {
+                alice
+                    .encrypt(format!("Message {}", i).as_bytes(), &[0x05])
+                    .expect("encrypt failed")
+            })
+            .collect();
+        let key_id = alice.get_dh_public_key().unwrap().to_vec();
+
+        // In-order message 0, then a small gap to message MAX_SKIP: that
+        // stores keys for messages 1..=MAX_SKIP-1 (MAX_SKIP-1 prior keys).
+        bob.decrypt(&messages[0], &[0x05]).expect("decrypt 0 failed");
+        bob.decrypt(&messages[MAX_SKIP], &[0x05])
+            .expect("decrypt gap failed");
+        assert_eq!(bob.skipped_keys.len(), MAX_SKIP - 1);
+
+        // One inbound message with a maximal gap: from recv = MAX_SKIP+1 the
+        // skip-window bound allows exactly up to message 2*MAX_SKIP+1, and
+        // skipping to it derives keys for MAX_SKIP+1..=2*MAX_SKIP — exactly
+        // MAX_SKIP new keys, i.e. the cache's full capacity in one message.
+        bob.decrypt(&messages[2 * MAX_SKIP + 1], &[0x05])
+            .expect("decrypt maximal-gap message failed");
+
+        // The cache is filled exactly...
+        assert_eq!(bob.skipped_keys.len(), MAX_SKIP);
+        for n in MAX_SKIP as u32 + 1..=2 * MAX_SKIP as u32 {
+            assert!(
+                bob.skipped_keys.contains(&(key_id.clone(), n)),
+                "key for message {} must be present",
+                n
+            );
+        }
+        // ...and every previously stored skipped key is gone.
+        for n in 1..=MAX_SKIP as u32 - 1 {
+            assert!(
+                !bob.skipped_keys.contains(&(key_id.clone(), n)),
+                "prior key for message {} must be evicted",
+                n
+            );
+        }
+
+        // The cost in behaviour: a moderately late message from before the
+        // gap fails for good; one from after it still recovers.
+        assert!(
+            bob.decrypt(&messages[MAX_SKIP / 2], &[0x05]).is_err(),
+            "prior skipped message must fail after eviction"
+        );
+        let late = bob
+            .decrypt(&messages[3 * MAX_SKIP / 2], &[0x05])
+            .expect("post-gap skipped message must decrypt");
+        assert_eq!(
+            late.as_slice(),
+            format!("Message {}", 3 * MAX_SKIP / 2).as_bytes()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1338,5 +1599,39 @@ mod split_ratchet_tests {
         let (r1, r2) = tokio::join!(encrypt_task, decrypt_task);
         r1.expect("Encrypt task failed");
         r2.expect("Decrypt task failed");
+    }
+
+    #[tokio::test]
+    async fn test_split_ratchet_out_of_order_recovery() {
+        // Reorder scenario for the split ratchet: message 1 must decrypt from
+        // the skipped-key cache after message 2 advanced the chain past it.
+        // (SplitRatchet is not currently used by production paths, but ships
+        // in rvpn-core and must keep the same semantics as DoubleRatchet.)
+        let shared_secret = [0x42u8; 32];
+        let alice = SplitRatchet::init_alice(shared_secret, [0u8; 32]).await;
+        let bob = SplitRatchet::init_bob(shared_secret).await;
+
+        let mut messages = Vec::new();
+        for i in 0..3 {
+            messages.push(
+                alice
+                    .encrypt(format!("Message {}", i).as_bytes(), &[0x05])
+                    .await
+                    .expect("encrypt failed"),
+            );
+        }
+
+        let d0 = bob.decrypt(&messages[0], &[0x05]).await.expect("decrypt 0 failed");
+        assert_eq!(d0.as_slice(), b"Message 0");
+        // Skip ahead: message 2 before message 1.
+        let d2 = bob.decrypt(&messages[2], &[0x05]).await.expect("decrypt 2 failed");
+        assert_eq!(d2.as_slice(), b"Message 2");
+        // Late message 1 recovers from the skipped-key cache.
+        let d1 = bob.decrypt(&messages[1], &[0x05]).await.expect("decrypt skipped 1 failed");
+        assert_eq!(d1.as_slice(), b"Message 1");
+
+        // A replay of the recovered message must not decrypt twice.
+        let replay = bob.decrypt(&messages[1], &[0x05]).await;
+        assert!(replay.is_err(), "replayed message must be rejected");
     }
 }

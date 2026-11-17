@@ -119,6 +119,12 @@ pub enum HandshakeMessage {
         /// Server identity key (for verification)
         #[serde(with = "serde_bytes")]
         identity_key: Vec<u8>,
+        /// Identity X25519 key, when supplied by a server supporting signed bundles.
+        #[serde(default, with = "serde_bytes")]
+        identity_x25519_key: Option<Vec<u8>>,
+        /// Signature over the identity X25519 key, when supplied.
+        #[serde(default, with = "serde_bytes")]
+        identity_x25519_signature: Option<Vec<u8>>,
     },
 
     /// Client authentication proof
@@ -207,4 +213,77 @@ pub struct VirtualIp {
     pub dns_servers: Vec<std::net::IpAddr>,
     /// MTU for the tunnel
     pub mtu: u16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_hello() -> HandshakeMessage {
+        HandshakeMessage::ServerHello {
+            ephemeral_key: vec![],
+            signed_prekey: vec![1; 32],
+            prekey_signature: vec![2; 64],
+            identity_key: vec![3; 32],
+            identity_x25519_key: Some(vec![4; 32]),
+            identity_x25519_signature: Some(vec![5; 64]),
+        }
+    }
+
+    #[test]
+    fn legacy_server_hello_decodes_without_signed_identity_fields() {
+        let mut json = serde_json::to_value(server_hello()).unwrap();
+        let fields = json
+            .get_mut("ServerHello")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        fields.remove("identity_x25519_key");
+        fields.remove("identity_x25519_signature");
+
+        let decoded: HandshakeMessage = serde_json::from_value(json).unwrap();
+        match decoded {
+            HandshakeMessage::ServerHello {
+                identity_x25519_key,
+                identity_x25519_signature,
+                ..
+            } => {
+                assert!(identity_x25519_key.is_none());
+                assert!(identity_x25519_signature.is_none());
+            }
+            _ => panic!("wrong handshake variant"),
+        }
+    }
+
+    #[test]
+    fn legacy_client_ignores_signed_identity_fields() {
+        #[derive(Deserialize)]
+        enum LegacyHandshakeMessage {
+            ServerHello {
+                #[serde(with = "serde_bytes")]
+                ephemeral_key: Vec<u8>,
+                #[serde(with = "serde_bytes")]
+                signed_prekey: Vec<u8>,
+                #[serde(with = "serde_bytes")]
+                prekey_signature: Vec<u8>,
+                #[serde(with = "serde_bytes")]
+                identity_key: Vec<u8>,
+            },
+        }
+
+        let decoded: LegacyHandshakeMessage =
+            serde_json::from_value(serde_json::to_value(server_hello()).unwrap()).unwrap();
+        match decoded {
+            LegacyHandshakeMessage::ServerHello {
+                ephemeral_key,
+                signed_prekey,
+                prekey_signature,
+                identity_key,
+            } => {
+                assert!(ephemeral_key.is_empty());
+                assert_eq!(signed_prekey, vec![1; 32]);
+                assert_eq!(prekey_signature, vec![2; 64]);
+                assert_eq!(identity_key, vec![3; 32]);
+            }
+        }
+    }
 }

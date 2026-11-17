@@ -42,7 +42,8 @@ static TUN_RUNTIME: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 // Atomic flag to prevent duplicate client creation during iOS double-startTunnel race
-static TUN_CLIENT_CREATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TUN_CLIENT_CREATING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // Global DNS proxy task handle (used by macOS Direct TUN, which intercepts DNS
 // at the packet layer and forwards to this local proxy; iOS passes
@@ -69,7 +70,12 @@ fn init_tracing() {
     use tracing_subscriber::prelude::*;
 
     if TRACING_INITIALIZED
-        .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
         .is_err()
     {
         return; // Already initialized
@@ -105,12 +111,10 @@ pub fn set_last_error(msg: &str) {
 pub extern "C" fn rvpn_last_error() -> *mut c_char {
     let guard = LAST_ERROR.lock().unwrap();
     match guard.as_ref() {
-        Some(msg) if !msg.is_empty() => {
-            match CString::new(msg.as_str()) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
-        }
+        Some(msg) if !msg.is_empty() => match CString::new(msg.as_str()) {
+            Ok(c_str) => c_str.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
         _ => std::ptr::null_mut(),
     }
 }
@@ -178,7 +182,8 @@ pub extern "C" fn rvpn_tun_check_connectivity() -> c_int {
 }
 
 // Static for tracking if tracing is initialized
-static TRACING_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRACING_INITIALIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // ============================================================================
 // OSLog Bridge - Route Rust tracing logs to iOS unified logging
@@ -422,6 +427,8 @@ pub unsafe extern "C" fn rvpn_start(config_json: *const c_char) -> c_int {
         enable_dns_proxy: mobile_config.enable_dns_proxy.unwrap_or(false),
         stealth_fingerprint: None,
         server_identity_pin: mobile_config.server_fingerprint,
+        signed_x25519_seen: false,
+        trust_on_first_use: mobile_config.trust_on_first_use.unwrap_or(true),
         country_ips_file: mobile_config.country_ips_file,
         // Legacy MobileConfig predates multi-server routing.
         extra_servers: vec![],
@@ -564,7 +571,12 @@ pub unsafe extern "C" fn rvpn_tun_create(config_json: *const c_char) -> c_int {
     // both threads pass the fast-path check, create separate clients, and spawn
     // duplicate reconnect loops that fight each other.
     if TUN_CLIENT_CREATING
-        .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
         .is_err()
     {
         warn!("[IOS_TUN_FFI] TUN client creation already in progress, ignoring duplicate call");
@@ -731,7 +743,10 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::R
     let server_port = client.server_port();
     let base_path = client.server_path();
 
-    let dns_path = format!("{}/dns", base_path.trim_end_matches("/tun").trim_end_matches('/'));
+    let dns_path = format!(
+        "{}/dns",
+        base_path.trim_end_matches("/tun").trim_end_matches('/')
+    );
 
     let flow_config = FlowConnectorConfig {
         server_host: server_host.clone(),
@@ -742,6 +757,7 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::R
         tls_fingerprint: rvpn_tls::TlsFingerprint::Chrome,
         identity_key: Arc::new(client.identity_key().clone()),
         server_bundle: client.server_bundle().clone(),
+        security: client.default_security(),
         // Share the default session's resumption store so /dns reconnects
         // resume from the tickets the tunnel connection earned.
         resumption: Some(client.resumption_store()),
@@ -751,7 +767,10 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::R
     doh_client.clone().start_cleanup_task();
     doh_client.start().await?;
 
-    info!("[IOS_TUN_FFI] DoH client started, connecting to {}/dns", base_path);
+    info!(
+        "[IOS_TUN_FFI] DoH client started, connecting to {}/dns",
+        base_path
+    );
 
     // Multi-server: one extra DoH client per secondary exit, each with its
     // own persistent /dns WebSocket to that exit (same X3DH + ratchet
@@ -764,9 +783,16 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::R
     // The exit servers' own hostnames must always bypass the tunnel in the
     // DNS layer — the reconnect path resolves them while the tunnel is down.
     let mut server_hostnames: Vec<String> = vec![client.server_host().to_string()];
-    server_hostnames.extend(extra_dns_info.iter().map(|(_, host, _, _, _, _)| host.clone()));
-    for (name, host, port, base_path, bundle, resumption) in extra_dns_info {
-        let dns_path = format!("{}/dns", base_path.trim_end_matches("/tun").trim_end_matches('/'));
+    server_hostnames.extend(
+        extra_dns_info
+            .iter()
+            .map(|(_, host, _, _, _, _, _)| host.clone()),
+    );
+    for (name, host, port, base_path, bundle, security, resumption) in extra_dns_info {
+        let dns_path = format!(
+            "{}/dns",
+            base_path.trim_end_matches("/tun").trim_end_matches('/')
+        );
         let flow_config = FlowConnectorConfig {
             server_host: host,
             server_port: port,
@@ -774,6 +800,7 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::R
             tls_fingerprint: rvpn_tls::TlsFingerprint::Chrome,
             identity_key: Arc::new(client.identity_key().clone()),
             server_bundle: bundle,
+            security,
             // This exit session's own store — shared with its tunnel session.
             resumption: Some(resumption),
         };
@@ -785,7 +812,10 @@ async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::R
                 extra_doh_clients.insert(name, doh);
             }
             Err(e) => {
-                error!("[IOS_TUN_FFI] DoH client for exit '{}' failed to start: {}", name, e);
+                error!(
+                    "[IOS_TUN_FFI] DoH client for exit '{}' failed to start: {}",
+                    name, e
+                );
             }
         }
     }
@@ -856,15 +886,13 @@ pub extern "C" fn rvpn_tun_get_state() -> c_int {
 #[no_mangle]
 pub extern "C" fn rvpn_tun_get_ip() -> *mut c_char {
     match TUN_CLIENT.lock().unwrap().as_ref() {
-        Some(client) => {
-            match client.get_tunnel_ip() {
-                Some(ip_str) => match CString::new(ip_str) {
-                    Ok(c_str) => c_str.into_raw(),
-                    Err(_) => std::ptr::null_mut(),
-                },
-                None => std::ptr::null_mut(),
-            }
-        }
+        Some(client) => match client.get_tunnel_ip() {
+            Some(ip_str) => match CString::new(ip_str) {
+                Ok(c_str) => c_str.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            },
+            None => std::ptr::null_mut(),
+        },
         None => std::ptr::null_mut(),
     }
 }
@@ -877,15 +905,13 @@ pub extern "C" fn rvpn_tun_get_ip() -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn rvpn_tun_get_gateway_ip() -> *mut c_char {
     match TUN_CLIENT.lock().unwrap().as_ref() {
-        Some(client) => {
-            match client.get_gateway_ip() {
-                Some(ip_str) => match CString::new(ip_str) {
-                    Ok(c_str) => c_str.into_raw(),
-                    Err(_) => std::ptr::null_mut(),
-                },
-                None => std::ptr::null_mut(),
-            }
-        }
+        Some(client) => match client.get_gateway_ip() {
+            Some(ip_str) => match CString::new(ip_str) {
+                Ok(c_str) => c_str.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            },
+            None => std::ptr::null_mut(),
+        },
         None => std::ptr::null_mut(),
     }
 }
@@ -909,7 +935,7 @@ pub extern "C" fn rvpn_tun_get_mtu() -> c_int {
 /// reconnect TCP SYN packets from being routed through the dead TUN interface.
 ///
 /// # Returns
-/// C string with IP address (e.g., "113.52.134.101"), or null if not initialized
+/// C string with IP address (e.g., "203.0.113.10"), or null if not initialized
 /// or if startup resolution failed (connects then dial the hostname).
 /// Caller must free with rvpn_free_string()
 #[no_mangle]
@@ -993,6 +1019,26 @@ pub unsafe extern "C" fn rvpn_tun_get_server_identity_for(name: *const c_char) -
     }
 }
 
+/// Return 1 when the named server has proved signed X25519 support, 0 otherwise.
+///
+/// # Safety
+/// `name` must be a valid null-terminated C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn rvpn_tun_signed_x25519_seen_for(name: *const c_char) -> c_int {
+    if name.is_null() {
+        return 0;
+    }
+    let name = match CStr::from_ptr(name).to_str() {
+        Ok(name) => name,
+        Err(_) => return 0,
+    };
+    let client = match TUN_CLIENT.lock().unwrap().as_ref() {
+        Some(client) => client.clone(),
+        None => return 0,
+    };
+    i32::from(client.signed_x25519_seen_for(name).unwrap_or(false))
+}
+
 /// Write packet to TUN (Swift → Rust → Server)
 ///
 /// # Arguments
@@ -1009,10 +1055,7 @@ pub unsafe extern "C" fn rvpn_tun_get_server_identity_for(name: *const c_char) -
 /// This function uses try_send() to avoid block_on() deadlocks on the hot path.
 /// It is safe to call from any thread (including Swift dispatch queues).
 #[no_mangle]
-pub unsafe extern "C" fn rvpn_tun_write_packet(
-    data: *const u8,
-    len: usize,
-) -> c_int {
+pub unsafe extern "C" fn rvpn_tun_write_packet(data: *const u8, len: usize) -> c_int {
     // Validate pointer
     if data.is_null() {
         return ERROR_NULL_POINTER;
@@ -1054,10 +1097,7 @@ pub unsafe extern "C" fn rvpn_tun_write_packet(
 /// # Safety
 /// `data` must point to `len` valid bytes.
 #[no_mangle]
-pub unsafe extern "C" fn rvpn_tun_write_packet_batch(
-    data: *const u8,
-    len: usize,
-) -> c_int {
+pub unsafe extern "C" fn rvpn_tun_write_packet_batch(data: *const u8, len: usize) -> c_int {
     if data.is_null() {
         return ERROR_NULL_POINTER;
     }
@@ -1140,7 +1180,10 @@ pub unsafe extern "C" fn rvpn_tun_read_packet(
             let packet_len = packet.len();
 
             if packet_len > buffer_len {
-                error!("[IOS_TUN_FFI] Packet too large for buffer: {} > {}", packet_len, buffer_len);
+                error!(
+                    "[IOS_TUN_FFI] Packet too large for buffer: {} > {}",
+                    packet_len, buffer_len
+                );
                 return ERROR_INVALID_CONFIG;
             }
 
@@ -1309,7 +1352,7 @@ pub unsafe extern "C" fn rvpn_tun_set_state_callback(
     let state_callback: crate::ios_tun::StateCallback = callback.map(|cb| {
         std::mem::transmute::<
             extern "C" fn(c_int, *const c_char, *const c_char),
-            unsafe extern "C" fn(i32, *const c_char, *const c_char)
+            unsafe extern "C" fn(i32, *const c_char, *const c_char),
         >(cb)
     });
 
@@ -1377,7 +1420,9 @@ pub unsafe extern "C" fn rvpn_get_bypass_ips_for_countries(
             if !path_str.is_empty() {
                 match std::fs::read_to_string(path_str) {
                     Ok(content) => {
-                        match serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(&content) {
+                        match serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(
+                            &content,
+                        ) {
                             Ok(map) => {
                                 for cc in &country_codes {
                                     if let Some(cidrs) = map.get(cc.as_str()) {
@@ -1385,7 +1430,11 @@ pub unsafe extern "C" fn rvpn_get_bypass_ips_for_countries(
                                     }
                                 }
                                 loaded_from_file = true;
-                                info!("[IOS_TUN_FFI] Loaded {} IPs from {}", all_cidrs.len(), path_str);
+                                info!(
+                                    "[IOS_TUN_FFI] Loaded {} IPs from {}",
+                                    all_cidrs.len(),
+                                    path_str
+                                );
                             }
                             Err(e) => error!("[IOS_TUN_FFI] Failed to parse {}: {}", path_str, e),
                         }
@@ -1485,7 +1534,9 @@ pub unsafe extern "C" fn rvpn_get_bypass_domains_for_countries(
             if !path_str.is_empty() {
                 match std::fs::read_to_string(path_str) {
                     Ok(content) => {
-                        match serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(&content) {
+                        match serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(
+                            &content,
+                        ) {
                             Ok(map) => {
                                 for cc in &country_codes {
                                     if let Some(domains) = map.get(cc.as_str()) {
@@ -1493,7 +1544,11 @@ pub unsafe extern "C" fn rvpn_get_bypass_domains_for_countries(
                                     }
                                 }
                                 loaded_from_file = true;
-                                info!("[IOS_TUN_FFI] Loaded {} domains from {}", all_domains.len(), path_str);
+                                info!(
+                                    "[IOS_TUN_FFI] Loaded {} domains from {}",
+                                    all_domains.len(),
+                                    path_str
+                                );
                             }
                             Err(e) => error!("[IOS_TUN_FFI] Failed to parse {}: {}", path_str, e),
                         }
@@ -1556,8 +1611,7 @@ pub unsafe extern "C" fn rvpn_generate_identity() -> *mut c_char {
 
     // Derive X25519 public key from Ed25519 verifying key bytes
     let ed25519_pubkey_bytes = identity.verifying_key.to_bytes();
-    let x25519_pubkey =
-        x25519_dalek::PublicKey::from(ed25519_pubkey_bytes);
+    let x25519_pubkey = x25519_dalek::PublicKey::from(ed25519_pubkey_bytes);
 
     // Format as: R-VPN-IDENTITY-v1\ned25519: <b64>\nx25519: <b64>\n<b64>\n
     let content = format!(
@@ -1681,7 +1735,10 @@ pub unsafe extern "C" fn rvpn_validate_identity(identity_content: *const c_char)
         return -1;
     }
     let ed25519_key_b64 = &lines[1]["ed25519:".len()..].trim();
-    if base64::engine::general_purpose::STANDARD.decode(ed25519_key_b64).is_err() {
+    if base64::engine::general_purpose::STANDARD
+        .decode(ed25519_key_b64)
+        .is_err()
+    {
         set_last_error("Invalid identity: bad ed25519 key base64");
         return -1;
     }
@@ -1692,13 +1749,19 @@ pub unsafe extern "C" fn rvpn_validate_identity(identity_content: *const c_char)
         return -1;
     }
     let x25519_key_b64 = &lines[2]["x25519:".len()..].trim();
-    if base64::engine::general_purpose::STANDARD.decode(x25519_key_b64).is_err() {
+    if base64::engine::general_purpose::STANDARD
+        .decode(x25519_key_b64)
+        .is_err()
+    {
         set_last_error("Invalid identity: bad x25519 key base64");
         return -1;
     }
 
     // Validate signing key
-    if base64::engine::general_purpose::STANDARD.decode(lines[3]).is_err() {
+    if base64::engine::general_purpose::STANDARD
+        .decode(lines[3])
+        .is_err()
+    {
         set_last_error("Invalid identity: bad signing key base64");
         return -1;
     }

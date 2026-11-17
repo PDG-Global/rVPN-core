@@ -4,21 +4,50 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use rvpn_core::protocol::{HandshakeMessage, ProtocolVersion, AuthMethod};
+
+/// Create valid identity and prekey files for a test configuration.
+pub fn configure_test_keys(config: &mut crate::config::ServerConfig, directory: &std::path::Path) {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use rvpn_core::crypto::{IdentityKey, X3DHResponder};
+
+    let identity = IdentityKey::generate();
+    let identity_data = format!(
+        "R-VPN-IDENTITY-v1\n{}\n{}\n",
+        BASE64.encode(identity.verifying_key.as_bytes()),
+        BASE64.encode(identity.signing_key.to_bytes())
+    );
+    let identity_path = directory.join("server_identity.key");
+    crate::private_files::atomic_write_private(&identity_path, identity_data.as_bytes()).unwrap();
+    let responder = X3DHResponder::from_identity(identity);
+    let private_json = serde_json::json!({
+        "signed_prekey_private": BASE64.encode(responder.get_signed_prekey_private())
+    });
+    let bundle_path = directory.join("prekey-bundle.json");
+    crate::private_files::atomic_write_private(&bundle_path, b"{}").unwrap();
+    crate::private_files::atomic_write_private(
+        &bundle_path.with_extension("private.json"),
+        private_json.to_string().as_bytes(),
+    )
+    .unwrap();
+    config.identity_key_file = identity_path;
+    config.prekey_bundle_file = Some(bundle_path);
+}
 
 /// Start a test server
 pub async fn start_test_server(port: u16) -> Result<Arc<RwLock<crate::handler::VpnHandler>>> {
     use crate::config::ServerConfig;
     use crate::handler::VpnHandler;
 
-    let config = ServerConfig {
+    let directory = tempfile::tempdir()?;
+    let mut config = ServerConfig {
         bind_address: format!("127.0.0.1:{}", port),
         ..Default::default()
     };
+    configure_test_keys(&mut config, directory.path());
 
     let handler = Arc::new(RwLock::new(VpnHandler::new(config)?));
     Ok(handler)
@@ -26,16 +55,16 @@ pub async fn start_test_server(port: u16) -> Result<Arc<RwLock<crate::handler::V
 
 /// Connect to server via WebSocket
 pub async fn connect_to_server(addr: SocketAddr) -> Result<(
-    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 )> {
     let url = format!("ws://{}", addr);
     let (ws_stream, _) = connect_async(&url).await?;
-    Ok(ws_stream)
+    Ok((ws_stream,))
 }
 
 /// Perform X3DH handshake as client
 pub async fn client_handshake(
-    ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 ) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
 

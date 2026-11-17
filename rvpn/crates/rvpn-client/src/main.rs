@@ -316,6 +316,7 @@ async fn run_socks5(config: ClientConfig) -> Result<()> {
     let socks_addr: SocketAddr = config.socks5.listen_address.parse()?;
 
     // Initialize stats manager for historical tracking
+    metrics::init_global_metrics();
     let stats_manager = stats::init_global_stats_manager_with_dir(config.data_dir.clone()).await;
     let _stats_handle = stats_manager.start_collection();
 
@@ -464,6 +465,7 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
     let (host, port, path) = parse_server_url(&config.server_address);
 
     // Initialize stats manager for historical tracking
+    metrics::init_global_metrics();
     let stats_manager = stats::init_global_stats_manager_with_dir(config.data_dir.clone()).await;
     let _stats_handle = stats_manager.start_collection();
 

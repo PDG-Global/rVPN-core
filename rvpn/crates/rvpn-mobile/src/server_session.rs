@@ -32,9 +32,9 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::server_hello::ServerSecurity;
 use crate::ws::{FrameType, MinimalWebSocket, MinimalWsReader, MinimalWsWriter};
 
-use ed25519_dalek::Verifier;
 use rvpn_core::crypto::ratchet::{RatchetMessage, RatchetMessageRef};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
 use rvpn_core::crypto::{DoubleRatchet, EphemeralKey, IdentityKey, X3DHPublicBundle};
@@ -253,7 +253,7 @@ pub(crate) struct ServerSession {
     /// from `server_bundle.identity_key` at construction. The app FFI reads
     /// this via `rvpn_tun_get_server_identity()` after `Connected` to
     /// capture the TOFU pin on first-ever connect.
-    server_identity_pin_actual: String,
+    security: ServerSecurity,
     /// Last time any traffic was received from the server (Unix seconds).
     /// Updated on every WebSocket frame, including encrypted data and WS
     /// control frames, so Swift can distinguish a healthy idle tunnel from
@@ -337,7 +337,7 @@ impl ServerSession {
         server_port: u16,
         server_path: String,
         server_bundle: X3DHPublicBundle,
-        server_identity_pin_actual: String,
+        security: ServerSecurity,
         chan_cap: usize,
         is_default: bool,
         server_sni: Option<String>,
@@ -362,7 +362,7 @@ impl ServerSession {
             mtu: Arc::new(std::sync::Mutex::new(1420)),
             shutdown_tx,
             server_bundle,
-            server_identity_pin_actual,
+            security,
             last_rx_time: Arc::new(AtomicU64::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -397,8 +397,16 @@ impl ServerSession {
     /// identity key. The app FFI reads this via
     /// `rvpn_tun_get_server_identity()` after the tunnel reaches `Connected`
     /// to persist the TOFU pin on the first connect.
-    pub(crate) fn server_identity_pin(&self) -> &str {
-        &self.server_identity_pin_actual
+    pub(crate) fn server_identity_pin(&self) -> String {
+        self.security.actual_pin().unwrap_or_default()
+    }
+
+    pub(crate) fn signed_x25519_seen(&self) -> bool {
+        self.security.signed_x25519_seen()
+    }
+
+    pub(crate) fn security(&self) -> ServerSecurity {
+        self.security.clone()
     }
 
     /// This exit's TLS session resumption store (a cheap `Arc` clone sharing
@@ -870,81 +878,13 @@ impl ServerSession {
                     serde_json::from_slice(&frame_buf[..frame_len])
                         .context("Failed to parse ServerHello message")?;
 
-                match server_hello {
-                    HandshakeMessage::ServerHello {
-                        ephemeral_key: _server_ephemeral,
-                        identity_key: server_identity_key,
-                        signed_prekey: server_signed_prekey,
-                        prekey_signature: server_prekey_signature,
-                    } => {
-                        debug!("[IosTun] Received ServerHello with ephemeral key");
-
-                        // Build a bundle from the SERVER'S ACTUAL KEYS (not the pre-loaded bundle)
-                        let server_identity_key: [u8; 32] =
-                            server_identity_key.as_slice().try_into().map_err(|_| {
-                                anyhow::anyhow!("Server identity key has invalid length")
-                            })?;
-                        let server_signed_prekey: [u8; 32] =
-                            server_signed_prekey.as_slice().try_into().map_err(|_| {
-                                anyhow::anyhow!("Server signed prekey has invalid length")
-                            })?;
-                        let prekey_signature: [u8; 64] = server_prekey_signature
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("Prekey signature has invalid length"))?;
-
-                        // Verify the Ed25519 signature on signed_prekey using the server's identity_key
-                        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
-                            &server_identity_key,
-                        )
-                        .map_err(|e| anyhow::anyhow!("Invalid server identity key: {}", e))?;
-                        let signature = ed25519_dalek::Signature::from_bytes(&prekey_signature);
-                        verifying_key
-                            .verify(&server_signed_prekey, &signature)
-                            .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
-                        debug!("[IosTun] Server prekey signature verified");
-
-                        // For the X3DH key agreement, we need the server's identity_x25519_key which is
-                        // derived from the server's Ed25519 *private* key. We can't derive it from the
-                        // Ed25519 *public* key sent in ServerHello, so use the pre-loaded bundle's value.
-                        let server_identity_x25519_key = self.server_bundle.identity_x25519_key;
-
-                        // Bundle for X3DH key agreement — uses pre-loaded identity_x25519_key
-                        // but the actual signed_prekey from the ServerHello (signature-verified above)
-                        let server_bundle_from_hello = X3DHPublicBundle {
-                            identity_key: server_identity_key,
-                            identity_x25519_key: server_identity_x25519_key,
-                            signed_prekey: server_signed_prekey,
-                            prekey_signature,
-                            one_time_prekey: None,
-                            // Handshake path doesn't propagate rotation
-                            // metadata (yet); the pre-loaded bundle from
-                            // disk carries those fields and drives TOFU
-                            // enforcement in IosTunClient::new.
-                            identity_key_version: self.server_bundle.identity_key_version,
-                            rotation_signature: self.server_bundle.rotation_signature,
-                        };
-
-                        // Complete X3DH agreement using the SERVER'S ACTUAL bundle
-                        let (shared_secret, _x3dh_material) = initiator
-                            .agree(&server_bundle_from_hello)
-                            .context("X3DH key agreement failed")?;
-
-                        debug!("[IosTun] X3DH shared secret derived successfully");
-
-                        // Initialize Double Ratchet as Alice (initiator)
-                        // In X3DH, the server (Bob) doesn't generate an ephemeral key.
-                        // The _server_ephemeral field is empty - init_alice doesn't use this parameter.
-                        let ratchet = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-
-                        info!("[IosTun] Double Ratchet initialized as Alice (initiator)");
-
-                        Ok(ratchet)
-                    }
-                    _ => Err(anyhow::anyhow!(
-                        "Unexpected handshake message type from server"
-                    )),
-                }
+                let validated = self.security.validate(server_hello, &self.server_bundle)?;
+                let (shared_secret, _) = initiator
+                    .agree(&validated.bundle)
+                    .context("X3DH key agreement failed")?;
+                validated.commit(&self.security);
+                info!("[IosTun] Double Ratchet initialized after server identity validation");
+                Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32]))
             }
             _ => Err(anyhow::anyhow!("Expected binary message during handshake")),
         }
@@ -1675,9 +1615,7 @@ impl ServerSession {
                 if this.rx_count.load(Ordering::Relaxed) > rx_baseline {
                     info!("[IosTun] Keepalive: connection survived doze, staying connected");
                     doze_probe = None;
-                } else if now
-                    .duration_since(probe_start)
-                    .unwrap_or_default()
+                } else if now.duration_since(probe_start).unwrap_or_default()
                     > std::time::Duration::from_secs(10)
                 {
                     error!("[IosTun] Keepalive: no response after doze, connection dead. Reconnecting.");
@@ -2109,7 +2047,7 @@ impl ServerSession {
                     client.drop_pending("max reconnection attempts reached");
                     client
                         .notify_state(
-                            TunClientState::Error,
+                            TunClientState::Terminal,
                             None,
                             "Max reconnection attempts reached",
                         )
@@ -2222,6 +2160,15 @@ impl ServerSession {
                         had_successful_session = true;
                     }
                     Err(e) => {
+                        if let Some(message) = ServerSecurity::security_failure_message(&e) {
+                            error!("[IosTun] {}", message);
+                            client.reconnect_enabled.store(false, Ordering::Relaxed);
+                            client.drop_pending("terminal server security failure");
+                            client
+                                .notify_state(TunClientState::Terminal, None, &message)
+                                .await;
+                            break;
+                        }
                         let rss_after_kb = rss_bytes_now() / 1024;
                         let headroom_after_kb = headroom_bytes_now() / 1024;
                         error!(
@@ -2361,6 +2308,12 @@ mod tests {
     /// pending-queue tests. The runtime is only needed for the `Handle` in
     /// `SharedContext`; nothing is spawned on it.
     fn test_session() -> (Arc<ServerSession>, tokio::runtime::Runtime) {
+        test_session_with_signed_state(false)
+    }
+
+    fn test_session_with_signed_state(
+        signed_x25519_seen: bool,
+    ) -> (Arc<ServerSession>, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2384,6 +2337,7 @@ mod tests {
             one_time_prekey: None,
             identity_key_version: 1,
             rotation_signature: None,
+            identity_x25519_signature: None,
         };
         let session = Arc::new(ServerSession::new(
             shared,
@@ -2391,8 +2345,8 @@ mod tests {
             Some("127.0.0.1".parse().unwrap()),
             443,
             "/connect".to_string(),
-            bundle,
-            "ik:1:test".to_string(),
+            bundle.clone(),
+            ServerSecurity::new(None, signed_x25519_seen, &bundle).unwrap(),
             64,    // chan_cap
             false, // is_default
             None,  // server_sni
@@ -2400,6 +2354,22 @@ mod tests {
             None,
         ));
         (session, rt)
+    }
+
+    #[test]
+    fn recreated_session_rejects_unsigned_downgrade_with_persisted_state() {
+        let (session, _rt) = test_session_with_signed_state(true);
+        let mut bundle = rvpn_core::crypto::X3DHResponder::new().get_public_bundle();
+        bundle.identity_x25519_signature = None;
+        let unsigned = HandshakeMessage::ServerHello {
+            ephemeral_key: vec![],
+            signed_prekey: bundle.signed_prekey.to_vec(),
+            prekey_signature: bundle.prekey_signature.to_vec(),
+            identity_key: bundle.identity_key.to_vec(),
+            identity_x25519_key: None,
+            identity_x25519_signature: None,
+        };
+        assert!(session.security.validate(unsigned, &bundle).is_err());
     }
 
     /// Minimal IPv4 packet with the given src/dst and a marker byte at the
@@ -2423,16 +2393,15 @@ mod tests {
 
         // Pre-VirtualIp: packets stash in the pending queue, nothing reaches
         // the uplink channel.
-        session
-            .enqueue_uplink(v4_packet(PRIMARY, dst, 1))
-            .unwrap();
-        session
-            .enqueue_uplink(v4_packet(PRIMARY, dst, 2))
-            .unwrap();
+        session.enqueue_uplink(v4_packet(PRIMARY, dst, 1)).unwrap();
+        session.enqueue_uplink(v4_packet(PRIMARY, dst, 2)).unwrap();
         assert_eq!(session.pending_uplink.lock().unwrap().len(), 2);
         {
             let mut rx = session.from_swift_receiver.blocking_lock();
-            assert!(rx.try_recv().is_err(), "channel must stay empty pre-VirtualIp");
+            assert!(
+                rx.try_recv().is_err(),
+                "channel must stay empty pre-VirtualIp"
+            );
         }
 
         // VirtualIp arrives → flush rewrites src and enqueues in order.
@@ -2453,12 +2422,12 @@ mod tests {
         let (session, _rt) = test_session();
         *session.tunnel_ip.lock().unwrap() = Some(SESSION_IP.to_string());
         let dst: std::net::Ipv4Addr = "1.1.1.1".parse().unwrap();
-        session
-            .enqueue_uplink(v4_packet(PRIMARY, dst, 9))
-            .unwrap();
+        session.enqueue_uplink(v4_packet(PRIMARY, dst, 9)).unwrap();
         assert!(session.pending_uplink.lock().unwrap().is_empty());
         let mut rx = session.from_swift_receiver.blocking_lock();
-        let pkt = rx.try_recv().expect("packet should go straight to the channel");
+        let pkt = rx
+            .try_recv()
+            .expect("packet should go straight to the channel");
         assert_eq!(&pkt[12..16], &SESSION_IP.octets());
     }
 
@@ -2484,9 +2453,7 @@ mod tests {
     fn drop_pending_clears_queue() {
         let (session, _rt) = test_session();
         let dst: std::net::Ipv4Addr = "8.8.8.8".parse().unwrap();
-        session
-            .enqueue_uplink(v4_packet(PRIMARY, dst, 1))
-            .unwrap();
+        session.enqueue_uplink(v4_packet(PRIMARY, dst, 1)).unwrap();
         assert_eq!(session.pending_uplink.lock().unwrap().len(), 1);
         session.drop_pending("test");
         assert!(session.pending_uplink.lock().unwrap().is_empty());

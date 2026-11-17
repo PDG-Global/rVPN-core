@@ -26,6 +26,10 @@ pub struct ServerConfig {
     #[serde(default = "default_tls_key")]
     pub tls_key_file: PathBuf,
 
+    /// Allow plaintext WebSocket only behind a trusted TLS-terminating proxy.
+    #[serde(default)]
+    pub allow_plaintext: bool,
+
     /// Identity key file
     #[serde(default = "default_identity_key")]
     pub identity_key_file: PathBuf,
@@ -82,6 +86,7 @@ impl Default for ServerConfig {
             bind_address: "0.0.0.0:443".to_string(),
             tls_cert_file: PathBuf::from("certs/cert.pem"),
             tls_key_file: PathBuf::from("certs/key.pem"),
+            allow_plaintext: false,
             identity_key_file: PathBuf::from("server_identity.key"),
             prekey_rotation_hours: 168,
             one_time_prekey_count: 100,
@@ -243,17 +248,25 @@ fn default_max_handshakes() -> u32 {
 /// Network configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
-    /// Enable NAT
+    /// Enable server-managed NAT; containment remains enabled when this is false.
     #[serde(default = "default_true")]
     pub nat_enabled: bool,
 
-    /// DHCP range
+    /// Legacy compatibility field; allocation/filtering/NAT use tun.tun_ip instead.
     #[serde(default = "default_dhcp_range")]
     pub dhcp_range: String,
 
     /// DNS servers
     #[serde(default)]
     pub dns_servers: Vec<String>,
+
+    /// Public addresses of this server that are not assigned to any local
+    /// interface — typical for cloud VMs behind 1:1 NAT, where the interface
+    /// carries only a private address. Client egress (raw TUN, TCP, UDP and
+    /// DNS relays) to these addresses is denied so VPN clients cannot loop
+    /// back into the server's own services through the external IP.
+    #[serde(default)]
+    pub public_addresses: Vec<std::net::IpAddr>,
 }
 
 impl Default for NetworkConfig {
@@ -262,6 +275,7 @@ impl Default for NetworkConfig {
             nat_enabled: true,
             dhcp_range: "10.200.0.0/24".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
+            public_addresses: Vec::new(),
         }
     }
 }
@@ -296,6 +310,14 @@ pub struct TunNetworkConfig {
     /// DNS servers to advertise to clients via VirtualIp
     #[serde(default)]
     pub dns_servers: Vec<std::net::IpAddr>,
+
+    /// Optional CAKE shaper bandwidth in kbit/s applied to the TUN interface
+    /// (Linux only). Set this just below a known downstream bottleneck (e.g.
+    /// a rate-limited transit link) so the queue forms in *our* fq/cake
+    /// qdisc — with per-flow fairness — instead of in the bottleneck's own
+    /// policer buffer. Absent = no shaper (kernel default qdisc).
+    #[serde(default)]
+    pub shaper_bandwidth_kbit: Option<u32>,
 }
 
 impl Default for TunNetworkConfig {
@@ -306,6 +328,7 @@ impl Default for TunNetworkConfig {
             mtu: 1420,
             interface_name: "tun0".to_string(),
             dns_servers: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))],
+            shaper_bandwidth_kbit: None,
         }
     }
 }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MobileConfig {
-    /// Server WebSocket URL (e.g., "wss://001.sg.97688.io:443/api/v1/ws")
+    /// Server WebSocket URL (e.g., "wss://vpn.example.com:443/api/v1/ws")
     pub server_address: String,
     /// Path to identity key file
     pub identity_key_path: String,

@@ -55,11 +55,6 @@ impl WebSocketWriter {
         Ok(())
     }
 
-    /// Check if the underlying channel has been closed (writer task exited)
-    pub fn is_closed(&self) -> bool {
-        self.sender.is_closed()
-    }
-
     /// Build a writer directly from a channel sender (tests only).
     #[cfg(test)]
     pub(crate) fn from_sender(sender: tokio::sync::mpsc::Sender<Message>) -> Self {
@@ -90,6 +85,17 @@ impl WebSocketTaskHandle {
         let _ = self.shutdown_tx.send(());
         for join in std::mem::take(&mut self.joins) {
             let _ = join.await;
+        }
+    }
+
+    /// Handle with no helper tasks, for unit tests that build tunnel state
+    /// directly without a live WebSocket.
+    #[cfg(test)]
+    pub(crate) fn noop() -> Self {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        Self {
+            shutdown_tx,
+            joins: Vec::new(),
         }
     }
 }

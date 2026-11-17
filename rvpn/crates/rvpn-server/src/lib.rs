@@ -2,7 +2,10 @@
 
 pub mod config;
 pub mod decoy;
+pub mod egress;
+pub mod firewall;
 pub mod handler;
+pub mod private_files;
 pub mod tun_server;
 
 #[cfg(test)]

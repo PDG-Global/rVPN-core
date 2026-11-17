@@ -44,6 +44,7 @@ use rvpn_core::protocol::{
 };
 
 use crate::android_tun::{android_log, TunClientState};
+use crate::server_hello::ServerSecurity;
 
 // tun_log!/tun_log_error! come from android_tun.rs via #[macro_use] in lib.rs.
 
@@ -131,7 +132,7 @@ pub(crate) struct AndroidServerSession {
     /// at construction from `server_bundle.identity_key`. Kotlin reads this
     /// via the JNI wrapper after the tunnel reaches `Connected` to capture
     /// the TOFU pin on first connect.
-    server_identity_pin_actual: String,
+    security: ServerSecurity,
     /// Start/reconnect loop running flag (prevents duplicate loops)
     is_started: AtomicBool,
     /// Whether the reconnect loop should keep retrying
@@ -184,7 +185,7 @@ impl AndroidServerSession {
         server_port: u16,
         server_path: String,
         server_bundle: X3DHPublicBundle,
-        server_identity_pin_actual: String,
+        security: ServerSecurity,
         chan_cap: usize,
         is_default: bool,
     ) -> Self {
@@ -203,7 +204,7 @@ impl AndroidServerSession {
             mtu: Arc::new(std::sync::Mutex::new(1420)),
             shutdown_tx,
             server_bundle,
-            server_identity_pin_actual,
+            security,
             is_started: AtomicBool::new(false),
             reconnect_enabled: AtomicBool::new(false), // Disabled by default; FFI start enables
             reconnect_max_attempts: AtomicU32::new(0), // 0 = unlimited
@@ -222,8 +223,16 @@ impl AndroidServerSession {
 
     /// Canonical `ik:1:<base32>` pin of the server this session was
     /// constructed against.
-    pub(crate) fn server_identity_pin(&self) -> &str {
-        &self.server_identity_pin_actual
+    pub(crate) fn server_identity_pin(&self) -> String {
+        self.security.actual_pin().unwrap_or_default()
+    }
+
+    pub(crate) fn signed_x25519_seen(&self) -> bool {
+        self.security.signed_x25519_seen()
+    }
+
+    pub(crate) fn security(&self) -> ServerSecurity {
+        self.security.clone()
     }
 
     /// Record a state transition. Kotlin learns state by polling
@@ -492,76 +501,13 @@ impl AndroidServerSession {
                 let server_hello: HandshakeMessage =
                     serde_json::from_slice(&data).context("Failed to parse ServerHello message")?;
 
-                match server_hello {
-                    HandshakeMessage::ServerHello {
-                        ephemeral_key: _server_ephemeral,
-                        identity_key: server_identity_key,
-                        signed_prekey: server_signed_prekey,
-                        prekey_signature: server_prekey_signature,
-                    } => {
-                        tun_log!("[AndroidTun] Received ServerHello with ephemeral key");
-
-                        // Use wire values for X3DH. Ignoring them and running
-                        // agreement against the pre-loaded on-disk bundle
-                        // silently breaks every connection whenever the disk
-                        // copy drifts from what the server is actually running
-                        // (e.g. after any `rvpn-server prekey-bundle` run).
-                        // Mirrors the working pattern in ios_tun.rs.
-                        let server_identity_key: [u8; 32] =
-                            server_identity_key.as_slice().try_into().map_err(|_| {
-                                anyhow::anyhow!("Server identity key has invalid length")
-                            })?;
-                        let server_signed_prekey: [u8; 32] =
-                            server_signed_prekey.as_slice().try_into().map_err(|_| {
-                                anyhow::anyhow!("Server signed prekey has invalid length")
-                            })?;
-                        let prekey_signature: [u8; 64] = server_prekey_signature
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("Prekey signature has invalid length"))?;
-
-                        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
-                            &server_identity_key,
-                        )
-                        .map_err(|e| anyhow::anyhow!("Invalid server identity key: {}", e))?;
-                        let signature = ed25519_dalek::Signature::from_bytes(&prekey_signature);
-                        ed25519_dalek::Verifier::verify(
-                            &verifying_key,
-                            &server_signed_prekey,
-                            &signature,
-                        )
-                        .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
-                        tun_log!("[AndroidTun] Server prekey signature verified");
-
-                        let server_bundle_from_hello = X3DHPublicBundle {
-                            identity_key: server_identity_key,
-                            identity_x25519_key: self.server_bundle.identity_x25519_key,
-                            signed_prekey: server_signed_prekey,
-                            prekey_signature,
-                            one_time_prekey: None,
-                            identity_key_version: self.server_bundle.identity_key_version,
-                            rotation_signature: self.server_bundle.rotation_signature,
-                        };
-
-                        let (shared_secret, _x3dh_material) = initiator
-                            .agree(&server_bundle_from_hello)
-                            .context("X3DH key agreement failed")?;
-
-                        tun_log!("[AndroidTun] X3DH shared secret derived successfully");
-
-                        // Initialize Double Ratchet as Alice (initiator)
-                        // In X3DH, the server (Bob) doesn't generate an ephemeral key.
-                        // The _server_ephemeral field is empty - init_alice doesn't use this parameter.
-                        let ratchet = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-
-                        tun_log!("[AndroidTun] Double Ratchet initialized as Alice (initiator)");
-
-                        Ok(ratchet)
-                    }
-                    _ => Err(anyhow::anyhow!(
-                        "Unexpected handshake message type from server"
-                    )),
-                }
+                let validated = self.security.validate(server_hello, &self.server_bundle)?;
+                let (shared_secret, _) = initiator
+                    .agree(&validated.bundle)
+                    .context("X3DH key agreement failed")?;
+                validated.commit(&self.security);
+                tun_log!("[AndroidTun] Server identity validated and Double Ratchet initialized");
+                Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32]))
             }
             _ => Err(anyhow::anyhow!("Expected binary message during handshake")),
         }
@@ -1282,9 +1228,11 @@ impl AndroidServerSession {
                     // Routed packets stashed for this session have no exit
                     // left — drop them rather than stalling flows forever.
                     client.drop_pending("max reconnection attempts reached");
+                    #[cfg(target_os = "android")]
+                    crate::android_tun_ffi::set_last_error("Max reconnection attempts reached");
                     client
                         .notify_state(
-                            TunClientState::Error,
+                            TunClientState::Terminal,
                             None,
                             "Max reconnection attempts reached",
                         )
@@ -1329,6 +1277,17 @@ impl AndroidServerSession {
                         had_successful_session = true;
                     }
                     Err(e) => {
+                        if let Some(message) = ServerSecurity::security_failure_message(&e) {
+                            tun_log_error!("[AndroidTun] {}", message);
+                            client.reconnect_enabled.store(false, Ordering::Relaxed);
+                            client.drop_pending("terminal server security failure");
+                            #[cfg(target_os = "android")]
+                            crate::android_tun_ffi::set_last_error(&message);
+                            client
+                                .notify_state(TunClientState::Terminal, None, &message)
+                                .await;
+                            break;
+                        }
                         tun_log_error!(
                             "[AndroidTun] Connection failed (attempt {}): {}",
                             attempts + 1,
@@ -1441,6 +1400,12 @@ mod tests {
     /// pending-queue tests. The runtime is only needed for the `Handle` in
     /// `AndroidSharedContext`; nothing is spawned on it.
     fn test_session() -> (Arc<AndroidServerSession>, tokio::runtime::Runtime) {
+        test_session_with_signed_state(false)
+    }
+
+    fn test_session_with_signed_state(
+        signed_x25519_seen: bool,
+    ) -> (Arc<AndroidServerSession>, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1460,6 +1425,7 @@ mod tests {
             one_time_prekey: None,
             identity_key_version: 1,
             rotation_signature: None,
+            identity_x25519_signature: None,
         };
         let session = Arc::new(AndroidServerSession::new(
             shared,
@@ -1467,12 +1433,28 @@ mod tests {
             "127.0.0.1".parse().unwrap(),
             443,
             "/connect".to_string(),
-            bundle,
-            "ik:1:test".to_string(),
+            bundle.clone(),
+            ServerSecurity::new(None, signed_x25519_seen, &bundle).unwrap(),
             64,    // chan_cap
             false, // is_default
         ));
         (session, rt)
+    }
+
+    #[test]
+    fn recreated_session_rejects_unsigned_downgrade_with_persisted_state() {
+        let (session, _rt) = test_session_with_signed_state(true);
+        let mut bundle = rvpn_core::crypto::X3DHResponder::new().get_public_bundle();
+        bundle.identity_x25519_signature = None;
+        let unsigned = HandshakeMessage::ServerHello {
+            ephemeral_key: vec![],
+            signed_prekey: bundle.signed_prekey.to_vec(),
+            prekey_signature: bundle.prekey_signature.to_vec(),
+            identity_key: bundle.identity_key.to_vec(),
+            identity_x25519_key: None,
+            identity_x25519_signature: None,
+        };
+        assert!(session.security.validate(unsigned, &bundle).is_err());
     }
 
     /// Minimal IPv4 packet with the given src/dst and a marker byte at the

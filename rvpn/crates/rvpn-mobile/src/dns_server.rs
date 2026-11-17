@@ -393,8 +393,17 @@ impl DnsServer {
     }
 
 
-    /// Try to bind with fallback ports (5453, 5353, 1053, etc.)
+    /// Try to bind with fallback ports (5453, 5353, 1053, etc.). Port zero
+    /// requests one OS-assigned port and never falls back to a fixed port.
     async fn try_bind_with_fallback(primary: SocketAddr) -> Result<UdpSocket> {
+        if primary.port() == 0 {
+            let socket = UdpSocket::bind(primary)
+                .await
+                .with_context(|| format!("Failed to bind DNS to {}", primary))?;
+            info!("DNS server bound to {}", socket.local_addr()?);
+            return Ok(socket);
+        }
+
         let ports = [primary.port(), 5353, 1053, 15353, 1153];
         let ip = primary.ip();
 
@@ -416,6 +425,14 @@ impl DnsServer {
 
     /// Start the DNS server (runs indefinitely)
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        self.run_with_ready(|_| {}).await
+    }
+
+    /// Start the DNS server and report its actual bound address before serving.
+    pub async fn run_with_ready<F>(self: Arc<Self>, ready: F) -> Result<()>
+    where
+        F: FnOnce(SocketAddr) + Send,
+    {
         let bind_addr: SocketAddr = self.bind_addr.parse()
             .context("Invalid bind address")?;
 
@@ -424,6 +441,7 @@ impl DnsServer {
             Self::try_bind_with_fallback(bind_addr).await
                 .context("Failed to bind DNS UDP socket on any port")?
         );
+        ready(socket.local_addr().context("Failed to read DNS bound address")?);
 
         // Use a larger buffer to handle EDNS/larger responses
         let mut buf = [0u8; 4096];
@@ -1058,7 +1076,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_root_probe_answered_locally() {
+    async fn test_full_tunnel_never_uses_split_dns_bypass() {
+        let config = rvpn_split_tunnel::SplitTunnelConfig {
+            enabled: false,
+            builtin_bypass_countries: vec!["CN".to_string()],
+            block_ads: false,
+            ..Default::default()
+        };
+        let split_tunnel = SplitTunnel::new(
+            config,
+            Arc::new(rvpn_split_tunnel::DnsResolver::new(true, 14400, 1000, false, true, vec![])),
+        ).await.unwrap();
+        let server = DnsServer::new(split_tunnel);
+
+        let name = Name::from_ascii("www.baidu.com").unwrap();
+        assert_eq!(server.route_query(&name).await, RoutingDecision::Tunnel);
+    }
+
+    #[tokio::test]
+    async fn test_zero_port_reports_os_assigned_ready_address() {
+        let server = Arc::new(DnsServer::with_bind_addr(
+            test_split_tunnel().await,
+            "127.0.0.1:0".to_string(),
+        ));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            server.run_with_ready(move |addr| {
+                let _ = ready_tx.send(addr);
+            }).await
+        });
+
+        let addr = tokio::time::timeout(Duration::from_secs(1), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr.ip(), IpAddr::from([127, 0, 0, 1]));
+        assert_ne!(addr.port(), 0);
+        assert!(![5353, 1053, 15353, 1153].contains(&addr.port()));
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn test_root_query_answered_locally() {
         use std::time::Duration;
         use hickory_proto::op::{Message, MessageType, OpCode, Query};
         use rvpn_split_tunnel::SplitTunnelConfig;
@@ -1080,9 +1141,7 @@ mod tests {
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_addr = client_socket.local_addr().unwrap();
 
-        // The Android service discovers the DNS proxy by querying the root
-        // domain and expects a fast reply — it must be answered locally,
-        // never routed upstream (DoH may be down or slow).
+        // Root queries are answered locally, never routed upstream.
         let mut request = Message::new();
         request.set_id(0x1234);
         request.set_message_type(MessageType::Query);

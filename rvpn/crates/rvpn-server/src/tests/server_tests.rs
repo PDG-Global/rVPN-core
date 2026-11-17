@@ -9,7 +9,9 @@ use rvpn_core::protocol::{HandshakeMessage, ProtocolVersion, AuthMethod};
 /// Test basic server startup
 #[tokio::test]
 async fn test_server_startup() -> anyhow::Result<()> {
-    let config = crate::config::ServerConfig::default();
+    let directory = tempfile::tempdir()?;
+    let mut config = crate::config::ServerConfig::default();
+    crate::tests::fixtures::configure_test_keys(&mut config, directory.path());
     let _handler = crate::handler::VpnHandler::new(config)?;
 
     // Just verify we can create the handler
@@ -154,7 +156,10 @@ async fn relay_test_rig(
     use futures_util::StreamExt;
     use tokio::io::AsyncReadExt;
 
-    let handler = crate::handler::VpnHandler::new(crate::config::ServerConfig::default())?;
+    let key_directory = tempfile::tempdir()?;
+    let mut config = crate::config::ServerConfig::default();
+    crate::tests::fixtures::configure_test_keys(&mut config, key_directory.path());
+    let handler = crate::handler::VpnHandler::new(config)?;
 
     // TCP origin the relay will target.
     let target_listener = TcpListener::bind("127.0.0.1:0").await?;

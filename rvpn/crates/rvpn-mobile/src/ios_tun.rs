@@ -35,6 +35,7 @@ use rvpn_split_tunnel::{Router, DEFAULT_SERVER_NAME};
 
 use crate::ffi::{MobileServerEntry, TunConfig};
 use crate::route_map::RouteMap;
+use crate::server_hello::ServerSecurity;
 use crate::server_session::{ServerSession, SharedContext};
 
 /// Simple object pool for `Vec<u8>` to reduce per-packet heap allocation churn.
@@ -106,7 +107,9 @@ pub(crate) fn rss_bytes_now() -> u64 {
     (hi << 32) | lo
 }
 #[cfg(not(target_vendor = "apple"))]
-pub(crate) fn rss_bytes_now() -> u64 { 0 }
+pub(crate) fn rss_bytes_now() -> u64 {
+    0
+}
 
 /// Bytes of memory the process may still allocate before iOS jetsams it.
 /// Always available for the same reason as `rss_bytes_now`.
@@ -118,7 +121,9 @@ pub(crate) fn headroom_bytes_now() -> u64 {
     unsafe { os_proc_available_memory() }
 }
 #[cfg(not(target_vendor = "apple"))]
-pub(crate) fn headroom_bytes_now() -> u64 { 0 }
+pub(crate) fn headroom_bytes_now() -> u64 {
+    0
+}
 
 /// Get the current resident set size (RSS) in bytes using Mach task_info.
 /// Returns 0 on failure.
@@ -173,8 +178,8 @@ pub(crate) fn jetsam_headroom_bytes() -> u64 {
 #[cfg(feature = "diagnostics")]
 #[repr(C)]
 #[allow(dead_code)] // blocks_in_use/max_size_in_use/size_allocated are
-// write-only padding for the ABI — the struct must span all 32 bytes even
-// though we only read size_in_use.
+                    // write-only padding for the ABI — the struct must span all 32 bytes even
+                    // though we only read size_in_use.
 struct MallocStatistics {
     blocks_in_use: libc::c_uint,
     _pad: u32,
@@ -509,6 +514,14 @@ pub(crate) fn mi_commit_after_collect() -> u64 {
 }
 
 /// Connection state
+///
+/// `Error` is transient — the reconnect loop is still running and will move
+/// back to `Connecting` on its own (network switch, brief server outage).
+/// `Terminal` means the reconnect loop has given up (server security failure
+/// or max attempts — a user-disabled-reconnect stop exits silently and never
+/// notifies this state): the only way out is an explicit stop/retry from the
+/// app. Swift's kill switch tears the tunnel into a block-only state only on
+/// `Terminal`, so a routine relay end must never strand the user.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TunClientState {
     Init = 0,
@@ -516,6 +529,7 @@ pub enum TunClientState {
     IpAssigned = 2,
     Connected = 3,
     Error = 4,
+    Terminal = 5,
 }
 
 impl From<i32> for TunClientState {
@@ -525,7 +539,8 @@ impl From<i32> for TunClientState {
             1 => TunClientState::Connecting,
             2 => TunClientState::IpAssigned,
             3 => TunClientState::Connected,
-            _ => TunClientState::Error,
+            4 => TunClientState::Error,
+            _ => TunClientState::Terminal,
         }
     }
 }
@@ -600,6 +615,10 @@ impl IosTunClient {
     /// the Runtime from being transitively dropped inside a tokio worker,
     /// which would panic in `BlockingPool::shutdown`.
     pub fn new(config: &TunConfig, handle: tokio::runtime::Handle) -> Result<Self> {
+        crate::ffi::ensure_tofu_allowed(
+            config.server_identity_pin.as_deref(),
+            config.trust_on_first_use,
+        )?;
         // Parse server URL
         let (host, port, path) = Self::parse_server_url(&config.server_address)?;
 
@@ -610,8 +629,7 @@ impl IosTunClient {
         // By resolving here (before DNS is hijacked), connects dial the IP directly.
         // Failure is NOT fatal: `None` makes connects fall back to dialing the hostname
         // (which works as long as the tunnel's DNS capture isn't live yet).
-        let server_ip: Option<std::net::IpAddr> = if let Ok(ip) = host.parse::<std::net::IpAddr>()
-        {
+        let server_ip: Option<std::net::IpAddr> = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             Some(ip)
         } else {
             std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:{}", host, port))
@@ -633,8 +651,10 @@ impl IosTunClient {
 
         // Load prekey bundle and enforce the TOFU pin (if configured) for the
         // default server.
-        let (server_bundle, server_identity_pin_actual) =
-            Self::load_bundle_and_pin(&config.prekey_bundle_path, config.server_identity_pin.as_deref())?;
+        let (server_bundle, _) = Self::load_bundle_and_pin(
+            &config.prekey_bundle_path,
+            config.server_identity_pin.as_deref(),
+        )?;
 
         // Create channels for Swift TUN communication.
         // iOS keeps channels modest to stay within the 50 MB NE memory limit,
@@ -687,18 +707,25 @@ impl IosTunClient {
             server_ip,
             port,
             path,
-            server_bundle,
-            server_identity_pin_actual,
+            server_bundle.clone(),
+            ServerSecurity::new(
+                config.server_identity_pin.clone(),
+                config.signed_x25519_seen,
+                &server_bundle,
+            )?,
             chan_cap,
-            true,  // is_default
-            None,  // server_sni — default server uses its URL host for SNI
+            true, // is_default
+            None, // server_sni — default server uses its URL host for SNI
             #[cfg(feature = "diagnostics")]
             mem_log_path,
         ));
 
         // --- Multi-server setup (no-op when extra_servers is empty) ---
         let mut sessions: HashMap<String, Arc<ServerSession>> = HashMap::new();
-        sessions.insert(DEFAULT_SERVER_NAME.to_string(), Arc::clone(&default_session));
+        sessions.insert(
+            DEFAULT_SERVER_NAME.to_string(),
+            Arc::clone(&default_session),
+        );
 
         let mut router: Option<Arc<Router>> = None;
         let mut route_map: Option<Arc<std::sync::Mutex<RouteMap>>> = None;
@@ -707,6 +734,10 @@ impl IosTunClient {
 
             let mut known: Vec<&str> = vec![DEFAULT_SERVER_NAME];
             for entry in &config.extra_servers {
+                crate::ffi::ensure_tofu_allowed(
+                    entry.server_identity_pin.as_deref(),
+                    config.trust_on_first_use,
+                )?;
                 let (host, port, path) = Self::parse_server_url(&entry.address)
                     .with_context(|| format!("extraServers[{}]: invalid address", entry.name))?;
                 // Pre-resolve to an IP for the same DNS-circularity reason as
@@ -731,9 +762,11 @@ impl IosTunClient {
                     ),
                 }
 
-                let (bundle, pin) =
-                    Self::load_bundle_and_pin(&entry.prekey_bundle_path, entry.server_identity_pin.as_deref())
-                        .with_context(|| format!("extraServers[{}]", entry.name))?;
+                let (bundle, _) = Self::load_bundle_and_pin(
+                    &entry.prekey_bundle_path,
+                    entry.server_identity_pin.as_deref(),
+                )
+                .with_context(|| format!("extraServers[{}]", entry.name))?;
 
                 // Extra sessions do NOT get the diagnostics mem_log_path —
                 // they would truncate each other's (and the default
@@ -744,8 +777,12 @@ impl IosTunClient {
                     server_ip,
                     port,
                     path,
-                    bundle,
-                    pin,
+                    bundle.clone(),
+                    ServerSecurity::new(
+                        entry.server_identity_pin.clone(),
+                        entry.signed_x25519_seen,
+                        &bundle,
+                    )?,
                     chan_cap,
                     false, // is_default
                     entry.sni_hostname.clone(),
@@ -796,21 +833,24 @@ impl IosTunClient {
         prekey_bundle_path: &str,
         expected_pin: Option<&str>,
     ) -> Result<(X3DHPublicBundle, String)> {
-        let bundle_json = std::fs::read_to_string(prekey_bundle_path)
-            .context("Failed to read prekey bundle")?;
+        let bundle_json =
+            std::fs::read_to_string(prekey_bundle_path).context("Failed to read prekey bundle")?;
         let server_bundle: X3DHPublicBundle =
             serde_json::from_str(&bundle_json).context("Failed to parse prekey bundle JSON")?;
 
         let pin_actual = rvpn_core::identity_pin::encode_identity_pin(&server_bundle.identity_key)
             .context("Failed to encode server identity pin")?;
         if let Some(expected) = expected_pin {
-            let matched = rvpn_core::identity_pin::pins_match(expected, &server_bundle.identity_key)
-                .context("Configured server_identity_pin is not a valid pin string")?;
+            let matched =
+                rvpn_core::identity_pin::pins_match(expected, &server_bundle.identity_key)
+                    .context("Configured server_identity_pin is not a valid pin string")?;
             if !matched {
-                return Err(anyhow::Error::from(rvpn_core::Error::ServerIdentityMismatch {
-                    expected: expected.to_string(),
-                    actual: pin_actual,
-                }));
+                return Err(anyhow::Error::from(
+                    rvpn_core::Error::ServerIdentityMismatch {
+                        expected: expected.to_string(),
+                        actual: pin_actual,
+                    },
+                ));
             }
         }
         Ok((server_bundle, pin_actual))
@@ -842,7 +882,7 @@ impl IosTunClient {
     /// key. The app FFI reads this via `rvpn_tun_get_server_identity()`
     /// after the tunnel reaches `Connected` to persist the TOFU pin on the
     /// first connect.
-    pub fn server_identity_pin(&self) -> &str {
+    pub fn server_identity_pin(&self) -> String {
         self.default_session.server_identity_pin()
     }
 
@@ -1020,11 +1060,7 @@ impl IosTunClient {
     /// Returns `None` for the default exit (single-server configs, non-IPv4
     /// or unparseable packets, and anything no rule matches).
     fn choose_exit(&self, packet: &[u8]) -> Option<String> {
-        choose_exit_name(
-            self.router.as_deref(),
-            self.route_map.as_deref(),
-            packet,
-        )
+        choose_exit_name(self.router.as_deref(), self.route_map.as_deref(), packet)
     }
 
     /// Start the named session's connect/reconnect loop if it isn't running
@@ -1047,9 +1083,16 @@ impl IosTunClient {
     /// Canonical `ik:1:<base32>` pin of the named exit server, for per-exit
     /// TOFU pin capture. Returns `None` for unknown names.
     pub fn server_identity_pin_for(&self, name: &str) -> Option<String> {
-        self.sessions
-            .get(name)
-            .map(|s| s.server_identity_pin().to_string())
+        self.sessions.get(name).map(|s| s.server_identity_pin())
+    }
+
+    pub fn signed_x25519_seen_for(&self, name: &str) -> Option<bool> {
+        self.sessions.get(name).map(|s| s.signed_x25519_seen())
+    }
+
+    #[allow(dead_code)] // Used by the DNS proxy startup in ios_tun_ffi.rs (dns feature)
+    pub(crate) fn default_security(&self) -> ServerSecurity {
+        self.default_session.security()
     }
 
     /// The compiled multi-server router, if any (shared with the DNS layer).
@@ -1064,10 +1107,7 @@ impl IosTunClient {
         self.route_map.clone()
     }
 
-    /// Per-extra-exit connection info for the DNS layer's DoH client pool:
-    /// (name, host, port, base path, prekey bundle, TLS resumption store).
-    /// Empty when single-server. The store is the exit session's own, so the
-    /// exit's `/dns` WebSocket reconnects resume from the same TLS tickets.
+    /// Per-extra-exit connection and security info for the DNS layer's DoH pool.
     #[allow(dead_code)] // Used by the DNS proxy startup in ios_tun_ffi.rs (dns feature)
     pub(crate) fn extra_session_dns_info(
         &self,
@@ -1077,6 +1117,7 @@ impl IosTunClient {
         u16,
         String,
         X3DHPublicBundle,
+        ServerSecurity,
         rvpn_tls::ResumptionStore,
     )> {
         self.sessions
@@ -1089,6 +1130,7 @@ impl IosTunClient {
                     s.server_port(),
                     s.server_path().to_string(),
                     s.server_bundle().clone(),
+                    s.security(),
                     s.resumption_store(),
                 )
             })
@@ -1156,7 +1198,8 @@ impl IosTunClient {
 
     /// Set initial reconnection delay (ms)
     pub fn set_reconnect_initial_delay_ms(&self, delay_ms: u64) {
-        self.default_session.set_reconnect_initial_delay_ms(delay_ms);
+        self.default_session
+            .set_reconnect_initial_delay_ms(delay_ms);
     }
 
     /// Set maximum reconnection delay (ms)
@@ -1245,7 +1288,11 @@ mod tests {
         assert_eq!(TunClientState::from(2), TunClientState::IpAssigned);
         assert_eq!(TunClientState::from(3), TunClientState::Connected);
         assert_eq!(TunClientState::from(4), TunClientState::Error);
-        assert_eq!(TunClientState::from(99), TunClientState::Error);
+        assert_eq!(TunClientState::from(5), TunClientState::Terminal);
+        // Unknown values must fail closed (Terminal), never collapse to a
+        // retryable Error — Swift tears the tunnel down only on Terminal.
+        assert_eq!(TunClientState::from(99), TunClientState::Terminal);
+        assert_eq!(TunClientState::from(-1), TunClientState::Terminal);
     }
 
     #[test]
@@ -1269,6 +1316,7 @@ mod tests {
             address: "wss://127.0.0.1:443/connect".to_string(),
             prekey_bundle_path: "/nonexistent/bundle.json".to_string(),
             server_identity_pin: None,
+            signed_x25519_seen: false,
             sni_hostname: None,
         }
     }
@@ -1276,11 +1324,10 @@ mod tests {
     #[test]
     fn test_validate_extra_server_names() {
         // Valid: distinct, non-reserved names.
-        assert!(IosTunClient::validate_extra_server_names(&[
-            extra_entry("sg"),
-            extra_entry("us")
-        ])
-        .is_ok());
+        assert!(
+            IosTunClient::validate_extra_server_names(&[extra_entry("sg"), extra_entry("us")])
+                .is_ok()
+        );
 
         // Reserved name rejected.
         let err = IosTunClient::validate_extra_server_names(&[extra_entry("default")])
@@ -1289,9 +1336,10 @@ mod tests {
         assert!(err.contains("reserved"), "unexpected error: {}", err);
 
         // Duplicates rejected.
-        let err = IosTunClient::validate_extra_server_names(&[extra_entry("sg"), extra_entry("sg")])
-            .unwrap_err()
-            .to_string();
+        let err =
+            IosTunClient::validate_extra_server_names(&[extra_entry("sg"), extra_entry("sg")])
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("duplicate"), "unexpected error: {}", err);
 
         // Empty name rejected.
@@ -1333,10 +1381,7 @@ mod tests {
         let route_map = std::sync::Mutex::new(RouteMap::new());
         let mut v6 = vec![0u8; 40];
         v6[0] = 0x60;
-        assert_eq!(
-            choose_exit_name(Some(&router), Some(&route_map), &v6),
-            None
-        );
+        assert_eq!(choose_exit_name(Some(&router), Some(&route_map), &v6), None);
         assert_eq!(
             choose_exit_name(Some(&router), Some(&route_map), &packet[..10]),
             None
@@ -1390,11 +1435,10 @@ mod tests {
         let router = test_router();
         let route_map = std::sync::Mutex::new(RouteMap::new());
         let dst = Ipv4Addr::new(8, 8, 8, 8);
-        route_map.lock().unwrap().insert(
-            IpAddr::V4(dst),
-            "hk",
-            std::time::Duration::from_secs(0),
-        );
+        route_map
+            .lock()
+            .unwrap()
+            .insert(IpAddr::V4(dst), "hk", std::time::Duration::from_secs(0));
         // Expired dynamic entry → static rule decides.
         assert_eq!(
             choose_exit_name(Some(&router), Some(&route_map), &v4_packet(dst)).as_deref(),

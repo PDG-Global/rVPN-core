@@ -2,6 +2,20 @@
 
 All notable changes to rVPN are documented in this file.
 
+## [Unreleased]
+
+### Security
+
+- **Fixed skipped-key lookup in the Double Ratchet** so out-of-order
+  messages decrypt instead of failing (previously could drop late
+  packets).
+- **Added an optional Ed25519 signature binding the server's identity
+  X25519 key.** The mobile library verifies it when present; unsigned
+  legacy bundles are still accepted. Note: servers do not yet produce the
+  signature, and clients do not yet require it — this change ships the
+  format and verification path only; enforcement follows in a later
+  release. Until then the legacy path remains a downgrade route.
+
 ## [1.3.6] — 2026-09-25
 
 Patch release: a built-in stats dashboard for the CLI client, and a round

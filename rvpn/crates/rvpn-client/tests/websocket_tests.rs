@@ -142,7 +142,7 @@ fn test_keepalive_interval_jitter_range() {
 fn test_websocket_request_uri_format() {
     use tungstenite::client::IntoClientRequest;
 
-    let host = "002.hk.97688.io";
+    let host = "node1.example.com";
     let port: u16 = 443;
     let path = "/api/v1/ws/mux";
 
@@ -185,7 +185,7 @@ fn test_websocket_request_uri_format() {
 fn test_websocket_request_uri_non_default_port() {
     use tungstenite::client::IntoClientRequest;
 
-    let host = "002.hk.97688.io";
+    let host = "node1.example.com";
     let port: u16 = 8443;
     let path = "/api/v1/ws/mux";
 
@@ -279,7 +279,7 @@ async fn test_concurrent_websocket_connections() -> Result<()> {
 fn test_chrome_like_websocket_headers() {
     use tungstenite::handshake::client::generate_key;
 
-    let host = "002.hk.97688.io";
+    let host = "node1.example.com";
     let port: u16 = 443;
     let path = "/api/v1/ws";
     let ws_key = generate_key();

@@ -196,13 +196,14 @@ async fn handle_direct_connection(
 
     info!("Direct connection established to {}", target_addr);
 
-    let (mut client_read, mut client_write) = socket.split();
-    let (mut target_read, mut target_write) = target.split();
-
-    let (up, down) = tokio::try_join!(
-        tokio::io::copy(&mut client_read, &mut target_write),
-        tokio::io::copy(&mut target_read, &mut client_write)
-    )?;
+    // copy_bidirectional propagates shutdown: when either peer sends FIN,
+    // the opposite write half is shut down so the surviving peer observes
+    // EOF and closes. A try_join!(copy, copy) pair instead waits for BOTH
+    // directions to see EOF, so a server-side close with a client holding
+    // an idle keep-alive parked the task forever with the target socket
+    // stuck in CLOSE-WAIT (observed as an FD/memory leak on long-running
+    // clients).
+    let (up, down) = tokio::io::copy_bidirectional(&mut socket, &mut target).await?;
     crate::dashboard::record_bytes_up(up);
     crate::dashboard::record_bytes_down(down);
 

@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::TunNetworkConfig;
+use crate::egress::permitted_tun_destination;
 
 /// TUN server that manages the server-side TUN interface
 pub struct TunServer {
@@ -411,8 +412,13 @@ impl TunServer {
         count
     }
 
-    /// Write packet to TUN interface (for sending to kernel/network)
+    /// Write a permitted packet to TUN; policy drops never tear down the session.
     pub async fn write_to_tun(&self, packet: &[u8]) -> Result<()> {
+        if permitted_tun_destination(packet).is_none() {
+            debug!("Dropping malformed or forbidden TUN uplink packet");
+            return Ok(());
+        }
+
         let device = self
             .device
             .as_ref()
@@ -554,6 +560,7 @@ mod tests {
             mtu: 1420,
             interface_name: "tun-test".to_string(),
             dns_servers: vec![],
+            shaper_bandwidth_kbit: None,
         }
     }
 
@@ -601,6 +608,30 @@ mod tests {
         ts.unregister_client(ip, "ik:alice", &tx_new).await.unwrap();
         let senders = ts.client_senders.read().await;
         assert!(!senders.contains_key(&ip));
+    }
+
+    #[tokio::test]
+    async fn denied_packet_does_not_poison_the_next_packet_or_session() {
+        let _guard = crate::egress::host_policy_test_lock().lock().unwrap();
+        crate::egress::set_host_policy_for_test(&[]);
+        fn packet(destination: std::net::Ipv4Addr) -> Vec<u8> {
+            let mut packet = vec![0u8; 20];
+            packet[0] = 0x45;
+            packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+            packet[16..20].copy_from_slice(&destination.octets());
+            packet
+        }
+
+        let ts = TunServer::new(&test_config()).unwrap();
+        ts.write_to_tun(&packet("10.0.0.1".parse().unwrap()))
+            .await
+            .unwrap();
+        ts.write_to_tun(&[0x45, 0, 0]).await.unwrap();
+        let error = ts
+            .write_to_tun(&packet("8.8.8.8".parse().unwrap()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("TUN device not initialized"));
     }
 
     #[tokio::test]

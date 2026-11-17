@@ -20,7 +20,7 @@
 //! ```sh
 //! cargo run -p rvpn-mobile --example reconnect_soak \
 //!   --features ios-direct-tun,dns --release -- \
-//!   --server wss://003.hk.97688.io/api/v1/ws/tun \
+//!   --server wss://<your-disposable-test-vm>/api/v1/ws/tun \
 //!   --identity /path/to/identity.key \
 //!   --bundle /path/to/hk.prekey-bundle.json \
 //!   --cycles 100 --interval-secs 10
@@ -72,8 +72,9 @@ fn wait_for_state(client: &Arc<IosTunClient>, want: TunClientState, timeout: Dur
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let server = arg_value(&args, "--server")
-        .unwrap_or_else(|| "wss://003.hk.97688.io/api/v1/ws/tun".to_string());
+    // --server is required with no default, so a soak never hits a live
+    // production server by accident. Point this at a disposable VM you spun up yourself.
+    let server = arg_value(&args, "--server").expect("--server <url> required");
     let identity = arg_value(&args, "--identity").expect("--identity <path> required");
     let bundle = arg_value(&args, "--bundle").expect("--bundle <path> required");
     let cycles: u32 = arg_value(&args, "--cycles")
@@ -105,6 +106,8 @@ fn main() {
         enable_dns_proxy: true,
         stealth_fingerprint: None,
         server_identity_pin: None,
+        signed_x25519_seen: false,
+        trust_on_first_use: true,
         country_ips_file: None,
         extra_servers: vec![],
         routing: Default::default(),
@@ -137,7 +140,10 @@ fn main() {
         let cycle_start = Instant::now();
         client.request_reconnect();
         if !wait_for_state(&client, TunClientState::Connected, Duration::from_secs(30)) {
-            eprintln!("cycle {}: reconnect did not reach Connected within 30s", cycle);
+            eprintln!(
+                "cycle {}: reconnect did not reach Connected within 30s",
+                cycle
+            );
             std::process::exit(1);
         }
         // Hold the remainder of the interval so each cycle spans a

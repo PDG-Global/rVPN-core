@@ -1,0 +1,566 @@
+//! SOCKS5 Server for rvpn-mobile
+//!
+//! This module implements a minimal SOCKS5 server that runs in-process
+//! and forwards connections through the VPN tunnel.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use anyhow::{Context as _, Result};
+use std::net::Ipv4Addr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, error, info, warn};
+
+/// Create a TCP listener with SO_REUSEADDR enabled
+/// 
+/// This is critical for iOS where the VPN extension may be restarted
+/// rapidly and we need to reuse the port immediately.
+fn create_reuse_listener(bind_addr: SocketAddr) -> Result<TcpListener> {
+    use std::net::TcpListener as StdTcpListener;
+    use socket2::{Domain, Socket, Type};
+
+    // Create socket with SO_REUSEADDR
+    let socket = Socket::new(
+        if bind_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 },
+        Type::STREAM,
+        None,
+    ).with_context(|| "Failed to create socket")?;
+
+    // Enable SO_REUSEADDR to allow rapid restarts
+    socket.set_reuse_address(true)
+        .with_context(|| "Failed to set SO_REUSEADDR")?;
+
+    // Bind to address
+    socket.bind(&bind_addr.into())
+        .with_context(|| format!("Failed to bind to {}", bind_addr))?;
+
+    // Listen for connections
+    socket.listen(128)
+        .with_context(|| "Failed to listen on socket")?;
+
+    // Set non-blocking for tokio
+    socket.set_nonblocking(true)
+        .with_context(|| "Failed to set non-blocking")?;
+
+    // Convert to std listener then tokio listener
+    let std_listener: StdTcpListener = socket.into();
+    TcpListener::from_std(std_listener)
+        .with_context(|| "Failed to create tokio listener")
+}
+
+/// SOCKS5 proxy server configuration
+#[derive(Debug, Clone)]
+pub struct Socks5ServerConfig {
+    /// Listen address
+    pub listen_addr: SocketAddr,
+}
+
+/// SOCKS5 server that handles connections and forwards to tunnel
+pub struct Socks5Server {
+    listen_addr: SocketAddr,
+}
+
+/// Handle to control a running SOCKS5 server
+#[derive(Clone)]
+pub struct Socks5ServerHandle {
+    /// Signal to stop the server
+    shutdown_tx: mpsc::Sender<()>,
+    /// Local address the server is bound to
+    pub local_addr: SocketAddr,
+}
+
+impl Socks5ServerHandle {
+    /// Stop the SOCKS5 server
+    pub async fn stop(&self) {
+        let _ = self.shutdown_tx.send(()).await;
+    }
+}
+
+impl Socks5Server {
+    /// Create a new SOCKS5 server
+    pub fn new(config: Socks5ServerConfig) -> Self {
+        Self {
+            listen_addr: config.listen_addr,
+        }
+    }
+
+    /// Run the SOCKS5 server with graceful shutdown support
+    /// 
+    /// This spawns a task that listens for SOCKS5 connections and forwards
+    /// them to the tunnel via the provided channel. Returns a handle that
+    /// can be used to stop the server.
+    pub async fn run_with_shutdown(
+        &self,
+        tunnel_sender: mpsc::Sender<TunnelRequest>,
+    ) -> Result<Socks5ServerHandle> {
+        // Use SO_REUSEADDR socket to allow rapid restarts (critical for iOS)
+        let listener = create_reuse_listener(self.listen_addr)
+            .with_context(|| format!("Failed to bind SOCKS5 proxy to {}", self.listen_addr))?;
+
+        let local_addr = listener.local_addr()?;
+        info!("SOCKS5 proxy listening on {}", local_addr);
+
+        // Create shutdown channel
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        
+        // Track active connections for graceful shutdown
+        let active_connections: Arc<RwLock<Vec<tokio::task::AbortHandle>>> = 
+            Arc::new(RwLock::new(Vec::new()));
+        let active_connections_clone = active_connections.clone();
+
+        // Spawn the accept loop
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Accept new connections
+                    result = listener.accept() => {
+                        match result {
+                            Ok((socket, addr)) => {
+                                // Enable TCP_NODELAY for low-latency SOCKS5 responses
+                                if let Err(e) = socket.set_nodelay(true) {
+                                    error!("Failed to set TCP_NODELAY: {}", e);
+                                }
+                                
+                                let sender = tunnel_sender.clone();
+                                let handle = tokio::spawn(async move {
+                                    if let Err(e) = handle_socks5_connection(socket, addr, sender).await {
+                                        error!("SOCKS5 connection error from {}: {}", addr, e);
+                                    }
+                                });
+                                
+                                // Track the connection
+                                let mut connections = active_connections_clone.write().await;
+                                connections.push(handle.abort_handle());
+                                
+                                // Clean up completed tasks periodically
+                                connections.retain(|h| !h.is_finished());
+                            }
+                            Err(e) => {
+                                error!("Failed to accept SOCKS5 connection: {}", e);
+                            }
+                        }
+                    }
+                    // Wait for shutdown signal
+                    _ = shutdown_rx.recv() => {
+                        info!("SOCKS5 server received shutdown signal");
+                        
+                        // Abort all active connections
+                        let mut connections = active_connections_clone.write().await;
+                        for handle in connections.drain(..) {
+                            handle.abort();
+                        }
+                        
+                        info!("SOCKS5 server stopped");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Socks5ServerHandle {
+            shutdown_tx,
+            local_addr,
+        })
+    }
+}
+
+/// Handle a single SOCKS5 connection
+///
+/// This function performs the SOCKS5 handshake, then hands off the socket to the tunnel
+/// for WebSocket-based relay. The tunnel will signal completion when the relay is done.
+async fn handle_socks5_connection(
+    mut socket: TcpStream,
+    addr: SocketAddr,
+    tunnel_sender: mpsc::Sender<TunnelRequest>,
+) -> Result<()> {
+    info!("[SOCKS5] New connection from {}", addr);
+
+    // 1. SOCKS5 handshake
+    let target_addr = match socks5_handshake(&mut socket).await {
+        Ok(Some(addr)) => {
+            info!("[SOCKS5] Handshake successful, target: {}", addr);
+            addr
+        }
+        Ok(None) => {
+            // UDP ASSOCIATE - already handled, no TCP relay needed
+            info!("[SOCKS5] UDP ASSOCIATE completed, closing TCP connection");
+            return Ok(());
+        }
+        Err(e) => {
+            error!("[SOCKS5] Handshake failed for {}: {}", addr, e);
+            return Err(e);
+        }
+    };
+
+    // 2. Send success response to SOCKS5 client
+    // Note: We send this BEFORE tunnel is ready because SOCKS5 protocol requires it
+    send_socks5_success(&mut socket).await?;
+    debug!("Sent SOCKS5 success response to {}", addr);
+
+    // 3. Create completion channel
+    let (completion_tx, mut completion_rx) = mpsc::channel::<Result<()>>(1);
+
+    // 4. Create tunnel request with the socket
+    let request = TunnelRequest {
+        target_address: target_addr.clone(),
+        socket,
+        completion_sender: completion_tx,
+    };
+
+    // 5. Send request to tunnel
+    tunnel_sender.send(request).await
+        .map_err(|_| anyhow::anyhow!("Tunnel channel closed"))?;
+
+    // 6. Wait for tunnel to signal completion
+    match completion_rx.recv().await {
+        Some(result) => {
+            match result {
+                Ok(()) => debug!("Tunnel relay completed successfully for {}", addr),
+                Err(e) => error!("Tunnel relay failed for {}: {}", addr, e),
+            }
+        }
+        None => {
+            error!("Completion channel closed unexpectedly for {}", addr);
+        }
+    }
+
+    debug!("SOCKS5 connection closed: {}", addr);
+    Ok(())
+}
+
+/// SOCKS5 handshake - parse target address
+async fn socks5_handshake(socket: &mut TcpStream) -> Result<Option<String>> {
+    // Send greeting (SOCKS5, no auth)
+    socket.write_all(&[0x05, 0x00]).await
+        .map_err(|e| anyhow::anyhow!("Failed to send greeting: {}", e))?;
+    
+    // CRITICAL: Flush to ensure response is sent immediately
+    // Without this, the response may be buffered and Swift client times out
+    socket.flush().await
+        .map_err(|e| anyhow::anyhow!("Failed to flush greeting: {}", e))?;
+    
+    info!("[SOCKS5] Sent greeting [0x05, 0x00] and flushed");
+    
+    // Read client greeting
+    let mut greeting = [0u8; 2];
+    socket.read_exact(&mut greeting).await
+        .map_err(|e| anyhow::anyhow!("Failed to read greeting: {}", e))?;
+    
+    if greeting[0] != 0x05 {
+        return Err(anyhow::anyhow!("Unsupported SOCKS version: {}", greeting[0]));
+    }
+    
+    let nmethods = greeting[1] as usize;
+    if nmethods == 0 {
+        return Err(anyhow::anyhow!("No methods provided"));
+    }
+    
+    // Read methods
+    let mut methods = vec![0u8; nmethods];
+    socket.read_exact(&mut methods).await
+        .map_err(|e| anyhow::anyhow!("Failed to read methods: {}", e))?;
+    
+    // We only support no-auth (0x00)
+    if !methods.contains(&0x00) {
+        return Err(anyhow::anyhow!("No supported auth methods: {:?}", methods));
+    }
+    
+    // Send no-auth response (0x00)
+    socket.write_all(&[0x05, 0x00]).await
+        .map_err(|e| anyhow::anyhow!("Failed to send auth response: {}", e))?;
+    
+    // CRITICAL: Flush to ensure response is sent immediately
+    // Without this, the response may be buffered and Swift client times out
+    socket.flush().await
+        .map_err(|e| anyhow::anyhow!("Failed to flush auth response: {}", e))?;
+    
+    info!("[SOCKS5] Sent auth response [0x05, 0x00] and flushed");
+    
+    // Read request
+    let mut header = [0u8; 4];
+    socket.read_exact(&mut header).await
+        .map_err(|e| anyhow::anyhow!("Failed to read request header: {}", e))?;
+    let cmd = header[1];
+    let atyp = header[3];
+    info!("[SOCKS5] Request: cmd={}, atyp={}", cmd, atyp);
+    
+    match cmd {
+        0x01 => {
+            // CONNECT command - handle below
+            info!("[SOCKS5] CONNECT command");
+        }
+        0x03 => {
+            // UDP ASSOCIATE command
+            info!("[SOCKS5] UDP ASSOCIATE command - handling UDP relay");
+            handle_udp_associate(socket).await?;
+            return Ok(None); // UDP ASSOCIATE handled, no target string needed
+        }
+        _ => {
+            // Command not supported
+            socket.write_all(&[0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+            return Err(anyhow::anyhow!("Command not supported: {}", cmd));
+        }
+    }
+    
+    // Parse address
+    let target = match atyp {
+        0x01 => {  // IPv4
+            let mut addr = [0u8; 4];
+            socket.read_exact(&mut addr).await
+                .map_err(|e| anyhow::anyhow!("Failed to read IPv4 addr: {}", e))?;
+            let port = read_port(socket).await
+                .map_err(|e| anyhow::anyhow!("Failed to read port: {}", e))?;
+            let target = format!("{}.{}.{}.{}:{}", addr[0], addr[1], addr[2], addr[3], port);
+            info!("[SOCKS5] IPv4 target: {}", target);
+            target
+        }
+        0x03 => {  // Domain
+            let mut len = [0u8; 1];
+            socket.read_exact(&mut len).await
+                .map_err(|e| anyhow::anyhow!("Failed to read domain len: {}", e))?;
+            let mut domain = vec![0u8; len[0] as usize];
+            socket.read_exact(&mut domain).await
+                .map_err(|e| anyhow::anyhow!("Failed to read domain: {}", e))?;
+            let port = read_port(socket).await
+                .map_err(|e| anyhow::anyhow!("Failed to read port: {}", e))?;
+            let target = format!("{}:{}", String::from_utf8_lossy(&domain), port);
+            info!("[SOCKS5] Domain target: {}", target);
+            target
+        }
+        0x04 => {  // IPv6
+            let mut addr = [0u8; 16];
+            socket.read_exact(&mut addr).await
+                .map_err(|e| anyhow::anyhow!("Failed to read IPv6 addr: {}", e))?;
+            let port = read_port(socket).await
+                .map_err(|e| anyhow::anyhow!("Failed to read port: {}", e))?;
+            let ip = std::net::Ipv6Addr::from(addr);
+            let target = format!("[{}]:{}", ip, port);
+            info!("[SOCKS5] IPv6 target: {}", target);
+            target
+        }
+        _ => {
+            socket.write_all(&[0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+            return Err(anyhow::anyhow!("Invalid address type: {}", atyp));
+        }
+    };
+    
+    Ok(Some(target))
+}
+    
+    // Read methods
+    let mut methods = vec![0u8; nmethods];
+    socket.read_exact(&mut methods).await
+        .map_err(|e| anyhow::anyhow!("Failed to read methods: {}", e))?;
+    info!("[SOCKS5] Methods: {:?}", methods);
+    
+    // Send no-auth response (0x00)
+    socket.write_all(&[0x05, 0x00]).await
+        .map_err(|e| anyhow::anyhow!("Failed to send auth response: {}", e))?;
+    
+    // CRITICAL: Flush to ensure response is sent immediately
+    // Without this, the response may be buffered and Swift client times out
+    socket.flush().await
+        .map_err(|e| anyhow::anyhow!("Failed to flush auth response: {}", e))?;
+    
+    info!("[SOCKS5] Sent auth response [0x05, 0x00] and flushed");
+    
+    // Read request
+    let mut header = [0u8; 4];
+    socket.read_exact(&mut header).await
+        .map_err(|e| anyhow::anyhow!("Failed to read request header: {}", e))?;
+    let cmd = header[1];
+    let atyp = header[3];
+    info!("[SOCKS5] Request: cmd={}, atyp={}", cmd, atyp);
+    
+    match cmd {
+        0x01 => {
+            // CONNECT command - handle below
+            info!("[SOCKS5] CONNECT command");
+        }
+        0x03 => {
+            // UDP ASSOCIATE command
+            info!("[SOCKS5] UDP ASSOCIATE command - handling UDP relay");
+            return handle_udp_associate(socket).await;
+        }
+        _ => {
+            // Command not supported
+            socket.write_all(&[0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+            return Err(anyhow::anyhow!("Command not supported: {}", cmd));
+        }
+    }
+    
+    // Parse address
+    let target = match atyp {
+        0x01 => {  // IPv4
+            let mut addr = [0u8; 4];
+            socket.read_exact(&mut addr).await
+                .map_err(|e| anyhow::anyhow!("Failed to read IPv4 addr: {}", e))?;
+            let port = read_port(socket).await
+                .map_err(|e| anyhow::anyhow!("Failed to read port: {}", e))?;
+            let target = format!("{}.{}.{}.{}:{}", addr[0], addr[1], addr[2], addr[3], port);
+            info!("[SOCKS5] IPv4 target: {}", target);
+            target
+        }
+        0x03 => {  // Domain
+            let mut len = [0u8; 1];
+            socket.read_exact(&mut len).await
+                .map_err(|e| anyhow::anyhow!("Failed to read domain len: {}", e))?;
+            let mut domain = vec![0u8; len[0] as usize];
+            socket.read_exact(&mut domain).await
+                .map_err(|e| anyhow::anyhow!("Failed to read domain: {}", e))?;
+            let port = read_port(socket).await
+                .map_err(|e| anyhow::anyhow!("Failed to read port: {}", e))?;
+            let target = format!("{}:{}", String::from_utf8_lossy(&domain), port);
+            info!("[SOCKS5] Domain target: {}", target);
+            target
+        }
+        0x04 => {  // IPv6
+            let mut addr = [0u8; 16];
+            socket.read_exact(&mut addr).await
+                .map_err(|e| anyhow::anyhow!("Failed to read IPv6 addr: {}", e))?;
+            let port = read_port(socket).await
+                .map_err(|e| anyhow::anyhow!("Failed to read port: {}", e))?;
+            let ip = std::net::Ipv6Addr::from(addr);
+            let target = format!("[{}]:{}", ip, port);
+            info!("[SOCKS5] IPv6 target: {}", target);
+            target
+        }
+        _ => {
+            socket.write_all(&[0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+            return Err(anyhow::anyhow!("Invalid address type: {}", atyp));
+        }
+    };
+    
+    Ok(Some(target))
+}
+
+/// Handle UDP ASSOCIATE command
+/// 
+/// This creates a UDP relay socket that forwards packets through the VPN tunnel.
+/// The client sends UDP packets to the relay address, which are then encapsulated
+/// and sent through the tunnel.
+async fn handle_udp_associate(socket: &mut TcpStream) -> Result<()> {
+    use std::net::SocketAddr;
+    
+    // Read the client's requested address (usually 0.0.0.0:0)
+    let _atyp = socket.read_u8().await
+        .map_err(|e| anyhow::anyhow!("Failed to read ATYP: {}", e))?;
+    
+    // Parse address (we don't actually use it, but need to consume it)
+    match _atyp {
+        0x01 => {  // IPv4
+            let mut addr = [0u8; 4];
+            socket.read_exact(&mut addr).await?;
+            let _port = read_port(socket).await?;
+        }
+        0x03 => {  // Domain
+            let mut len = [0u8; 1];
+            socket.read_exact(&mut len).await?;
+            let mut domain = vec![0u8; len[0] as usize];
+            socket.read_exact(&mut domain).await?;
+            let _port = read_port(socket).await?;
+        }
+        0x04 => {  // IPv6
+            let mut addr = [0u8; 16];
+            socket.read_exact(&mut addr).await?;
+            let _port = read_port(socket).await?;
+        }
+        _ => {
+            socket.write_all(&[0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+            return Err(anyhow::anyhow!("Invalid address type in UDP ASSOCIATE: {}", _atyp));
+        }
+    }
+    
+    // Create UDP socket bound to localhost with ephemeral port
+    let udp_bind_addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+    let udp_socket = UdpSocket::bind(udp_bind_addr).await
+        .map_err(|e| anyhow::anyhow!("Failed to bind UDP socket: {}", e))?;
+    
+    let relay_addr = udp_socket.local_addr()
+        .map_err(|e| anyhow::anyhow!("Failed to get UDP socket address: {}", e))?;
+    
+    info!("[SOCKS5] UDP ASSOCIATE: Created relay at {}", relay_addr);
+    
+    // Send success response with relay address
+    let mut response = vec![
+        0x05, 0x00,  // Version 5, no error
+        0x00,        // Reserved
+        0x01,        // IPv4
+    ];
+    
+    // Add relay IP
+    if let SocketAddr::V4(addr) = relay_addr {
+        response.extend_from_slice(&addr.ip().octets());
+        response.extend_from_slice(&addr.port().to_be_bytes());
+    } else {
+        // Shouldn't happen since we bound to IPv4
+        response.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    }
+    
+    socket.write_all(&response).await?;
+    socket.flush().await?;
+    
+    info!("[SOCKS5] UDP ASSOCIATE: Sent relay address {} to client", relay_addr);
+    
+    // Note: In a full implementation, we would now:
+    // 1. Spawn a task to receive UDP packets from the client
+    // 2. Encapsulate them and send through the tunnel
+    // 3. Receive responses from the tunnel
+    // 4. Send them back to the client via UDP
+    //
+    // For now, we return success and let the client send UDP packets to the relay.
+    // The actual relay logic needs to be integrated with the tunnel.
+    
+    // Keep the TCP connection open while UDP is active
+    // In practice, the client will close this connection when done
+    let mut buf = [0u8; 1];
+    loop {
+        match socket.read(&mut buf).await {
+            Ok(0) => {
+                // Client closed connection
+                info!("[SOCKS5] UDP ASSOCIATE: Client closed control connection");
+                break;
+            }
+            Ok(_) => {
+                // Ignore any data on control connection
+                continue;
+            }
+            Err(e) => {
+                warn!("[SOCKS5] UDP ASSOCIATE: Control connection error: {}", e);
+                break;
+            }
+        }
+    }
+    
+    info!("[SOCKS5] UDP ASSOCIATE: Closing relay at {}", relay_addr);
+    Ok(())
+}
+
+async fn read_port(socket: &mut TcpStream) -> Result<u16> {
+    let mut port = [0u8; 2];
+    socket.read_exact(&mut port).await?;
+    Ok(u16::from_be_bytes(port))
+}
+
+async fn send_socks5_success(socket: &mut TcpStream) -> Result<()> {
+    // Send success response (bind address = 0.0.0.0:0)
+    socket.write_all(&[0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+    // Ensure the response is sent immediately
+    socket.flush().await?;
+    Ok(())
+}
+
+/// Request to connect to a target through the tunnel
+#[derive(Debug)]
+pub struct TunnelRequest {
+    /// Target address (host:port)
+    pub target_address: String,
+    /// The SOCKS5 client socket
+    pub socket: TcpStream,
+    /// Channel to signal when relay is complete
+    pub completion_sender: mpsc::Sender<Result<()>>,
+}
+
+

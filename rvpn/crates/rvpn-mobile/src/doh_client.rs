@@ -16,16 +16,16 @@ use anyhow::{Context as _, Result};
 use futures::SinkExt;
 use futures::StreamExt;
 use futures_util::stream::SplitSink;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{oneshot, Mutex};
 use tokio::time::timeout;
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
-use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
-use rvpn_core::crypto::x3dh::X3DHInitiator;
 use rvpn_core::crypto::ratchet::RatchetMessage;
-use rvpn_core::protocol::HandshakeMessage;
+use rvpn_core::crypto::x3dh::X3DHInitiator;
+use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
 use rvpn_core::protocol::message::{DnsQuery, DnsResponse};
+use rvpn_core::protocol::HandshakeMessage;
 
 use crate::flow_connector::FlowConnectorConfig;
 
@@ -89,25 +89,35 @@ impl DohClient {
         let server_ip = if let Ok(ip) = config.server_host.parse::<std::net::IpAddr>() {
             ip
         } else {
-            let addrs_result = std::net::ToSocketAddrs::to_socket_addrs(
-                &format!("{}:{}", config.server_host, config.server_port)
-            );
+            let addrs_result = std::net::ToSocketAddrs::to_socket_addrs(&format!(
+                "{}:{}",
+                config.server_host, config.server_port
+            ));
             match addrs_result {
                 Ok(mut addrs) => match addrs.next() {
                     Some(addr) => addr.ip(),
                     None => {
-                        error!("[DohClient] DNS resolution returned no addresses for {}", config.server_host);
+                        error!(
+                            "[DohClient] DNS resolution returned no addresses for {}",
+                            config.server_host
+                        );
                         // Fallback: we'll try to resolve at connection time (will fail if DNS is hijacked)
                         std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
                     }
                 },
                 Err(e) => {
-                    error!("[DohClient] Failed to resolve server hostname {}: {}", config.server_host, e);
+                    error!(
+                        "[DohClient] Failed to resolve server hostname {}: {}",
+                        config.server_host, e
+                    );
                     std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
                 }
             }
         };
-        info!("[DohClient] Server {} resolved to {}", config.server_host, server_ip);
+        info!(
+            "[DohClient] Server {} resolved to {}",
+            config.server_host, server_ip
+        );
 
         Self {
             config,
@@ -139,6 +149,12 @@ impl DohClient {
                         info!("[DohClient] Connection closed, reconnecting in 1s...");
                     }
                     Err(e) => {
+                        if let Some(message) =
+                            crate::server_hello::ServerSecurity::security_failure_message(&e)
+                        {
+                            error!("[DohClient] Terminal server security failure: {}", message);
+                            break;
+                        }
                         warn!("[DohClient] Connection error: {}, reconnecting in 2s...", e);
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
@@ -242,12 +258,14 @@ impl DohClient {
 
         if !response.success {
             // Cache failure to suppress retry storms
-            self.insert_cache_entry(
-                cache_key, vec![], true, Duration::from_secs(30)).await;
+            self.insert_cache_entry(cache_key, vec![], true, Duration::from_secs(30))
+                .await;
             anyhow::bail!(
                 "DNS resolution failed for {}: {}",
                 domain,
-                response.error.unwrap_or_else(|| "unknown error".to_string())
+                response
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string())
             );
         }
 
@@ -255,12 +273,19 @@ impl DohClient {
         addresses.extend(response.ipv4_addrs.iter().map(|a| IpAddr::V4(*a)));
         addresses.extend(response.ipv6_addrs.iter().map(|a| IpAddr::V6(*a)));
 
-        info!("[DohClient] Resolved {} -> {} addresses (ipv4={}, ipv6={}) success={}",
-              domain, addresses.len(), response.ipv4_addrs.len(), response.ipv6_addrs.len(), response.success);
+        info!(
+            "[DohClient] Resolved {} -> {} addresses (ipv4={}, ipv6={}) success={}",
+            domain,
+            addresses.len(),
+            response.ipv4_addrs.len(),
+            response.ipv6_addrs.len(),
+            response.success
+        );
 
         // Cache the result
         let ttl = Duration::from_secs(response.ttl as u64);
-        self.insert_cache_entry(cache_key, addresses.clone(), false, ttl).await;
+        self.insert_cache_entry(cache_key, addresses.clone(), false, ttl)
+            .await;
 
         Ok(addresses)
     }
@@ -302,11 +327,14 @@ impl DohClient {
             }
         }
 
-        cache.insert(cache_key, CacheEntry {
-            addresses,
-            expires_at: Instant::now() + ttl,
-            failed,
-        });
+        cache.insert(
+            cache_key,
+            CacheEntry {
+                addresses,
+                expires_at: Instant::now() + ttl,
+                failed,
+            },
+        );
     }
 
     /// Start a background task that periodically cleans expired cache entries.
@@ -321,7 +349,10 @@ impl DohClient {
                 cache.retain(|_, e| e.expires_at > now);
                 let after = cache.len();
                 if before != after {
-                    debug!("[DohClient] cache cleanup: removed {} expired entries", before - after);
+                    debug!(
+                        "[DohClient] cache cleanup: removed {} expired entries",
+                        before - after
+                    );
                 }
             }
         });
@@ -330,8 +361,15 @@ impl DohClient {
     /// Resolve A records (IPv4)
     pub async fn resolve_a(&self, domain: &str) -> Result<Vec<Ipv4Addr>> {
         let addrs = self.resolve(domain, 1).await?;
-        Ok(addrs.into_iter()
-            .filter_map(|a| if let IpAddr::V4(v4) = a { Some(v4) } else { None })
+        Ok(addrs
+            .into_iter()
+            .filter_map(|a| {
+                if let IpAddr::V4(v4) = a {
+                    Some(v4)
+                } else {
+                    None
+                }
+            })
             .collect())
     }
 
@@ -339,8 +377,15 @@ impl DohClient {
     #[allow(dead_code)]
     pub async fn resolve_aaaa(&self, domain: &str) -> Result<Vec<Ipv6Addr>> {
         let addrs = self.resolve(domain, 28).await?;
-        Ok(addrs.into_iter()
-            .filter_map(|a| if let IpAddr::V6(v6) = a { Some(v6) } else { None })
+        Ok(addrs
+            .into_iter()
+            .filter_map(|a| {
+                if let IpAddr::V6(v6) = a {
+                    Some(v6)
+                } else {
+                    None
+                }
+            })
             .collect())
     }
 
@@ -352,7 +397,10 @@ impl DohClient {
         pending: &Arc<Mutex<HashMap<u64, PendingQuery>>>,
         query_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DnsQuery>,
     ) -> Result<()> {
-        let url = format!("wss://{}:{}{}", config.server_host, config.server_port, dns_path);
+        let url = format!(
+            "wss://{}:{}{}",
+            config.server_host, config.server_port, dns_path
+        );
         info!("[DohClient] Connecting to {} (via IP {})", url, server_ip);
 
         // TLS backend depends on platform feature. Both arms pass the
@@ -360,7 +408,7 @@ impl DohClient {
         // direct-TUN DNS proxy shares the exit's tunnel-session store) so
         // the persistent /dns WebSocket's reconnects resume via PSK instead
         // of paying a full handshake.
-        #[cfg(not(feature = "android-direct-tun"))]
+        #[cfg(any(feature = "ios-direct-tun", feature = "macos-direct-tun"))]
         let (ws_stream, _) = {
             let tls_stream = {
                 #[cfg(feature = "ios-direct-tun")]
@@ -384,10 +432,13 @@ impl DohClient {
                 .context("DNS TLS handshake failed")?;
                 s
             };
-            timeout(Duration::from_secs(3), tokio_tungstenite::client_async(&url, tls_stream))
-                .await
-                .context("DNS WebSocket handshake timeout (3s)")?
-                .context("DNS WebSocket handshake failed")?
+            timeout(
+                Duration::from_secs(3),
+                tokio_tungstenite::client_async(&url, tls_stream),
+            )
+            .await
+            .context("DNS WebSocket handshake timeout (3s)")?
+            .context("DNS WebSocket handshake failed")?
         };
 
         // Android: tokio-tungstenite's built-in rustls connector has an EMPTY
@@ -404,8 +455,7 @@ impl DohClient {
             let tls_config = rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
-            let connector =
-                tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
+            let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
 
             let tcp_stream = timeout(
                 Duration::from_secs(5),
@@ -429,6 +479,19 @@ impl DohClient {
             .context("DNS WebSocket handshake failed")?
         };
 
+        #[cfg(not(any(
+            feature = "android-direct-tun",
+            feature = "ios-direct-tun",
+            feature = "macos-direct-tun"
+        )))]
+        let (ws_stream, _) = timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async_with_config(&url, None, false),
+        )
+        .await
+        .context("DNS WebSocket handshake timeout (5s)")?
+        .context("DNS WebSocket handshake failed")?;
+
         let (mut write, mut read) = ws_stream.split();
 
         // Perform X3DH handshake
@@ -437,6 +500,7 @@ impl DohClient {
             &mut write,
             &config.identity_key,
             &config.server_bundle,
+            &config.security,
         )
         .await
         .context("X3DH handshake failed for DNS connection")?;
@@ -526,7 +590,10 @@ impl DohClient {
                             }
                         };
 
-                        debug!("[DohClient] Received response for query_id={}", response.query_id);
+                        debug!(
+                            "[DohClient] Received response for query_id={}",
+                            response.query_id
+                        );
 
                         let mut pending_guard = pending.lock().await;
                         if let Some(pending_query) = pending_guard.remove(&response.query_id) {
@@ -557,10 +624,16 @@ impl DohClient {
 
 /// Perform X3DH handshake with the server
 async fn perform_handshake(
-    ws_reader: &mut futures_util::stream::SplitStream<WebSocketStream<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>>,
-    ws_writer: &mut SplitSink<WebSocketStream<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>, Message>,
+    ws_reader: &mut futures_util::stream::SplitStream<
+        WebSocketStream<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>,
+    >,
+    ws_writer: &mut SplitSink<
+        WebSocketStream<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>,
+        Message,
+    >,
     identity_key: &Arc<IdentityKey>,
     server_bundle: &X3DHPublicBundle,
+    security: &crate::server_hello::ServerSecurity,
 ) -> Result<DoubleRatchet> {
     let initiator = X3DHInitiator::from_identity_key(Arc::clone(identity_key));
 
@@ -577,7 +650,10 @@ async fn perform_handshake(
     };
 
     let hello_bytes = serde_json::to_vec(&hello).context("Failed to serialize Hello")?;
-    ws_writer.send(Message::Binary(hello_bytes)).await.context("Failed to send Hello")?;
+    ws_writer
+        .send(Message::Binary(hello_bytes))
+        .await
+        .context("Failed to send Hello")?;
 
     let response = timeout(Duration::from_secs(3), ws_reader.next())
         .await
@@ -587,62 +663,15 @@ async fn perform_handshake(
 
     match response {
         Message::Binary(data) => {
-            let server_hello: HandshakeMessage = serde_json::from_slice(&data)
-                .context("Failed to parse ServerHello")?;
+            let server_hello: HandshakeMessage =
+                serde_json::from_slice(&data).context("Failed to parse ServerHello")?;
+            let validated = security.validate(server_hello, server_bundle)?;
+            let (shared_secret, _) = initiator
+                .agree(&validated.bundle)
+                .context("X3DH key agreement failed")?;
+            validated.commit(security);
 
-            match server_hello {
-                HandshakeMessage::ServerHello {
-                    ephemeral_key: _server_ephemeral,
-                    identity_key: server_identity_key,
-                    signed_prekey: server_signed_prekey,
-                    prekey_signature: server_prekey_signature,
-                } => {
-                    // Use wire values for X3DH (see stream_relay.rs / ios_tun.rs).
-                    let server_identity_key: [u8; 32] = server_identity_key
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("Server identity key has invalid length"))?;
-                    let server_signed_prekey: [u8; 32] = server_signed_prekey
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("Server signed prekey has invalid length"))?;
-                    let prekey_signature: [u8; 64] = server_prekey_signature
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("Prekey signature has invalid length"))?;
-
-                    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
-                        &server_identity_key,
-                    )
-                    .map_err(|e| anyhow::anyhow!("Invalid server identity key: {}", e))?;
-                    let signature = ed25519_dalek::Signature::from_bytes(&prekey_signature);
-                    ed25519_dalek::Verifier::verify(
-                        &verifying_key,
-                        &server_signed_prekey,
-                        &signature,
-                    )
-                    .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
-
-                    let server_bundle_from_hello = X3DHPublicBundle {
-                        identity_key: server_identity_key,
-                        identity_x25519_key: server_bundle.identity_x25519_key,
-                        signed_prekey: server_signed_prekey,
-                        prekey_signature,
-                        one_time_prekey: None,
-                        identity_key_version: server_bundle.identity_key_version,
-                        rotation_signature: server_bundle.rotation_signature,
-                    };
-
-                    let (shared_secret, _) = initiator
-                        .agree(&server_bundle_from_hello)
-                        .context("X3DH key agreement failed")?;
-
-                    // In X3DH, the server (Bob) doesn't generate an ephemeral key.
-                    // The _server_ephemeral field is empty - init_alice doesn't use this parameter.
-                    Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32]))
-                }
-                _ => Err(anyhow::anyhow!("Unexpected handshake message")),
-            }
+            Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32]))
         }
         _ => Err(anyhow::anyhow!("Expected binary message during handshake")),
     }
