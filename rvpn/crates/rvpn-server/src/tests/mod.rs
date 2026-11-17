@@ -3,6 +3,7 @@
 pub mod fixtures;
 mod server_tests;
 mod routing_tests;
+mod log_privacy;
 
 // Integration test helpers
 pub mod integration;

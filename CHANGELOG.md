@@ -17,6 +17,15 @@ edition-2024).
 **Fork owners: rebase onto this release** — it carries two
 security-relevant fixes (below).
 
+### Privacy
+
+- **The server no longer logs client IP addresses, tunnel IPs,
+  destinations or DNS names at the default `INFO` level.** Those appear
+  only at `debug`/`trace` (`-v`/`-vv`). A build-time test fails if a
+  default-level log line names a client identifier again. Operators on
+  earlier versions should treat their logs as containing connection
+  records.
+
 ### Security
 
 - **Fixed skipped-key lookup in the Double Ratchet** so out-of-order

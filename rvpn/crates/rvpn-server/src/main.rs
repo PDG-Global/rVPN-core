@@ -761,7 +761,7 @@ async fn handle_connection(
     let stream: Box<dyn AsyncReadWrite + Send + Unpin> = if let Some(acceptor) = tls_acceptor {
         match acceptor.accept(stream).await {
             Ok(Some(tls_stream)) => {
-                info!("TLS handshake successful from {}", peer_addr);
+                debug!("TLS handshake successful from {}", peer_addr);
                 tls_stream
             }
             Ok(None) => {
@@ -922,7 +922,7 @@ where
         Ok(ws) => {
             // WebSocket upgrade successful
             let path = request_path.lock().unwrap().clone();
-            info!(
+            debug!(
                 "WebSocket upgrade accepted from {} on path: {}",
                 peer_addr, path
             );
@@ -972,13 +972,13 @@ where
                 }
             } else {
                 // Unknown path - close connection
-                warn!(
+                debug!(
                     "WebSocket connection on unknown path '{}' from {}",
                     path, peer_addr
                 );
             }
 
-            info!("Connection from {} closed", peer_addr);
+            debug!("Connection from {} closed", peer_addr);
         }
         Err(e) => {
             // Not a WebSocket - handle as HTTP
