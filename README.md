@@ -15,7 +15,7 @@ This repository contains the core Rust implementation: the client, server, proto
 - **Pooled multiplexing** - many flows share a small set of long-lived connections, with credit-based flow control and TLS session resumption
 - **Reverse proxy** - the server hosts a real website on port 443, the VPN endpoint is hidden behind it
 - **Per-instance decoy pages** - plain HTTPS probes get a realistic, randomly chosen login page, so no two servers present the same face
-- **Chrome-like TLS handshake** - desktop and iOS clients use a Chrome-like TLS 1.3 ClientHello by default (`tls_fingerprint = "chrome"`; `"firefox"` and `"safari"` are accepted but currently behave like `"chrome"`; Android does not apply it)
+- **Chrome-like TLS handshake** - the macOS and desktop CLI clients use a Chrome-like TLS 1.3 ClientHello by default (`tls_fingerprint = "chrome"`; `"firefox"` and `"safari"` are accepted but currently behave like `"chrome"`). The iOS and Android apps use rustls with no mimicry (BoringSSL leaks memory inside the iOS Network Extension sandbox)
 - **Size padding** - after the handshake, tunnelled packets are padded up to the next 1 KB block, so exact sizes do not show (the X3DH handshake messages themselves are not padded)
 - **Stats dashboard** - the CLI serves a live MRTG-style traffic page with a JSON API
 
