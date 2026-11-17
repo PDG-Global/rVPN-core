@@ -1,9 +1,9 @@
 # rVPN Core
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
-rVPN is a stealth VPN with end-to-end encryption. Traffic is encrypted on your device and decrypted only by its destination. The relay server in between forwards ciphertext it cannot read.
+rVPN is a stealth VPN. Traffic between your device and your rVPN server is encrypted with the Double Ratchet and carried over WebSocket/TLS on port 443, so the network in between sees what is designed to look like ordinary HTTPS. The server is the tunnel's exit: it decrypts your traffic and forwards it to its destination, like any VPN server. See [What rVPN protects against](#what-rvpn-protects-against).
 
 This repository contains the core Rust implementation: the client, server, protocol libraries, and mobile FFI bindings. The native macOS, iOS, and Android apps are maintained separately.
 
@@ -11,12 +11,23 @@ This repository contains the core Rust implementation: the client, server, proto
 
 - **Double Ratchet Algorithm** (from Signal) for continuous key rotation and forward secrecy
 - **X3DH key exchange** for initial handshake without passwords or accounts
-- **WebSocket over TLS** transport - traffic is indistinguishable from normal HTTPS
+- **WebSocket over TLS** transport - designed to look like normal HTTPS on port 443
 - **Pooled multiplexing** - many flows share a small set of long-lived connections, with credit-based flow control and TLS session resumption
 - **Reverse proxy** - the server hosts a real website on port 443, the VPN endpoint is hidden behind it
 - **Per-instance decoy pages** - plain HTTPS probes get a realistic, randomly chosen login page, so no two servers present the same face
-- **TLS fingerprint mimicry** - connections mimic Chrome, Firefox, or Safari fingerprints
+- **Chrome-like TLS handshake** - desktop and iOS clients use a Chrome-like TLS 1.3 ClientHello by default (`tls_fingerprint = "chrome"`; `"firefox"` and `"safari"` are accepted but currently behave like `"chrome"`; Android does not apply it)
+- **Size padding** - every tunnelled packet is padded up to the next 1 KB block, so exact sizes do not show
 - **Stats dashboard** - the CLI serves a live MRTG-style traffic page with a JSON API
+
+## What rVPN protects against
+
+**Protects:** your traffic between your device and your rVPN server. Your ISP, the Wi-Fi operator or a national firewall sees encrypted traffic designed to look like HTTPS to a website on port 443, and a probe of the server gets a decoy site.
+
+**Does not protect from the server operator.** The server decrypts the tunnel to forward your traffic, so whoever runs it can see which destinations you connect to and the content of anything you send without HTTPS (sites you reach over HTTPS stay encrypted between you and the site). Run your own server, or use one run by someone you trust.
+
+**Not claimed:** anonymity, resistance to an observer who can watch both ends, or guaranteed undetectability. Censors adapt; treat stealth as resistance, not a guarantee.
+
+**Logging:** from v1.3.7 the server's default `INFO` level never records client IP addresses, tunnel IPs, destinations or DNS names; those appear only at `debug`/`trace` (`-v`). Earlier versions logged them at `INFO`.
 
 ## Repository Structure
 
@@ -33,7 +44,7 @@ rvpn/
 
 ## Building
 
-Requires Rust 1.75+.
+Requires Rust 1.88+.
 
 ```bash
 cd rvpn
