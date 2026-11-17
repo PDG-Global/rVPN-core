@@ -1,0 +1,29 @@
+name: Audit
+
+# cargo audit: weekly, plus any PR that changes the dependency lockfile.
+# The secret-scanning gate asks "did anyone commit a secret"; this asks
+# "does the lockfile still resolve to something with a known CVE".
+on:
+  schedule:
+    - cron: '0 2 * * 1'
+  pull_request:
+    paths:
+      - 'rvpn/Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: rvpn
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
