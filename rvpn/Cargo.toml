@@ -127,3 +127,22 @@ panic = "abort"
 [profile.dev]
 opt-level = 0
 debug = true
+
+# ACME challenge tolerance (issue #1): a CA offering an unimplemented
+# challenge type — Let's Encrypt began offering `dns-persist-01` — failed
+# the whole order on rustls-acme 0.9's closed ChallengeType enum, and
+# dns-persist-01 also omits the `token` field. Upstream fixed both
+# (7fa79bac "Ignore unknown challenge types", released in 0.14.1; 67b5e9d0
+# / PR #93 "Fix Challenge deserialization for token-less challenge types"),
+# but every fixed release sits on rustls 0.23 while this workspace is on
+# rustls 0.22 (tokio-rustls 0.25). This pin carries a straight backport of
+# those two one-line fixes plus regression tests, on the 0.9 line.
+#
+# Drop condition (2026-11-17, Thomas's dependency audit): this pin holds
+# the workspace on rustls 0.22, a line that receives NO TLS fixes — the
+# open rustls advisories are fixed only in >= 0.23.46. The fork is a
+# stopgap by schedule, not convention: the rustls 0.23 migration (next
+# sprint, tracked as a security item) takes rustls-acme >= 0.15.4 and
+# retires this fork. Remove this pin in that migration.
+[patch.crates-io]
+rustls-acme = { git = "https://github.com/PDG-Global/rustls-acme", rev = "8c93b2e6ba4b71048cd6777e589758bea715c5b1" }
