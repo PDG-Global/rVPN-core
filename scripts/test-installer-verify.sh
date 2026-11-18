@@ -76,6 +76,8 @@ version_lt() {
     return 1
 }
 echo "── rollback floor compare ──"
+# These literals exercise version_lt semantics only; they are independent of
+# the current $FLOOR value and must not be "helpfully" derived from it.
 check "1.3.7 < 1.3.8 (older refused)" 'version_lt 1.3.7 1.3.8'
 check "1.3.8 == 1.3.8 not below (accepted)" '! version_lt 1.3.8 1.3.8'
 check "1.4.0 > 1.3.8 not below (accepted)" '! version_lt 1.4.0 1.3.8'
@@ -94,6 +96,19 @@ check "verify_manifest is wired before downloads" 'grep -q "^verify_manifest$" "
 # that one stays; only the RVPN_ALLOWED_SIGNERS assignment is pinned here).
 check "real install.sh anchor line is not the placeholder" \
     '! grep "^RVPN_ALLOWED_SIGNERS=" "$INSTALL_SH" | grep -q "REPLACE_WITH_RELEASE_PUBKEY"'
+# ...and "not the placeholder" is not enough: that check accepts ANY real key,
+# and every e2e case below injects its own anchor, so a PR swapping
+# RVPN_ALLOWED_SIGNERS for a different real key would go green. Pin the derived
+# fingerprint instead of the key text, so the test breaks if either the key
+# material or the identity changes. A legitimate rotation edits this constant
+# and install.sh's anchor in the same PR — the visible two-file change a
+# reviewer must notice. (In the PR lane this restores the invariant the release
+# lane's anchor-custody guard enforces.)
+EXPECTED_FP="SHA256:yGO+trZ+G4Ps3MErB/arSzbs91C8/Vk6kQF8JH0oWlc"
+ANCHOR_KEY="$(sed -n "s/^RVPN_ALLOWED_SIGNERS='[^ ]* \(ssh-ed25519 [A-Za-z0-9+/=]*\).*/\1/p" "$INSTALL_SH")"
+printf '%s\n' "$ANCHOR_KEY" > "$WORK/anchor.pub"
+check "shipped anchor is the rvpn-release key ($EXPECTED_FP)" \
+    '[ "$(ssh-keygen -lf "$WORK/anchor.pub" | awk "{print \$2}")" = "$EXPECTED_FP" ]'
 
 echo "── verify_manifest end-to-end (install.sh's OWN code, local file:// origin) ──"
 # Exercise the shipped verify_manifest, not a re-implementation (the version_lt
@@ -105,6 +120,11 @@ VFUNCS="$WORK/verify-funcs.sh"
     sed -n '/^verify_manifest()/,/^}/p' "$INSTALL_SH"
 } > "$VFUNCS"
 grep -q 'verify_manifest()' "$VFUNCS" || { echo "FAIL: could not extract verify_manifest from install.sh" >&2; exit 1; }
+# Completeness guard: the sed range above ends at the first column-0 '}', which
+# today is the function's end; a nested block or a heredoc containing one would
+# truncate the extraction silently. Assert it reached the function's last known
+# statement so a truncated function fails here, not inside the e2e cases.
+grep -q 'VERIFIED_MANIFEST="\$mfile"' "$VFUNCS" || { echo "FAIL: verify_manifest extraction truncated (missing tail)" >&2; exit 1; }
 GOOD_ANCHOR="$NS $(ssh-keygen -y -f "$KEY")"
 # run_verify <manifest-version> <requested-version> [signing-key] [anchor] [tamper]
 # Signs a manifest locally, lays it out as file://$WORK/e2e/<req>/, and runs the
@@ -135,6 +155,10 @@ run_verify() {
         verify_manifest
     ) >/dev/null 2>&1
 }
+# This is the ONLY case that requires success; every case after it asserts
+# `! run_verify …`, so any failure — including a broken harness — would count
+# as a pass for them. Do not remove the positive case: it is what fails when
+# the harness breaks, and it carries the whole negative suite.
 check "e2e: valid sig + version == requested == floor -> accepted" \
     'run_verify "$FLOOR" "$FLOOR"'
 check "e2e: SIGNED suffixed version above floor (1.3.9-rc1) -> hard fail" \
