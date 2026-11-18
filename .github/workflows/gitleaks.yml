@@ -14,7 +14,10 @@ name: gitleaks
 # outside forks execute with no secrets. No GITLEAKS_LICENSE: the CLI is
 # invoked directly rather than via gitleaks-action, whose org license
 # gate we don't need. Ported from rcommerce-core's gitleaks workflow;
-# the image is pinned to the same version.
+# the image is pinned to the same version by registry digest (A1): a Docker
+# tag is mutable, so the tag alone is not a pin. Digest = the OCI index
+# digest registry-1.docker.io serves for v8.24.3 (Docker-Content-Digest),
+# cross-checked against the Docker Hub tag API, 2026-11-18.
 
 on:
   pull_request:
@@ -35,7 +38,7 @@ jobs:
       - name: gitleaks (PR commits, base..head)
         run: >-
           docker run --rm -v "$PWD:/repo" -w /repo
-          zricethezav/gitleaks:v8.24.3
+          zricethezav/gitleaks:v8.24.3@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
           git --redact
           --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
           /repo
@@ -50,5 +53,5 @@ jobs:
       - name: gitleaks (full history)
         run: >-
           docker run --rm -v "$PWD:/repo" -w /repo
-          zricethezav/gitleaks:v8.24.3
+          zricethezav/gitleaks:v8.24.3@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
           git --redact --log-opts="--all" /repo
