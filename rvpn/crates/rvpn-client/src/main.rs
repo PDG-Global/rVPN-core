@@ -81,9 +81,9 @@ impl<F: FnMut()> Drop for OnDrop<F> {
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "R-VPN Client - A stealth VPN with Double Ratchet encryption")]
 struct Args {
-    /// Configuration file
-    #[arg(short, long, default_value = "client.toml")]
-    config: PathBuf,
+    /// Configuration file (defaults to client.toml in the working or executable directory)
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 
     /// Server address (overrides config)
     #[arg(long)]
@@ -163,9 +163,20 @@ async fn main() -> Result<()> {
     info!("R-VPN Client v{}", env!("CARGO_PKG_VERSION"));
 
     // Load configuration
-    let config = if args.config.exists() {
-        info!("Loading configuration from {:?}", args.config);
-        ClientConfig::load(&args.config)?
+    let config_path = match args.config {
+        Some(path) => path,
+        None => {
+            let default = PathBuf::from("client.toml");
+            if default.try_exists()? {
+                default
+            } else {
+                std::env::current_exe()?.with_file_name(default)
+            }
+        }
+    };
+    let config = if config_path.try_exists()? {
+        info!("Loading configuration from {:?}", config_path);
+        ClientConfig::load(&config_path)?
     } else {
         info!("No config file found, using defaults");
         ClientConfig::default()

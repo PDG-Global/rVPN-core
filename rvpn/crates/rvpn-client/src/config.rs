@@ -1,7 +1,9 @@
 //! Client configuration
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -157,16 +159,52 @@ pub struct ServerEntry {
 pub use rvpn_split_tunnel::RoutingRule;
 
 impl ClientConfig {
-    /// Load configuration from file
-    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+    /// Load configuration and anchor its relative file paths to its directory.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let path = resolve_path(path, &std::env::current_dir()?);
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read client configuration: {}", path.display()))?;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-        match ext {
-            "toml" => Ok(toml::from_str(&content)?),
-            "json" => Ok(serde_json::from_str(&content)?),
+        let mut config: Self = match ext {
+            "toml" => toml::from_str(&content)?,
+            "json" => serde_json::from_str(&content)?,
             _ => anyhow::bail!("Unsupported config format: {}", ext),
+        };
+        let base = path
+            .parent()
+            .context("Configuration path has no parent directory")?;
+        for file in [
+            Some(&mut config.identity_key_file),
+            config.prekey_bundle.as_mut(),
+            Some(&mut config.data_dir),
+            Some(&mut config.server_identity.known_hosts_file),
+            config.split_tunnel.bypass_networks_file.as_mut(),
+            config.split_tunnel.bypass_domains_file.as_mut(),
+            config.split_tunnel.tunnel_networks_file.as_mut(),
+            config.split_tunnel.tunnel_domains_file.as_mut(),
+            config.split_tunnel.ad_block_file.as_mut(),
+            config.split_tunnel.country_ips_file.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *file = resolve_path(file, base);
         }
+        for server in &mut config.extra_servers {
+            server.prekey_bundle = resolve_path(&server.prekey_bundle, base);
+        }
+        Ok(config)
+    }
+}
+
+/// Resolve native relative paths (including ./ and ../) without requiring the
+/// destination to exist. Absolute paths keep their original meaning.
+fn resolve_path(path: &Path, base: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
     }
 }
 
@@ -725,6 +763,91 @@ fn default_tls_fingerprint() -> TlsFingerprint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_paths_and_dot_prefixes_load_beside_config_in_toml_and_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("config files 配置");
+        std::fs::create_dir(&directory).unwrap();
+        let identity = rvpn_core::crypto::IdentityKey::generate();
+        identity.save(&directory.join("identity.key")).unwrap();
+        std::fs::write(directory.join("prekey-bundle.json"), "{}").unwrap();
+        let raw = r#"
+identity_key_file = "./identity.key"
+prekey_bundle = "./prekey-bundle.json"
+data_dir = "./state"
+
+[[server]]
+name = "extra"
+address = "wss://extra.example.com"
+prekey_bundle = "./extra.json"
+
+[server_identity]
+known_hosts_file = "./known_hosts.json"
+
+[split_tunnel]
+bypass_networks_file = "./rules/bypass-ips.txt"
+bypass_domains_file = "./rules/bypass-domains.txt"
+tunnel_networks_file = "./rules/tunnel-ips.txt"
+tunnel_domains_file = "./rules/tunnel-domains.txt"
+ad_block_file = "./rules/ads.txt"
+country_ips_file = "./rules/country-ips.json"
+"#;
+        let input: ClientConfig = toml::from_str(raw).unwrap();
+        for ext in ["toml", "json"] {
+            let path = directory.join(format!("client.{ext}"));
+            let contents = if ext == "toml" {
+                raw.to_string()
+            } else {
+                serde_json::to_string(&input).unwrap()
+            };
+            std::fs::write(&path, contents).unwrap();
+            // No change to the process CWD: files must be found beside config.
+            let config = ClientConfig::load(&path).unwrap();
+            let loaded = rvpn_core::crypto::IdentityKey::load(&config.identity_key_file).unwrap();
+            assert_eq!(loaded.verifying_key, identity.verifying_key);
+            assert_eq!(
+                std::fs::read_to_string(config.prekey_bundle.unwrap()).unwrap(),
+                "{}"
+            );
+            assert_eq!(config.data_dir, directory.join("state"));
+            assert_eq!(
+                config.server_identity.known_hosts_file,
+                directory.join("known_hosts.json")
+            );
+            assert_eq!(
+                config.extra_servers[0].prekey_bundle,
+                directory.join("extra.json")
+            );
+            let split = &config.split_tunnel;
+            for file in [
+                &split.bypass_networks_file,
+                &split.bypass_domains_file,
+                &split.tunnel_networks_file,
+                &split.tunnel_domains_file,
+                &split.ad_block_file,
+                &split.country_ips_file,
+            ] {
+                assert!(file.as_ref().unwrap().is_absolute());
+                assert!(file.as_ref().unwrap().starts_with(directory.join("rules")));
+            }
+        }
+    }
+
+    #[test]
+    fn absolute_config_paths_are_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = ClientConfig::default();
+        config.identity_key_file = temp.path().join("absolute.key");
+        config.prekey_bundle = Some(temp.path().join("absolute.json"));
+        config.data_dir = temp.path().join("state");
+        let path = temp.path().join("client.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let loaded = ClientConfig::load(&path).unwrap();
+        assert_eq!(loaded.identity_key_file, config.identity_key_file);
+        assert_eq!(loaded.prekey_bundle, config.prekey_bundle);
+        assert_eq!(loaded.data_dir, config.data_dir);
+    }
 
     #[test]
     fn multi_server_toml_round_trips() {

@@ -69,7 +69,18 @@ async fn main() -> Result<()> {
     }
 
     // Load configuration
-    let config = load_config(&args.config).await;
+    let config_path = match args.config {
+        Some(path) => path,
+        None => {
+            let default = PathBuf::from("server.toml");
+            if default.try_exists()? {
+                default
+            } else {
+                std::env::current_exe()?.with_file_name(default)
+            }
+        }
+    };
+    let config = load_config(&config_path).await;
     let mut config = config;
     if let Some(bind) = args.bind {
         config.bind_address = bind;
@@ -995,7 +1006,7 @@ impl<T> AsyncReadWrite for T where T: tokio::io::AsyncRead + tokio::io::AsyncWri
 
 #[derive(Debug)]
 struct Args {
-    config: PathBuf,
+    config: Option<PathBuf>,
     bind: Option<String>,
     command: Option<String>,
     identity: Option<PathBuf>,
@@ -1015,7 +1026,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut args = Args {
-        config: PathBuf::from("server.toml"),
+        config: None,
         bind: None,
         command: None,
         identity: None,
@@ -1034,7 +1045,7 @@ fn parse_args() -> Args {
             "-c" | "--config" => {
                 i += 1;
                 if i < argv.len() {
-                    args.config = PathBuf::from(&argv[i]);
+                    args.config = Some(PathBuf::from(&argv[i]));
                 }
             }
             "-b" | "--bind" => {
@@ -1091,7 +1102,7 @@ fn print_help() {
     println!("Usage: rvpn-server [OPTIONS] [COMMAND]");
     println!();
     println!("Options:");
-    println!("  -c, --config FILE    Configuration file (default: server.toml)");
+    println!("  -c, --config FILE    Configuration file (defaults to server.toml in the working or executable directory)");
     println!("  -b, --bind ADDR      Bind address (overrides config)");
     println!("  -v, --verbose        Verbose output (use multiple times for more)");
     println!("  -h, --help           Print this help");
