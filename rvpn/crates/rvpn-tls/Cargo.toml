@@ -51,9 +51,14 @@ tokio-native-tls = { version = "0.3", optional = true }
 [features]
 # Default keeps current behavior: desktop client (rvpn-client) and macOS use boring.
 default = ["boring"]
-boring = ["dep:boring", "dep:tokio-boring"]
+boring = ["dep:boring", "dep:tokio-boring", "dep:rustls-native-certs"]
 rustls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 native-tls = ["dep:native-tls", "dep:tokio-native-tls"]
+
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+# Read Windows certificate stores, macOS Keychain, or the Linux CA bundle.
+# Only certificate loading is used; BoringSSL still handles the TLS connection.
+rustls-native-certs = { version = "0.8", optional = true }
 
 [dev-dependencies]
 # Self-signed certificates for the resumption test harness (local TLS servers).
