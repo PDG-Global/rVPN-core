@@ -38,6 +38,7 @@ const IDENTIFIERS: &[&str] = &[
     "peer_addr",
     "client_ip",
     "allocated_ip",
+    "tun_assigned_ip",
     "dst_ip",
     "target_addr",
     "target_socket_addr",

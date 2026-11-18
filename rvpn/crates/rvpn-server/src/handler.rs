@@ -2512,10 +2512,7 @@ where
                 );
 
                 if !Self::tun_source_permitted(payload, tun_assigned_ip) {
-                    warn!(
-                        "FRAME: [#{:05}] TUN mode: dropping packet — source is not the session's assigned tunnel IP ({:?})",
-                        frame_number, tun_assigned_ip
-                    );
+                    Self::log_spoofed_tun_source(frame_number);
                     return Err(anyhow::anyhow!(
                         "TUN mode: packet source does not match the session's assigned tunnel IP"
                     ));
@@ -2691,6 +2688,36 @@ where
             Some(src_ip)
         } else {
             None
+        }
+    }
+
+    /// Log a spoofed-source TUN drop WITHOUT any client identifier (the
+    /// assigned tunnel IP is one — log-privacy rule). A malicious client can
+    /// send one bad packet per frame, so the WARN is rate-limited to one per
+    /// minute process-wide; the rest go to debug. The drop itself is always
+    /// enforced regardless of logging.
+    fn log_spoofed_tun_source(frame_number: u64) {
+        use std::sync::atomic::Ordering;
+        static LAST_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = LAST_WARN_SECS.load(Ordering::Relaxed);
+        let due = now.saturating_sub(last) >= 60
+            && LAST_WARN_SECS
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
+        if due {
+            warn!(
+                "FRAME: [#{:05}] TUN mode: dropping packet — source is not the session's assigned tunnel IP (rate-limited; further drops at debug level)",
+                frame_number
+            );
+        } else {
+            debug!(
+                "FRAME: [#{:05}] TUN mode: dropping packet — source is not the session's assigned tunnel IP",
+                frame_number
+            );
         }
     }
 
@@ -3643,10 +3670,7 @@ where
                 );
 
                 if !Self::tun_source_permitted(payload, tun_assigned_ip) {
-                    warn!(
-                        "FRAME: [#{:05}] TUN mode: dropping packet — source is not the session's assigned tunnel IP ({:?})",
-                        frame_number, tun_assigned_ip
-                    );
+                    Self::log_spoofed_tun_source(frame_number);
                     return Err(anyhow::anyhow!(
                         "TUN mode: packet source does not match the session's assigned tunnel IP"
                     ));
