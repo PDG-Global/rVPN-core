@@ -63,13 +63,8 @@ async fn main() -> Result<()> {
 
     info!("R-VPN Server v{}", env!("CARGO_PKG_VERSION"));
 
-    if args.help {
-        print_help();
-        return Ok(());
-    }
-
     // Load configuration
-    let config = load_config(&args.config).await;
+    let config = load_config(&args.config, args.config_explicit).await;
     let mut config = config;
     if let Some(bind) = args.bind {
         config.bind_address = bind;
@@ -996,6 +991,8 @@ impl<T> AsyncReadWrite for T where T: tokio::io::AsyncRead + tokio::io::AsyncWri
 #[derive(Debug)]
 struct Args {
     config: PathBuf,
+    /// `-c/--config` was given: a missing file is then an error, not defaults.
+    config_explicit: bool,
     bind: Option<String>,
     command: Option<String>,
     identity: Option<PathBuf>,
@@ -1010,12 +1007,53 @@ struct Args {
     /// `--rotate-from` is set. See dev_docs/specs/TOFU_FINGERPRINT.md §6.
     from_version: Option<u32>,
     verbose: u8,
-    help: bool,
 }
 
+/// Parse the process arguments. `--help` and `--version` print and exit
+/// here, before any startup work; an unknown argument or a missing value
+/// exits non-zero. A mistyped flag must never fall through to starting a
+/// second server (found on a production box, 18 Nov 2026).
 fn parse_args() -> Args {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match parse_argv(&argv) {
+        Ok(ParseOutcome::Run(args)) => args,
+        Ok(ParseOutcome::Help) => {
+            print_help();
+            std::process::exit(0);
+        }
+        Ok(ParseOutcome::Version) => {
+            println!("rvpn-server {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("rvpn-server: {e}");
+            eprintln!("Run 'rvpn-server --help' for usage.");
+            std::process::exit(2);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ParseOutcome {
+    Run(Args),
+    Help,
+    Version,
+}
+
+/// Arguments without the program name. Pure, so it can be tested.
+fn parse_argv(argv: &[String]) -> Result<ParseOutcome, String> {
+    // Help and version win wherever they appear, so `rvpn-server -c x --version`
+    // never starts anything either.
+    if argv.iter().any(|a| a == "-h" || a == "--help") {
+        return Ok(ParseOutcome::Help);
+    }
+    if argv.iter().any(|a| a == "-V" || a == "--version") {
+        return Ok(ParseOutcome::Version);
+    }
+
     let mut args = Args {
         config: PathBuf::from("server.toml"),
+        config_explicit: false,
         bind: None,
         command: None,
         identity: None,
@@ -1023,66 +1061,46 @@ fn parse_args() -> Args {
         rotate_from: None,
         from_version: None,
         verbose: 0,
-        help: false,
     };
 
-    let argv: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-
-    while i < argv.len() {
-        match argv[i].as_str() {
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        let mut value = |flag: &str| -> Result<String, String> {
+            match it.next() {
+                Some(v) if !v.starts_with('-') || v == "-" => Ok(v.clone()),
+                _ => Err(format!("{flag} needs a value")),
+            }
+        };
+        match arg.as_str() {
             "-c" | "--config" => {
-                i += 1;
-                if i < argv.len() {
-                    args.config = PathBuf::from(&argv[i]);
-                }
+                args.config = PathBuf::from(value("--config")?);
+                args.config_explicit = true;
             }
-            "-b" | "--bind" => {
-                i += 1;
-                if i < argv.len() {
-                    args.bind = Some(argv[i].clone());
-                }
-            }
-            "-v" | "--verbose" => args.verbose += 1,
-            "-h" | "--help" => args.help = true,
-            "keygen" => args.command = Some("keygen".to_string()),
-            "prekey-bundle" => args.command = Some("prekey-bundle".to_string()),
-            "--identity" => {
-                i += 1;
-                if i < argv.len() {
-                    args.identity = Some(PathBuf::from(&argv[i]));
-                }
-            }
-            "-o" | "--output" => {
-                i += 1;
-                if i < argv.len() {
-                    args.output = Some(PathBuf::from(&argv[i]));
-                }
-            }
-            "--rotate-from" => {
-                i += 1;
-                if i < argv.len() {
-                    args.rotate_from = Some(PathBuf::from(&argv[i]));
-                }
-            }
+            "-b" | "--bind" => args.bind = Some(value("--bind")?),
+            "-v" | "--verbose" => args.verbose = args.verbose.saturating_add(1),
+            "--identity" => args.identity = Some(PathBuf::from(value("--identity")?)),
+            "-o" | "--output" => args.output = Some(PathBuf::from(value("--output")?)),
+            "--rotate-from" => args.rotate_from = Some(PathBuf::from(value("--rotate-from")?)),
             "--from-version" => {
-                i += 1;
-                if i < argv.len() {
-                    match argv[i].parse::<u32>() {
-                        Ok(v) => args.from_version = Some(v),
-                        Err(_) => {
-                            eprintln!("--from-version expects a non-negative integer");
-                            std::process::exit(2);
-                        }
-                    }
-                }
+                let v = value("--from-version")?;
+                args.from_version =
+                    Some(v.parse::<u32>().map_err(|_| {
+                        "--from-version expects a non-negative integer".to_string()
+                    })?);
             }
-            _ => {}
+            "keygen" | "prekey-bundle" => {
+                if let Some(prev) = &args.command {
+                    return Err(format!(
+                        "only one command allowed (got '{prev}' and '{arg}')"
+                    ));
+                }
+                args.command = Some(arg.clone());
+            }
+            other => return Err(format!("unrecognised argument '{other}'")),
         }
-        i += 1;
     }
 
-    args
+    Ok(ParseOutcome::Run(args))
 }
 
 fn print_help() {
@@ -1095,6 +1113,7 @@ fn print_help() {
     println!("  -b, --bind ADDR      Bind address (overrides config)");
     println!("  -v, --verbose        Verbose output (use multiple times for more)");
     println!("  -h, --help           Print this help");
+    println!("  -V, --version        Print the version");
     println!();
     println!("Commands:");
     println!("  keygen               Generate server identity key");
@@ -1123,7 +1142,7 @@ fn print_help() {
     println!("      --from-version 1");
 }
 
-async fn load_config(path: &PathBuf) -> ServerConfig {
+async fn load_config(path: &PathBuf, explicit: bool) -> ServerConfig {
     if path.exists() {
         match ServerConfig::load(path) {
             Ok(config) => {
@@ -1135,6 +1154,9 @@ async fn load_config(path: &PathBuf) -> ServerConfig {
                 std::process::exit(1);
             }
         }
+    } else if explicit {
+        error!("Config file {:?} not found", path);
+        std::process::exit(1);
     } else {
         info!("No config file found at {:?}. Using defaults.", path);
         ServerConfig::default()
@@ -1335,4 +1357,87 @@ fn prekey_bundle(
     info!("Generated private key: {:?}", private_output_path);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+
+    fn parse(a: &[&str]) -> Result<ParseOutcome, String> {
+        parse_argv(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn version_and_help_never_run() {
+        for a in [
+            &["--version"][..],
+            &["-V"],
+            &["-c", "/etc/rvpn/server.toml", "--version"],
+            &["keygen", "-V"],
+        ] {
+            assert!(matches!(parse(a), Ok(ParseOutcome::Version)), "{a:?}");
+        }
+        for a in [&["--help"][..], &["-h"], &["--bogus", "-h"]] {
+            assert!(matches!(parse(a), Ok(ParseOutcome::Help)), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_argument_is_rejected() {
+        for a in [&["--confg", "x"][..], &["--versoin"], &["serve"], &["-x"]] {
+            assert!(parse(a).is_err(), "{a:?} must not start a server");
+        }
+    }
+
+    #[test]
+    fn missing_value_is_rejected() {
+        for a in [
+            &["-c"][..],
+            &["--bind"],
+            &["-c", "--verbose"],
+            &["--from-version"],
+            &["--from-version", "abc"],
+        ] {
+            assert!(parse(a).is_err(), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn one_command_only() {
+        assert!(parse(&["keygen", "prekey-bundle"]).is_err());
+    }
+
+    #[test]
+    fn valid_invocations_still_parse() {
+        let Ok(ParseOutcome::Run(a)) = parse(&["--config", "/etc/rvpn/server.toml", "-v", "-v"])
+        else {
+            panic!()
+        };
+        assert_eq!(a.config, PathBuf::from("/etc/rvpn/server.toml"));
+        assert!(a.config_explicit);
+        assert_eq!(a.verbose, 2);
+        assert!(a.command.is_none());
+
+        let Ok(ParseOutcome::Run(a)) = parse(&[]) else {
+            panic!()
+        };
+        assert!(!a.config_explicit);
+
+        let Ok(ParseOutcome::Run(a)) = parse(&[
+            "prekey-bundle",
+            "--identity",
+            "new.key",
+            "-o",
+            "b.json",
+            "--rotate-from",
+            "old.key",
+            "--from-version",
+            "1",
+        ]) else {
+            panic!()
+        };
+        assert_eq!(a.command.as_deref(), Some("prekey-bundle"));
+        assert_eq!(a.from_version, Some(1));
+        assert_eq!(a.rotate_from, Some(PathBuf::from("old.key")));
+    }
 }
