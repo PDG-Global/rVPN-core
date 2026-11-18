@@ -2,8 +2,10 @@
 # R-VPN Universal Installer
 #
 # Usage:
-#   curl -fsSL https://assets.rvpn.org/install.sh | bash
-#   # Or:
+#   Download the installer from a release tag, read it, then run it:
+#   curl -fsSL https://raw.githubusercontent.com/PDG-Global/rvpn-core/<tag>/scripts/install.sh -o install.sh
+#   sudo bash install.sh
+#   # Or with options:
 #   bash install.sh [OPTIONS]
 #
 # Options:
@@ -33,7 +35,7 @@ RVPN_SIGN_NAMESPACE="rvpn-release"
 # Rollback floor: minimum acceptable release version. Bump at tag time
 # (same ceremony as CORE_VERSION). A genuinely signed OLD release served by bucket
 # write is refused because its signed manifest version is below this floor.
-RVPN_MIN_VERSION="1.3.8"
+RVPN_MIN_VERSION="1.3.9"
 VERIFIED_MANIFEST=""
 MANIFEST_DIR=""
 INSTALL_DIR="/usr/local/bin"
@@ -1033,7 +1035,7 @@ check_root() {
             return 0
         fi
         error "This script must be run as root (or with sudo)"
-        echo "Usage: curl -fsSL https://assets.rvpn.org/install.sh | sudo bash"
+        echo "Download install.sh from the release, read it, then run: sudo bash install.sh"
         exit 1
     fi
 }
