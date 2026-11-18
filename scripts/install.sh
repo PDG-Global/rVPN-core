@@ -1111,7 +1111,7 @@ cat << 'BANNER'
 
 BANNER
 echo -e "${NC}"
-echo "  Encrypted VPN • Zero Knowledge • Open Source"
+echo "  Encrypted VPN • Open Source • Self-Hosted"
 echo ""
 info "OS:       $OS ($ARCH)"
 info "Binary:   $BINARY"
