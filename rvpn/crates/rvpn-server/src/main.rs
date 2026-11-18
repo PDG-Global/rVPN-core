@@ -99,8 +99,28 @@ async fn run_server(config: ServerConfig) -> Result<()> {
     // Operator-configured public_addresses (1:1 NAT) are denied too. Fail
     // closed: refuse to accept clients if the address set cannot be
     // enumerated, and keep it refreshed as interfaces change.
-    rvpn_server::egress::initialize_host_egress_policy(&config.network.public_addresses)
-        .context("Host egress policy initialization failed; refusing to accept clients")?;
+    // The opt-in client-egress exemptions (C24: allow_client_to_client,
+    // allowed_internal_ranges) are parsed and validated here; dangerous
+    // allow-list entries refuse startup. Host-address denial always wins
+    // over the exemptions, at init and on every refresh.
+    let client_policy = rvpn_server::egress::ClientEgressPolicy::from_config(
+        config.network.allow_client_to_client,
+        &config.tun.tun_ip,
+        &config.network.allowed_internal_ranges,
+    )
+    .context("Invalid client egress policy configuration")?;
+    if client_policy.allow_client_to_client || !client_policy.allowed_ranges.is_empty() {
+        info!(
+            "Client egress exemptions enabled (C24): allow_client_to_client={}, allowed_internal_ranges={:?}",
+            client_policy.allow_client_to_client,
+            config.network.allowed_internal_ranges
+        );
+    }
+    rvpn_server::egress::initialize_host_egress_policy(
+        &config.network.public_addresses,
+        client_policy,
+    )
+    .context("Host egress policy initialization failed; refusing to accept clients")?;
     rvpn_server::egress::spawn_host_egress_refresh();
 
     // Initialize TUN server if configured (must be done before creating handlers)

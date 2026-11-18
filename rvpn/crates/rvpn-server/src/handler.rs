@@ -1779,6 +1779,9 @@ where
             let ratchet = ratchet.clone();
             let tun_server_for_receiver = tun_server.clone();
             let tcp_pool = self.tcp_pool.clone();
+            // The session's assigned tunnel IP: the uplink source check in
+            // dispatch_decrypted_frame compares every packet against it.
+            let tun_assigned_ip = allocated_ip_for_tun;
             let session_start = Instant::now();
             let frame_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let frame_counter_clone = frame_counter.clone();
@@ -1838,6 +1841,7 @@ where
                                             &dns_cache,
                                             tun_server_for_receiver.as_ref(),
                                             &tun_config,
+                                            tun_assigned_ip,
                                             &pending_flows,
                                             &tcp_pool,
                                             frame_num,
@@ -2315,6 +2319,7 @@ where
         dns_cache: &DnsCache,
         tun_server: Option<&Arc<dyn TunWriter>>,
         tun_config: &TunNetworkConfig,
+        tun_assigned_ip: Option<std::net::IpAddr>,
         pending_flows: &PendingFlows,
         frame_number: u64,
         elapsed: Duration,
@@ -2506,6 +2511,13 @@ where
                     client_ip_str
                 );
 
+                if !Self::tun_source_permitted(payload, tun_assigned_ip) {
+                    Self::log_spoofed_tun_source(frame_number);
+                    return Err(anyhow::anyhow!(
+                        "TUN mode: packet source does not match the session's assigned tunnel IP"
+                    ));
+                }
+
                 if let Err(e) = ts.write_to_tun(payload).await {
                     error!(
                         "FRAME: [#{:05}] Failed to write to TUN: {}",
@@ -2677,6 +2689,59 @@ where
         } else {
             None
         }
+    }
+
+    /// Log a spoofed-source TUN drop WITHOUT any client identifier (the
+    /// assigned tunnel IP is one — log-privacy rule). A malicious client can
+    /// send one bad packet per frame, so the WARN is rate-limited to one per
+    /// minute process-wide; the rest go to debug. The drop itself is always
+    /// enforced regardless of logging.
+    fn log_spoofed_tun_source(frame_number: u64) {
+        use std::sync::atomic::Ordering;
+        static LAST_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = LAST_WARN_SECS.load(Ordering::Relaxed);
+        let due = now.saturating_sub(last) >= 60
+            && LAST_WARN_SECS
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
+        if due {
+            warn!(
+                "FRAME: [#{:05}] TUN mode: dropping packet — source is not the session's assigned tunnel IP (rate-limited; further drops at debug level)",
+                frame_number
+            );
+        } else {
+            debug!(
+                "FRAME: [#{:05}] TUN mode: dropping packet — source is not the session's assigned tunnel IP",
+                frame_number
+            );
+        }
+    }
+
+    /// C24 review fix: a TUN session may only send packets whose source is
+    /// exactly its own assigned tunnel address. Without this check a client
+    /// can spoof another client's pool address — steering internet replies
+    /// into that client's tunnel (pre-existing on main), or impersonating
+    /// them when client-to-client is enabled. No assigned lease means no
+    /// uplink at all (fail closed). IPv6 has no pool and no lease, so a v6
+    /// source can never match.
+    fn tun_source_permitted(payload: &[u8], assigned: Option<std::net::IpAddr>) -> bool {
+        let Some(assigned) = assigned else {
+            return false;
+        };
+        if payload.len() < 20 || payload[0] >> 4 != 4 {
+            return false;
+        }
+        let source = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            payload[12],
+            payload[13],
+            payload[14],
+            payload[15],
+        ));
+        source == assigned
     }
 
     /// Parse a target string as an IP literal SocketAddr.
@@ -3514,6 +3579,7 @@ where
         dns_cache: &DnsCache,
         _tun_server: Option<&Arc<dyn TunWriter>>,
         tun_config: &TunNetworkConfig,
+        tun_assigned_ip: Option<std::net::IpAddr>,
         pending_flows: &PendingFlows,
         tcp_pool: &TcpPool,
         frame_number: u64,
@@ -3602,6 +3668,13 @@ where
                     payload.len(),
                     client_ip_str
                 );
+
+                if !Self::tun_source_permitted(payload, tun_assigned_ip) {
+                    Self::log_spoofed_tun_source(frame_number);
+                    return Err(anyhow::anyhow!(
+                        "TUN mode: packet source does not match the session's assigned tunnel IP"
+                    ));
+                }
 
                 if let Err(e) = ts.write_to_tun(payload).await {
                     error!(
@@ -4342,5 +4415,172 @@ mod egress_policy_tests {
         ]);
         assert!(ipv4.is_empty());
         assert!(ipv6.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tun_source_tests {
+    use super::*;
+
+    /// Records every packet written through the TunWriter trait so the test
+    /// can assert both halves of the contract: spoofed source dropped (no
+    /// write), own source delivered (exact bytes written).
+    #[derive(Default)]
+    struct RecordingTun {
+        packets: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl TunWriter for RecordingTun {
+        fn write_to_tun(
+            &self,
+            packet: &[u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>>
+        {
+            self.packets.lock().unwrap().push(packet.to_vec());
+            Box::pin(async { Ok(()) })
+        }
+        fn register_client(
+            &self,
+            _client_ip: std::net::IpAddr,
+            _sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+        fn unregister_client(
+            &self,
+            _client_ip: std::net::IpAddr,
+            _client_id: &str,
+            _sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+        fn allocate_ip(
+            &self,
+            _client_id: String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<std::net::IpAddr>> + Send + '_>,
+        > {
+            Box::pin(async { Ok("10.200.0.5".parse().unwrap()) })
+        }
+    }
+
+    fn packet(source: &str, destination: &str) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&40u16.to_be_bytes());
+        p[8] = 64;
+        p[9] = 6;
+        p[12..16].copy_from_slice(&source.parse::<std::net::Ipv4Addr>().unwrap().octets());
+        p[16..20].copy_from_slice(&destination.parse::<std::net::Ipv4Addr>().unwrap().octets());
+        p
+    }
+
+    async fn dispatch_tun_frame(
+        writer: &Arc<dyn TunWriter>,
+        payload: &[u8],
+        assigned: Option<std::net::IpAddr>,
+    ) -> anyhow::Result<()> {
+        let flows: FlowMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+        let (tun_tx, _tun_rx) = tokio::sync::mpsc::channel(8);
+        let dns_cache: DnsCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let tcp_pool: TcpPool = Arc::new(Mutex::new(HashMap::new()));
+        let pending_flows: PendingFlows = tokio::sync::Mutex::new(HashMap::new());
+        let mut tun_config = TunNetworkConfig::default();
+        tun_config.enabled = true;
+        MultiplexerSession::<tokio::net::TcpStream>::dispatch_decrypted_frame(
+            1, // non-zero flow id with no established flow -> TUN branch
+            payload,
+            1,
+            &flows,
+            &tx,
+            &control_tx,
+            &tun_tx,
+            "192.0.2.1:443".parse().unwrap(),
+            &dns_cache,
+            Some(writer),
+            &tun_config,
+            assigned,
+            &pending_flows,
+            &tcp_pool,
+            1,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn session_with_ip_5_spoofing_6_is_dropped_and_5_is_written() {
+        let recorder = Arc::new(RecordingTun::default());
+        let writer: Arc<dyn TunWriter> = recorder.clone();
+        let assigned: Option<std::net::IpAddr> = Some("10.200.0.5".parse().unwrap());
+
+        // Spoofed source (.6, another client's pool address): dropped, and
+        // nothing reaches the TUN device.
+        let spoofed = packet("10.200.0.6", "1.1.1.1");
+        assert!(dispatch_tun_frame(&writer, &spoofed, assigned)
+            .await
+            .is_err());
+        assert!(recorder.packets.lock().unwrap().is_empty());
+
+        // A source outside the pool entirely is dropped too.
+        let outside = packet("8.8.8.8", "1.1.1.1");
+        assert!(dispatch_tun_frame(&writer, &outside, assigned)
+            .await
+            .is_err());
+        assert!(recorder.packets.lock().unwrap().is_empty());
+
+        // The session's own source: written byte-for-byte.
+        let own = packet("10.200.0.5", "1.1.1.1");
+        dispatch_tun_frame(&writer, &own, assigned).await.unwrap();
+        assert_eq!(&*recorder.packets.lock().unwrap(), &[own]);
+    }
+
+    #[tokio::test]
+    async fn no_assigned_lease_means_no_uplink() {
+        let recorder = Arc::new(RecordingTun::default());
+        let writer: Arc<dyn TunWriter> = recorder.clone();
+        // Allocation failed (or TUN frames before assignment): fail closed.
+        let own = packet("10.200.0.5", "1.1.1.1");
+        assert!(dispatch_tun_frame(&writer, &own, None).await.is_err());
+        assert!(recorder.packets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_guard_rejects_malformed_and_ipv6_packets() {
+        let assigned: Option<std::net::IpAddr> = Some("10.200.0.5".parse().unwrap());
+        assert!(
+            MultiplexerSession::<tokio::net::TcpStream>::tun_source_permitted(
+                &packet("10.200.0.5", "1.1.1.1"),
+                assigned
+            )
+        );
+        assert!(
+            !MultiplexerSession::<tokio::net::TcpStream>::tun_source_permitted(
+                &packet("10.200.0.6", "1.1.1.1"),
+                assigned
+            )
+        );
+        // Truncated, non-IPv4, and v6 packets never match a v4 lease.
+        assert!(
+            !MultiplexerSession::<tokio::net::TcpStream>::tun_source_permitted(
+                &[0x45; 19],
+                assigned
+            )
+        );
+        let mut v6 = vec![0x60; 40];
+        v6[8..24].copy_from_slice(
+            &"10.200.0.5".parse::<std::net::Ipv4Addr>().unwrap().octets()[..4].repeat(4),
+        );
+        assert!(!MultiplexerSession::<tokio::net::TcpStream>::tun_source_permitted(&v6, assigned));
+        assert!(
+            !MultiplexerSession::<tokio::net::TcpStream>::tun_source_permitted(
+                &packet("10.200.0.5", "1.1.1.1"),
+                None
+            )
+        );
     }
 }

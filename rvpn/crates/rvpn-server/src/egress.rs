@@ -34,6 +34,179 @@ fn host_address_state() -> &'static RwLock<HostAddressState> {
     HOST_ADDRESSES.get_or_init(|| RwLock::new(HostAddressState::default()))
 }
 
+/// A parsed CIDR: network address normalized to the prefix, plus the prefix.
+pub type Cidr = (IpAddr, u8);
+
+/// Parse `address/prefix` (IPv4 or IPv6) into a normalized [`Cidr`].
+/// IPv4-mapped IPv6 CIDRs with prefix >= 96 are canonicalized to IPv4.
+pub fn parse_cidr(text: &str) -> Result<Cidr> {
+    let (address, prefix) = text
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("CIDR must use address/prefix notation: {text}"))?;
+    let address: IpAddr = address
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid address in CIDR: {text}"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid prefix in CIDR: {text}"))?;
+    let (address, prefix) = match address {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) if prefix >= 96 => (IpAddr::V4(v4), prefix - 96),
+            Some(_) => anyhow::bail!("IPv4-mapped CIDR needs prefix >= 96: {text}"),
+            None => (IpAddr::V6(v6), prefix),
+        },
+        v4 => (v4, prefix),
+    };
+    let max = if address.is_ipv4() { 32 } else { 128 };
+    if prefix > max {
+        anyhow::bail!("Prefix out of range in CIDR: {text}");
+    }
+    let network = match address {
+        IpAddr::V4(v4) => IpAddr::V4(Ipv4Addr::from(u32::from(v4) & prefix_mask_v4(prefix))),
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & prefix_mask_v6(prefix))),
+    };
+    Ok((network, prefix))
+}
+
+/// Whether `cidr` contains `addr` (IPv4-mapped addresses canonicalized to v4).
+pub fn cidr_contains(cidr: &Cidr, addr: IpAddr) -> bool {
+    let addr = canonical_ip(addr);
+    match (cidr.0, addr) {
+        (IpAddr::V4(net), IpAddr::V4(addr)) => {
+            ipv4_prefix_contains(u32::from(addr), u32::from(net), cidr.1)
+        }
+        (IpAddr::V6(net), IpAddr::V6(addr)) => {
+            ipv6_prefix_contains(u128::from(addr), u128::from(net), cidr.1)
+        }
+        _ => false,
+    }
+}
+
+fn canonical_ip(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(addr),
+        v4 => v4,
+    }
+}
+
+fn cidrs_overlap(a: &Cidr, b: &Cidr) -> bool {
+    cidr_contains(a, b.0) || cidr_contains(b, a.0)
+}
+
+fn fmt_cidr(cidr: &Cidr) -> String {
+    format!("{}/{}", cidr.0, cidr.1)
+}
+
+/// Opt-in exemptions to the client uplink egress boundary (register C24,
+/// task #rVPN:#18). Defaults are the strict v1.3.7+ containment: no
+/// client-to-client, no internal ranges. Both settings apply to the raw TUN
+/// uplink filter, the iptables RVPN_FORWARD chain and the pf anchor; the
+/// server's own relay paths ([`is_blocked_egress`]) never consult them.
+#[derive(Debug, Clone, Default)]
+pub struct ClientEgressPolicy {
+    /// Permit client-to-client traffic within the server's own TUN pool.
+    pub allow_client_to_client: bool,
+    /// Normalized pool network (from `tun.tun_ip`).
+    pub tun_subnet: Option<(Ipv4Addr, u8)>,
+    /// The TUN gateway address itself: always denied, even with the flag on
+    /// (it is a host address; the interface may not exist yet at init time).
+    pub tun_gateway: Option<IpAddr>,
+    /// Operator-listed internal ranges clients may reach (validated).
+    pub allowed_ranges: Vec<Cidr>,
+}
+
+impl ClientEgressPolicy {
+    /// Parse and validate the policy from configuration. Refuses dangerous
+    /// allow-list entries (default routes, loopback, link-local/metadata,
+    /// IPv6 ULA); host-address containment is checked at initialization,
+    /// once the host's addresses have been enumerated.
+    pub fn from_config(
+        allow_client_to_client: bool,
+        tun_ip: &str,
+        allowed_internal_ranges: &[String],
+    ) -> Result<Self> {
+        let mut policy = Self {
+            allow_client_to_client,
+            ..Default::default()
+        };
+        let normalized = normalized_tun_subnet(tun_ip)?;
+        if let (IpAddr::V4(network), prefix) = parse_cidr(&normalized)? {
+            policy.tun_subnet = Some((network, prefix));
+        }
+        let gateway: IpAddr = tun_ip
+            .split('/')
+            .next()
+            .unwrap_or(tun_ip)
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid TUN address: {tun_ip}"))?;
+        policy.tun_gateway = Some(gateway);
+        for text in allowed_internal_ranges {
+            let cidr = parse_cidr(text)
+                .with_context(|| format!("Invalid allowed_internal_ranges entry: {text}"))?;
+            validate_allowed_range(&cidr, text)?;
+            // No IPv6 pool exists and the uplink drops every IPv6 packet, so
+            // a v6 entry could never be used — but it would still install an
+            // ip6tables exemption, breaking the no-v6-forward invariant.
+            // Refuse until an IPv6 pool exists.
+            if cidr.0.is_ipv6() {
+                anyhow::bail!(
+                    "allowed_internal_ranges entry {text} is IPv6 — refused until an IPv6 pool exists (the IPv6 uplink is disabled)"
+                );
+            }
+            // An entry overlapping the pool would re-open client-to-client
+            // through the allow-list with the flag off. The pool is governed
+            // by allow_client_to_client only.
+            if let Some((network, prefix)) = policy.tun_subnet {
+                let pool = (IpAddr::V4(network), prefix);
+                if cidrs_overlap(&cidr, &pool) {
+                    anyhow::bail!(
+                        "allowed_internal_ranges entry {text} overlaps the TUN pool {} — client-to-client is governed by allow_client_to_client only; refusing to start",
+                        fmt_cidr(&pool)
+                    );
+                }
+            }
+            policy.allowed_ranges.push(cidr);
+        }
+        Ok(policy)
+    }
+}
+
+/// Ranges that must never appear in `allowed_internal_ranges`: loopback,
+/// link-local (cloud metadata at 169.254.169.254), IPv6 loopback, link-local
+/// and ULA (fc00::/7 covers fd00::/8 and the fd00:ec2::254 metadata endpoint).
+fn forbidden_policy_ranges() -> Vec<Cidr> {
+    vec![
+        (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8),
+        (IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16),
+        (IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
+        (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 10),
+        (IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)), 7),
+    ]
+}
+
+fn validate_allowed_range(cidr: &Cidr, text: &str) -> Result<()> {
+    if cidr.1 == 0 {
+        anyhow::bail!(
+            "allowed_internal_ranges entry {text} is a default route — refusing to start"
+        );
+    }
+    for forbidden in forbidden_policy_ranges() {
+        if cidrs_overlap(cidr, &forbidden) {
+            anyhow::bail!(
+                "allowed_internal_ranges entry {text} overlaps {} (loopback/link-local/metadata/ULA) — refusing to start",
+                fmt_cidr(&forbidden)
+            );
+        }
+    }
+    Ok(())
+}
+
+static CLIENT_EGRESS_POLICY: OnceLock<RwLock<ClientEgressPolicy>> = OnceLock::new();
+
+fn client_egress_policy() -> &'static RwLock<ClientEgressPolicy> {
+    CLIENT_EGRESS_POLICY.get_or_init(|| RwLock::new(ClientEgressPolicy::default()))
+}
+
 /// Special-use IPv4 destinations that must never be reached through client egress.
 pub const BLOCKED_IPV4_CIDRS: &[&str] = &[
     "0.0.0.0/8",
@@ -106,11 +279,39 @@ fn is_blocked_by_host_addresses(addr: IpAddr, host_addresses: &HashSet<IpAddr>) 
 /// `configured_public` lists operator-known public addresses that are not on
 /// any local interface (1:1 NAT cloud deployments); they are denied in
 /// addition to every enumerated interface address and survive refreshes.
-pub fn initialize_host_egress_policy(configured_public: &[IpAddr]) -> Result<()> {
+///
+/// `policy` carries the opt-in client-egress exemptions (C24). Allow-list
+/// entries containing any of the server's own addresses are refused here,
+/// after enumeration; the runtime filter also denies host addresses ahead of
+/// every exemption, so addresses that appear later (60s refresh) stay denied.
+pub fn initialize_host_egress_policy(
+    configured_public: &[IpAddr],
+    policy: ClientEgressPolicy,
+) -> Result<()> {
     if let Ok(mut state) = host_address_state().write() {
         state.configured = configured_public.iter().copied().collect();
     }
-    refresh_host_egress_policy()
+    refresh_host_egress_policy()?;
+    {
+        let state = host_address_state()
+            .read()
+            .map_err(|_| anyhow::anyhow!("Host-address policy lock is poisoned"))?;
+        for cidr in &policy.allowed_ranges {
+            for host in state.addresses.iter().chain(state.configured.iter()) {
+                if cidr_contains(cidr, *host) {
+                    anyhow::bail!(
+                        "allowed_internal_ranges entry {} contains the server's own address {host} — refusing to start",
+                        fmt_cidr(cidr)
+                    );
+                }
+            }
+        }
+    }
+    match client_egress_policy().write() {
+        Ok(mut stored) => *stored = policy,
+        Err(_) => anyhow::bail!("Client egress policy lock is poisoned"),
+    }
+    Ok(())
 }
 
 /// Refresh host addresses every minute; failed refreshes deny all client egress.
@@ -206,6 +407,17 @@ pub(crate) fn set_host_policy_for_test(addrs: &[IpAddr]) {
         state.initialized = true;
         state.addresses = addrs.iter().copied().collect();
         state.configured.clear();
+    }
+    // Reset the C24 exemptions too, so tests never inherit a policy.
+    if let Ok(mut stored) = client_egress_policy().write() {
+        *stored = ClientEgressPolicy::default();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_client_policy_for_test(policy: ClientEgressPolicy) {
+    if let Ok(mut stored) = client_egress_policy().write() {
+        *stored = policy;
     }
 }
 
@@ -346,7 +558,49 @@ pub fn permitted_tun_destination(packet: &[u8]) -> Option<IpAddr> {
         }
         _ => return None,
     };
-    (!is_blocked_egress(destination)).then_some(destination)
+    client_destination_permitted(destination).then_some(destination)
+}
+
+/// Client uplink destination policy (C24). Order is load-bearing:
+/// fail-closed uninitialized state, then host-address denial (wins over every
+/// exemption — the pool contains the gateway, a listed range could contain a
+/// host address), then the opt-in pool/list exemptions, then the special-use
+/// boundary. The server's own relay paths use [`is_blocked_egress`] instead
+/// and never consult the exemptions.
+fn client_destination_permitted(dest: IpAddr) -> bool {
+    let state = match host_address_state().read() {
+        Ok(state) => state,
+        Err(_) => return false,
+    };
+    if !state.initialized {
+        return false;
+    }
+    let canonical = canonical_ip(dest);
+    if state.addresses.contains(&dest) || state.addresses.contains(&canonical) {
+        return false;
+    }
+    let policy = match client_egress_policy().read() {
+        Ok(policy) => policy,
+        Err(_) => return false,
+    };
+    if Some(canonical) == policy.tun_gateway {
+        return false;
+    }
+    if policy.allow_client_to_client {
+        if let (IpAddr::V4(addr), Some((network, prefix))) = (canonical, policy.tun_subnet) {
+            if ipv4_prefix_contains(u32::from(addr), u32::from(network), prefix) {
+                return true;
+            }
+        }
+    }
+    if policy
+        .allowed_ranges
+        .iter()
+        .any(|cidr| cidr_contains(cidr, canonical))
+    {
+        return true;
+    }
+    !is_blocked_special_address(dest)
 }
 
 fn parse_ipv4_destination(packet: &[u8]) -> Option<IpAddr> {
@@ -436,7 +690,11 @@ mod tests {
         // 8.8.8.8 / 2606:4700:4700::1111 are not special-use ranges, so their
         // denial can only come from the configured list. This also exercises
         // real interface enumeration on the host (ip/ifconfig).
-        initialize_host_egress_policy(&[ip("8.8.8.8"), ip("2606:4700:4700::1111")]).unwrap();
+        initialize_host_egress_policy(
+            &[ip("8.8.8.8"), ip("2606:4700:4700::1111")],
+            ClientEgressPolicy::default(),
+        )
+        .unwrap();
         assert!(is_blocked_egress(ip("8.8.8.8")));
         assert!(is_blocked_egress(ip("2606:4700:4700::1111")));
 
@@ -674,5 +932,173 @@ mod tests {
         let mut bad_v6_len = valid_v6;
         bad_v6_len[5] += 1;
         assert_eq!(permitted_tun_destination(&bad_v6_len), None);
+    }
+
+    // ---- C24: opt-in client egress exemptions (task #rVPN:#18) ----
+
+    fn c2c_policy(allow: bool, ranges: &[&str]) -> ClientEgressPolicy {
+        let ranges: Vec<String> = ranges.iter().map(|text| text.to_string()).collect();
+        ClientEgressPolicy::from_config(allow, "10.200.0.1/24", &ranges).unwrap()
+    }
+
+    fn v4_dest(address: &str) -> Option<IpAddr> {
+        permitted_tun_destination(&ipv4_packet(address.parse().unwrap(), 6, 20))
+    }
+
+    #[test]
+    fn flag_off_preserves_strict_containment_byte_for_byte() {
+        let _guard = host_policy_test_lock().lock().unwrap();
+        set_host_policy_for_test(&[]);
+        // Default policy: pool peers stay blocked exactly as in v1.3.7/v1.3.8.
+        assert_eq!(v4_dest("10.200.0.5"), None);
+        assert_eq!(v4_dest("10.200.0.1"), None);
+        assert_eq!(v4_dest("1.1.1.1"), Some(ip("1.1.1.1")));
+    }
+
+    #[test]
+    fn flag_on_permits_pool_peers_only() {
+        let _guard = host_policy_test_lock().lock().unwrap();
+        set_host_policy_for_test(&[]);
+        set_client_policy_for_test(c2c_policy(true, &[]));
+
+        assert_eq!(v4_dest("10.200.0.5"), Some(ip("10.200.0.5")));
+        assert_eq!(v4_dest("10.200.0.254"), Some(ip("10.200.0.254")));
+        // The exemption is pool-specific: the rest of 10/8 and every other
+        // special-use range stays blocked, public internet stays open.
+        for blocked in [
+            "10.0.0.1",
+            "10.200.1.5",
+            "172.16.0.1",
+            "192.168.1.5",
+            "169.254.169.254",
+            "100.64.0.1",
+        ] {
+            assert_eq!(v4_dest(blocked), None, "{blocked}");
+        }
+        assert_eq!(v4_dest("1.1.1.1"), Some(ip("1.1.1.1")));
+        // The gateway is denied even though it sits inside the pool and was
+        // not enumerated (the TUN device may not exist yet at init time).
+        assert_eq!(v4_dest("10.200.0.1"), None);
+        // Relay paths never consult the exemption.
+        assert!(is_blocked_egress(ip("10.200.0.5")));
+        set_host_policy_for_test(&[]);
+    }
+
+    #[test]
+    fn host_addresses_win_over_the_pool_exemption() {
+        let _guard = host_policy_test_lock().lock().unwrap();
+        // A host address inside the pool (e.g. picked up by the 60s refresh)
+        // stays denied even with the flag on.
+        set_host_policy_for_test(&[ip("10.200.0.9")]);
+        set_client_policy_for_test(c2c_policy(true, &[]));
+        assert_eq!(v4_dest("10.200.0.9"), None);
+        assert_eq!(v4_dest("10.200.0.5"), Some(ip("10.200.0.5")));
+        set_host_policy_for_test(&[]);
+    }
+
+    #[test]
+    fn allowed_ranges_permit_listed_destinations_only() {
+        let _guard = host_policy_test_lock().lock().unwrap();
+        set_host_policy_for_test(&[]);
+        set_client_policy_for_test(c2c_policy(false, &["192.168.1.0/24"]));
+
+        assert_eq!(v4_dest("192.168.1.5"), Some(ip("192.168.1.5")));
+        assert_eq!(v4_dest("192.168.2.5"), None);
+        assert_eq!(v4_dest("10.0.0.1"), None);
+        assert_eq!(v4_dest("10.200.0.5"), None); // flag still off
+                                                 // A host address inside a listed range stays denied (refresh case).
+        set_host_policy_for_test(&[ip("192.168.1.10")]);
+        set_client_policy_for_test(c2c_policy(false, &["192.168.1.0/24"]));
+        assert_eq!(v4_dest("192.168.1.10"), None);
+        assert_eq!(v4_dest("192.168.1.5"), Some(ip("192.168.1.5")));
+        // Relays stay exemption-free.
+        assert!(is_blocked_egress(ip("192.168.1.5")));
+        set_host_policy_for_test(&[]);
+    }
+
+    #[test]
+    fn uninitialized_policy_denies_even_with_exemptions() {
+        let _guard = host_policy_test_lock().lock().unwrap();
+        set_host_policy_for_test(&[]);
+        set_client_policy_for_test(c2c_policy(true, &["192.168.1.0/24"]));
+        if let Ok(mut state) = host_address_state().write() {
+            state.initialized = false;
+        }
+        assert_eq!(v4_dest("10.200.0.5"), None);
+        assert_eq!(v4_dest("192.168.1.5"), None);
+        assert_eq!(v4_dest("1.1.1.1"), None);
+        set_host_policy_for_test(&[]);
+    }
+
+    #[test]
+    fn dangerous_allow_list_entries_refuse_startup() {
+        for bad in [
+            "0.0.0.0/0",
+            "::/0",
+            "127.0.0.0/8",
+            "127.5.0.0/16",
+            "169.254.0.0/16",
+            "169.254.5.0/24",
+            "::1/128",
+            "fe80::/10",
+            "fe80::1/128",
+            "fc00::/7",
+            "fd00::/8",
+            "fd00:ec2::254/128",
+            "not-a-cidr",
+            "192.168.1.0/33",
+            // Pool overlap: the allow-list must not re-open client-to-client
+            // with the flag off (exact, subset and superset all refused).
+            "10.200.0.0/24",
+            "10.200.0.128/25",
+            "10.0.0.0/8",
+            // IPv6 entries are refused until an IPv6 pool exists.
+            "2001:db8::/32",
+            "2606:4700::/32",
+        ] {
+            assert!(
+                ClientEgressPolicy::from_config(false, "10.200.0.1/24", &[bad.to_string()])
+                    .is_err(),
+                "accepted dangerous entry {bad}"
+            );
+        }
+        // Valid entries parse and normalize.
+        let policy = c2c_policy(false, &["192.168.1.5/24", "10.50.0.0/16"]);
+        assert_eq!(policy.allowed_ranges[0], (ip("192.168.1.0"), 24));
+        assert_eq!(policy.tun_subnet, Some(("10.200.0.0".parse().unwrap(), 24)));
+        assert_eq!(policy.tun_gateway, Some(ip("10.200.0.1")));
+    }
+
+    #[test]
+    fn allow_list_containing_a_server_address_refuses_initialization() {
+        let _guard = host_policy_test_lock().lock().unwrap();
+        // 192.0.2.0/24 is TEST-NET-1: never a real interface address, so the
+        // refusal can only come from the configured-public check.
+        let error = initialize_host_egress_policy(
+            &[ip("192.0.2.10")],
+            c2c_policy(false, &["192.0.2.0/24"]),
+        );
+        assert!(error.is_err());
+        set_host_policy_for_test(&[]);
+    }
+
+    #[test]
+    fn parse_cidr_normalizes_and_canonicalizes_mapped_addresses() {
+        assert_eq!(
+            parse_cidr("192.168.1.77/24").unwrap(),
+            (ip("192.168.1.0"), 24)
+        );
+        assert_eq!(
+            parse_cidr("::ffff:192.168.0.0/112").unwrap(),
+            (ip("192.168.0.0"), 16)
+        );
+        assert!(parse_cidr("::ffff:192.168.0.0/64").is_err());
+        assert!(cidr_contains(&(ip("10.200.0.0"), 24), ip("10.200.0.5")));
+        assert!(!cidr_contains(&(ip("10.200.0.0"), 24), ip("10.200.1.5")));
+        assert!(cidr_contains(
+            &(ip("10.200.0.0"), 24),
+            ip("::ffff:10.200.0.5")
+        ));
+        assert!(!cidr_contains(&(ip("10.200.0.0"), 24), ip("2606:4700::1")));
     }
 }
