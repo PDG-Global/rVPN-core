@@ -45,6 +45,37 @@ type QueryMsg = (
     oneshot::Sender<Option<DnsResponse>>,
 );
 
+struct WsManagerTask(tokio::task::JoinHandle<()>);
+
+impl Drop for WsManagerTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn receive_datagram(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    loop {
+        match socket.recv_from(buf).await {
+            // Windows reports ICMP errors from earlier UDP replies on recv_from.
+            // A client that closed its socket must not stop the DNS listener.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                debug!("DNS proxy: ignoring UDP peer error: {error}");
+            }
+            result => return result,
+        }
+    }
+}
+
 /// DNS-over-WebSocket proxy
 ///
 /// Listens for UDP DNS queries on a local port and resolves them through
@@ -143,14 +174,15 @@ impl DnsProxy {
 
         // WebSocket connection manager (runs in background, reconnects on failure)
         let self_clone = Arc::clone(&self);
-        tokio::spawn(async move {
+        let _ws_manager = WsManagerTask(tokio::spawn(async move {
             self_clone.run_ws_manager(query_rx).await;
-        });
+        }));
 
         // UDP receive loop
-        let mut buf = [0u8; 512];
+        // Receive complete EDNS datagrams to avoid WSAEMSGSIZE on Windows.
+        let mut buf = vec![0u8; 65535];
         loop {
-            let (n, src) = socket.recv_from(&mut buf).await?;
+            let (n, src) = receive_datagram(&socket, &mut buf).await?;
             let data = buf[..n].to_vec();
             let socket_clone = Arc::clone(&socket);
             let query_tx_clone = query_tx.clone();
@@ -963,4 +995,55 @@ fn build_dns_servfail(_query: &[u8], txid: u16) -> Vec<u8> {
     out[3] = 0x82; // RA=1, RCODE=2 (SERVFAIL)
                    // QDCOUNT=0, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0 (zeros from vec! init)
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn listener_survives_closed_udp_peer_and_receives_large_datagrams() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let closed_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let closed_address = closed_peer.local_addr().unwrap();
+        drop(closed_peer);
+        listener
+            .send_to(b"late reply", closed_address)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = vec![42u8; 4096];
+        client
+            .send_to(&payload, listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut buffer = vec![0u8; 65535];
+        let (length, source) = tokio::time::timeout(
+            Duration::from_secs(2),
+            receive_datagram(&listener, &mut buffer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(source, client.local_addr().unwrap());
+        assert_eq!(&buffer[..length], payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn listener_task_drop_stops_connection_manager() {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (stopped_tx, stopped_rx) = oneshot::channel::<()>();
+        let manager = WsManagerTask(tokio::spawn(async move {
+            let _stopped = stopped_tx;
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        ready_rx.await.unwrap();
+        drop(manager);
+        assert!(tokio::time::timeout(Duration::from_secs(2), stopped_rx)
+            .await
+            .unwrap()
+            .is_err());
+    }
 }
