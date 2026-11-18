@@ -4,8 +4,14 @@ All notable changes to rVPN are documented in this file.
 
 ## [Unreleased]
 
+## [1.3.9] — 2026-11-18
+
 ### Added
 
+- **The installer ships in this repository** at `scripts/install.sh`, and
+  install commands fetch it by release tag. The installer verifies the
+  signed release manifest fail-closed against a compiled-in release key and
+  refuses versions below its rollback floor (`RVPN_MIN_VERSION`). (#20)
 - **Opt-in client-to-client traffic and internal-range exemptions for TUN
   mode** (register C24, task #rVPN:#18). The containment introduced in
   v1.3.7 also blocked clients on the same server from reaching each other
@@ -28,6 +34,14 @@ All notable changes to rVPN are documented in this file.
   Operators upgrading from v1.3.6 who relied on client-to-client traffic
   must set `allow_client_to_client = true`.
 
+### Fixed
+
+- **`rvpn-server` rejects unknown command-line arguments** instead of
+  silently ignoring them, and `--version`/`--help` are handled before
+  startup (so they work without a config file and certificates). (#18)
+- **Installer usage text** no longer suggests piping a download straight
+  into a shell, and points at the release-tag origin. (#20)
+
 ### Security
 
 - **TUN uplink packets must carry the session's own assigned tunnel IP as
@@ -39,6 +53,9 @@ All notable changes to rVPN are documented in this file.
   now dropped before they reach the TUN device. The allowed-range firewall
   exemptions are bound to the pool as source (`-s <pool>` / `from $tun_net`)
   so a spoofed source can never reach an operator-listed LAN.
+- **CI supply-chain pinning:** every GitHub Actions `uses:` in this
+  repository's workflows is pinned to a full commit SHA verified against
+  the upstream ref. (#19)
 
 ## [1.3.8] — 2026-11-18
 
