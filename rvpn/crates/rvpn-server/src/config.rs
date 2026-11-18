@@ -267,6 +267,28 @@ pub struct NetworkConfig {
     /// back into the server's own services through the external IP.
     #[serde(default)]
     pub public_addresses: Vec<std::net::IpAddr>,
+
+    /// Permit client-to-client traffic within this server's own TUN pool
+    /// (register C24). Default false: the strict containment introduced in
+    /// v1.3.7 is preserved. When true, clients on the same server can reach
+    /// each other's pool addresses — LAN games, file sharing, local services.
+    /// The exemption is pool-specific; it never re-opens 10.0.0.0/8, and the
+    /// server's own addresses stay denied. Applies to the raw TUN path
+    /// (userspace filter, iptables FORWARD chain, pf anchor).
+    #[serde(default)]
+    pub allow_client_to_client: bool,
+
+    /// Internal CIDRs TUN clients may reach in addition to public internet
+    /// (e.g. ["192.168.1.0/24"] for a home LAN behind another router).
+    /// Default empty. Entries are validated at startup and the server
+    /// refuses to start on: a default route (0.0.0.0/0 or ::/0), loopback,
+    /// link-local/metadata (169.254.0.0/16, fe80::/10), IPv6 ULA (fc00::/7,
+    /// covering fd00::/8 and cloud metadata at fd00:ec2::254), or any range
+    /// containing one of the server's own addresses. Host-address denial
+    /// always wins over these exemptions, including addresses that appear
+    /// after startup (refreshed every 60s).
+    #[serde(default)]
+    pub allowed_internal_ranges: Vec<String>,
 }
 
 impl Default for NetworkConfig {
@@ -276,6 +298,8 @@ impl Default for NetworkConfig {
             dhcp_range: "10.200.0.0/24".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
             public_addresses: Vec::new(),
+            allow_client_to_client: false,
+            allowed_internal_ranges: Vec::new(),
         }
     }
 }

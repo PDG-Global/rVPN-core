@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use tracing::warn;
 
 use crate::config::ServerConfig;
-use crate::egress::{normalized_tun_subnet, BLOCKED_IPV4_CIDRS, BLOCKED_IPV6_CIDRS};
+use crate::egress::{self, normalized_tun_subnet, Cidr, BLOCKED_IPV4_CIDRS, BLOCKED_IPV6_CIDRS};
 
 const INPUT_CHAIN: &str = "RVPN_INPUT";
 const FORWARD_CHAIN: &str = "RVPN_FORWARD";
@@ -53,6 +53,8 @@ impl CommandRunner for SystemRunner {
 /// Configure containment before TUN starts; any failure aborts server startup.
 pub fn setup_tun_egress(config: &ServerConfig) -> Result<()> {
     let subnet = normalized_tun_subnet(&config.tun.tun_ip)?;
+    let allowed_ranges = parse_allowed_ranges(&config.network.allowed_internal_ranges)?;
+    let allow_c2c = config.network.allow_client_to_client;
     let mut runner = SystemRunner;
 
     #[cfg(target_os = "linux")]
@@ -68,6 +70,8 @@ pub fn setup_tun_egress(config: &ServerConfig) -> Result<()> {
             &subnet,
             config.network.nat_enabled,
             &config.network.public_addresses,
+            allow_c2c,
+            &allowed_ranges,
         )
     }
 
@@ -79,15 +83,30 @@ pub fn setup_tun_egress(config: &ServerConfig) -> Result<()> {
             &subnet,
             config.network.nat_enabled,
             &config.network.public_addresses,
+            allow_c2c,
+            &allowed_ranges,
             Path::new(PF_ANCHOR_PATH),
         )
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
-        let _ = (&mut runner, subnet);
+        let _ = (&mut runner, subnet, allowed_ranges, allow_c2c);
         anyhow::bail!("TUN egress containment is supported only on Linux and FreeBSD")
     }
+}
+
+/// Parse the operator allow-list (validated at startup by
+/// [`egress::ClientEgressPolicy::from_config`]; re-parsed here so the firewall
+/// layer never trusts an unchecked string).
+fn parse_allowed_ranges(ranges: &[String]) -> Result<Vec<Cidr>> {
+    ranges
+        .iter()
+        .map(|text| {
+            egress::parse_cidr(text)
+                .with_context(|| format!("Invalid allowed_internal_ranges entry: {text}"))
+        })
+        .collect()
 }
 
 fn run_checked(
@@ -116,6 +135,8 @@ fn setup_linux_firewall(
     subnet: &str,
     nat_enabled: bool,
     public_addresses: &[std::net::IpAddr],
+    allow_c2c: bool,
+    allowed_ranges: &[Cidr],
 ) -> Result<()> {
     validate_interface(tun_interface)?;
     setup_linux_filter_family(
@@ -125,6 +146,8 @@ fn setup_linux_firewall(
         Some(subnet),
         BLOCKED_IPV4_CIDRS,
         public_addresses,
+        allow_c2c,
+        allowed_ranges,
     )?;
     setup_linux_filter_family(
         runner,
@@ -133,6 +156,8 @@ fn setup_linux_firewall(
         None,
         BLOCKED_IPV6_CIDRS,
         public_addresses,
+        allow_c2c,
+        allowed_ranges,
     )?;
 
     if nat_enabled {
@@ -151,6 +176,8 @@ fn setup_linux_filter_family(
     subnet: Option<&str>,
     blocked_cidrs: &[&str],
     public_addresses: &[std::net::IpAddr],
+    allow_c2c: bool,
+    allowed_ranges: &[Cidr],
 ) -> Result<()> {
     ensure_owned_chain(runner, program, &[], INPUT_CHAIN)?;
     run_checked(
@@ -167,26 +194,10 @@ fn setup_linux_filter_family(
     )?;
 
     ensure_owned_chain(runner, program, &[], FORWARD_CHAIN)?;
-    for cidr in blocked_cidrs {
-        run_checked(
-            runner,
-            program,
-            &[
-                "-w",
-                "-A",
-                FORWARD_CHAIN,
-                "-i",
-                tun_interface,
-                "-d",
-                cidr,
-                "-j",
-                "DROP",
-            ],
-        )?;
-    }
     // Configured public addresses (1:1 NAT) are not on any interface, so the
     // interface-address blocks above cannot see them — drop them explicitly
     // to stop kernel-forwarded TUN traffic looping back through the NAT.
+    // These drops stay AHEAD of every exemption: the host is never reachable.
     for address in public_addresses {
         if address.is_ipv4() != (program == "iptables") {
             continue;
@@ -202,6 +213,70 @@ fn setup_linux_filter_family(
                 tun_interface,
                 "-d",
                 &address.to_string(),
+                "-j",
+                "DROP",
+            ],
+        )?;
+    }
+    // C24 opt-in exemptions, inserted BEFORE the special-use drops so they
+    // actually match (first-match wins). Client-to-client is pool-specific —
+    // never a re-opening of 10/8 — and both directions stay on the tunnel.
+    if allow_c2c {
+        if let Some(subnet) = subnet {
+            run_checked(
+                runner,
+                program,
+                &[
+                    "-w",
+                    "-A",
+                    FORWARD_CHAIN,
+                    "-i",
+                    tun_interface,
+                    "-o",
+                    tun_interface,
+                    "-s",
+                    subnet,
+                    "-d",
+                    subnet,
+                    "-j",
+                    "ACCEPT",
+                ],
+            )?;
+        }
+    }
+    for (network, prefix) in allowed_ranges {
+        if network.is_ipv4() != (program == "iptables") {
+            continue;
+        }
+        let cidr = format!("{network}/{prefix}");
+        run_checked(
+            runner,
+            program,
+            &[
+                "-w",
+                "-A",
+                FORWARD_CHAIN,
+                "-i",
+                tun_interface,
+                "-d",
+                &cidr,
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+    }
+    for cidr in blocked_cidrs {
+        run_checked(
+            runner,
+            program,
+            &[
+                "-w",
+                "-A",
+                FORWARD_CHAIN,
+                "-i",
+                tun_interface,
+                "-d",
+                cidr,
                 "-j",
                 "DROP",
             ],
@@ -413,6 +488,8 @@ fn setup_freebsd_firewall(
     subnet: &str,
     nat_enabled: bool,
     public_addresses: &[std::net::IpAddr],
+    allow_c2c: bool,
+    allowed_ranges: &[Cidr],
     anchor_path: &Path,
 ) -> Result<()> {
     validate_interface(tun_interface)?;
@@ -454,6 +531,8 @@ fn setup_freebsd_firewall(
         egress_interface.as_deref(),
         nat_enabled,
         public_addresses,
+        allow_c2c,
+        allowed_ranges,
     );
     validate_and_load_pf_anchor(runner, anchor_path, &rendered)
 }
@@ -499,6 +578,8 @@ fn render_pf_anchor(
     egress_interface: Option<&str>,
     nat_enabled: bool,
     public_addresses: &[std::net::IpAddr],
+    allow_c2c: bool,
+    allowed_ranges: &[Cidr],
 ) -> String {
     let mut rendered = format!("tun_if = \"{tun_interface}\"\ntun_net = \"{subnet}\"\n");
     if nat_enabled {
@@ -507,12 +588,11 @@ fn render_pf_anchor(
             egress_interface.expect("NAT requires an egress interface")
         ));
     }
-    for cidr in BLOCKED_IPV4_CIDRS.iter().chain(BLOCKED_IPV6_CIDRS) {
-        rendered.push_str(&format!("block in quick on $tun_if from any to {cidr}\n"));
-    }
-    // The interface's own addresses (public included) are not in the
-    // special-use ranges — block them explicitly so TUN clients cannot
-    // reach SSH or any other service on the server itself.
+    // PF evaluates `quick` rules first-match-wins, so every host block must
+    // precede the exemptions and the broad pass. The interface's own
+    // addresses (the TUN gateway included) are not in the special-use
+    // ranges — block them explicitly so TUN clients cannot reach SSH or any
+    // other service on the server itself.
     rendered.push_str("block in quick on $tun_if from any to (self)\n");
     // Configured public addresses (1:1 NAT) are not on any interface, so
     // (self) cannot see them — block each one explicitly.
@@ -520,6 +600,19 @@ fn render_pf_anchor(
         rendered.push_str(&format!(
             "block in quick on $tun_if from any to {address}\n"
         ));
+    }
+    // C24 opt-in exemptions, before the special-use blocks so they match.
+    // Client-to-client stays within the pool; listed ranges are exact CIDRs.
+    if allow_c2c {
+        rendered.push_str("pass in quick on $tun_if from $tun_net to $tun_net keep state\n");
+    }
+    for (network, prefix) in allowed_ranges {
+        rendered.push_str(&format!(
+            "pass in quick on $tun_if from any to {network}/{prefix} keep state\n"
+        ));
+    }
+    for cidr in BLOCKED_IPV4_CIDRS.iter().chain(BLOCKED_IPV6_CIDRS) {
+        rendered.push_str(&format!("block in quick on $tun_if from any to {cidr}\n"));
     }
     rendered.push_str(
         "pass in quick on $tun_if from $tun_net to any keep state\nblock in quick on $tun_if all\n",
@@ -689,8 +782,8 @@ esac
     #[test]
     fn linux_rules_are_owned_idempotent_and_fail_closed() {
         let mut fake = FakeBinaries::new(IPTABLES_FAKE);
-        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[]).unwrap();
-        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[]).unwrap();
+        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], false, &[]).unwrap();
+        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], false, &[]).unwrap();
         let log = fake.log();
         assert!(log.contains("iptables -w -A RVPN_FORWARD -i tun0 -d 100.64.0.0/10 -j DROP"));
         assert!(log.contains("ip6tables -w -A RVPN_FORWARD -i tun0 -d 64:ff9b::/96 -j DROP"));
@@ -713,7 +806,7 @@ esac
     #[test]
     fn nat_disabled_still_installs_containment_without_masquerade() {
         let mut fake = FakeBinaries::new(IPTABLES_FAKE);
-        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", false, &[]).unwrap();
+        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", false, &[], false, &[]).unwrap();
         let log = fake.log();
         assert!(log.contains("RVPN_INPUT -i tun0 -j DROP"));
         assert!(!log.contains("MASQUERADE"));
@@ -723,7 +816,7 @@ esac
     #[test]
     fn linux_ipv6_from_tun_is_never_forwarded() {
         let mut fake = FakeBinaries::new(IPTABLES_FAKE);
-        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[]).unwrap();
+        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], false, &[]).unwrap();
         let log = fake.log();
         // IPv4 is source-bound to the client pool; IPv6 has no pool yet, so
         // the ip6tables family must not contain any ACCEPT from the TUN
@@ -746,7 +839,7 @@ esac
             "8.8.8.8".parse().unwrap(),
             "2606:4700:4700::1111".parse().unwrap(),
         ];
-        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, public).unwrap();
+        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, public, false, &[]).unwrap();
         let log = fake.log();
         assert!(log.contains("iptables -w -A RVPN_FORWARD -i tun0 -d 8.8.8.8 -j DROP"));
         assert!(
@@ -760,7 +853,7 @@ esac
     fn linux_command_failure_aborts_setup() {
         let script = "#!/bin/sh\nprintf '%s %s\\n' \"$0\" \"$*\" >> commands.log\nexit 1\n";
         let mut fake = FakeBinaries::new(script);
-        let error = setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[])
+        let error = setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], false, &[])
             .unwrap_err()
             .to_string();
         assert!(error.contains("iptables"));
@@ -815,7 +908,17 @@ esac
     #[test]
     fn freebsd_validates_and_loads_only_rvpn_anchor() {
         let (mut fake, _directory, anchor) = pf_test();
-        setup_freebsd_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], &anchor).unwrap();
+        setup_freebsd_firewall(
+            &mut fake,
+            "tun0",
+            "10.200.0.0/24",
+            true,
+            &[],
+            false,
+            &[],
+            &anchor,
+        )
+        .unwrap();
         let log = fake.log();
         assert!(log.contains("pfctl -a rvpn -nf"));
         assert!(log.contains("pfctl -a rvpn -f"));
@@ -848,7 +951,17 @@ esac
             "8.8.8.8".parse().unwrap(),
             "2606:4700:4700::1111".parse().unwrap(),
         ];
-        setup_freebsd_firewall(&mut fake, "tun0", "10.200.0.0/24", true, public, &anchor).unwrap();
+        setup_freebsd_firewall(
+            &mut fake,
+            "tun0",
+            "10.200.0.0/24",
+            true,
+            public,
+            false,
+            &[],
+            &anchor,
+        )
+        .unwrap();
         let rendered = std::fs::read_to_string(anchor).unwrap();
         let public_block = rendered
             .find("block in quick on $tun_if from any to 8.8.8.8")
@@ -869,17 +982,35 @@ esac
         for marker in ["pf-disabled", "forwarding-disabled"] {
             let (mut fake, _directory, anchor) = pf_test();
             std::fs::write(fake.path(marker), "").unwrap();
-            setup_freebsd_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], &anchor)
-                .unwrap_err();
+            setup_freebsd_firewall(
+                &mut fake,
+                "tun0",
+                "10.200.0.0/24",
+                true,
+                &[],
+                false,
+                &[],
+                &anchor,
+            )
+            .unwrap_err();
             assert!(!anchor.exists());
             assert!(!fake.log().contains(" -f "));
         }
 
         let (mut fake, _directory, anchor) = pf_test();
         std::fs::write(fake.path("main-rules"), "pass all\n").unwrap();
-        let error = setup_freebsd_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], &anchor)
-            .unwrap_err()
-            .to_string();
+        let error = setup_freebsd_firewall(
+            &mut fake,
+            "tun0",
+            "10.200.0.0/24",
+            true,
+            &[],
+            false,
+            &[],
+            &anchor,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("anchor \"rvpn\""));
         assert!(!anchor.exists());
 
@@ -889,7 +1020,17 @@ esac
             "nat on vtnet0 from any to any -> (vtnet0)\n",
         )
         .unwrap();
-        setup_freebsd_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], &anchor).unwrap_err();
+        setup_freebsd_firewall(
+            &mut fake,
+            "tun0",
+            "10.200.0.0/24",
+            true,
+            &[],
+            false,
+            &[],
+            &anchor,
+        )
+        .unwrap_err();
         assert!(!anchor.exists());
     }
 
@@ -899,8 +1040,17 @@ esac
             let (mut fake, _directory, anchor) = pf_test();
             std::fs::write(fake.path("main-rules"), "anchor \"rvpn\" all\n").unwrap();
             std::fs::write(fake.path(marker), "").unwrap();
-            setup_freebsd_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], &anchor)
-                .unwrap_err();
+            setup_freebsd_firewall(
+                &mut fake,
+                "tun0",
+                "10.200.0.0/24",
+                true,
+                &[],
+                false,
+                &[],
+                &anchor,
+            )
+            .unwrap_err();
             assert_eq!(
                 std::fs::read_to_string(fake.path("main-rules")).unwrap(),
                 "anchor \"rvpn\" all\n"
@@ -913,10 +1063,180 @@ esac
     #[test]
     fn freebsd_nat_false_still_requires_anchors_and_containment() {
         let (mut fake, _directory, anchor) = pf_test();
-        setup_freebsd_firewall(&mut fake, "tun0", "10.200.0.0/24", false, &[], &anchor).unwrap();
+        setup_freebsd_firewall(
+            &mut fake,
+            "tun0",
+            "10.200.0.0/24",
+            false,
+            &[],
+            false,
+            &[],
+            &anchor,
+        )
+        .unwrap();
         let rendered = std::fs::read_to_string(anchor).unwrap();
         assert!(!rendered.contains("nat on"));
         assert!(rendered.contains("pass in quick"));
         assert!(!fake.log().contains("route -n get default"));
+    }
+
+    // ---- C24: opt-in client egress exemptions (task #rVPN:#18) ----
+
+    #[test]
+    fn linux_c2c_accept_precedes_special_use_drops() {
+        let mut fake = FakeBinaries::new(IPTABLES_FAKE);
+        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], true, &[]).unwrap();
+        let log = fake.log();
+        let accept = log
+            .find("iptables -w -A RVPN_FORWARD -i tun0 -o tun0 -s 10.200.0.0/24 -d 10.200.0.0/24 -j ACCEPT")
+            .expect("client-to-client ACCEPT must exist when the flag is on");
+        let drop_10 = log
+            .find("iptables -w -A RVPN_FORWARD -i tun0 -d 10.0.0.0/8 -j DROP")
+            .expect("10/8 drop must still exist");
+        assert!(
+            accept < drop_10,
+            "exemption must match before the CIDR drop"
+        );
+        // The pool is IPv4: the v6 family gets no client-to-client rule.
+        assert!(!log.contains("ip6tables -w -A RVPN_FORWARD -i tun0 -o tun0"));
+    }
+
+    #[test]
+    fn linux_flag_off_adds_no_exemption_rules() {
+        let mut fake = FakeBinaries::new(IPTABLES_FAKE);
+        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], false, &[]).unwrap();
+        let log = fake.log();
+        assert!(!log.contains("-o tun0 -s 10.200.0.0/24 -d 10.200.0.0/24 -j ACCEPT"));
+        // Containment unchanged: every special-use drop still present.
+        assert!(log.contains("iptables -w -A RVPN_FORWARD -i tun0 -d 10.0.0.0/8 -j DROP"));
+        assert!(log.contains("iptables -w -A RVPN_FORWARD -i tun0 -d 192.168.0.0/16 -j DROP"));
+    }
+
+    #[test]
+    fn linux_allowed_range_accepts_precede_drops_per_family() {
+        let mut fake = FakeBinaries::new(IPTABLES_FAKE);
+        let ranges = vec![
+            egress::parse_cidr("192.168.1.0/24").unwrap(),
+            egress::parse_cidr("2001:db8::/32").unwrap(),
+        ];
+        setup_linux_firewall(
+            &mut fake,
+            "tun0",
+            "10.200.0.0/24",
+            true,
+            &[],
+            false,
+            &ranges,
+        )
+        .unwrap();
+        let log = fake.log();
+        let v4_accept = log
+            .find("iptables -w -A RVPN_FORWARD -i tun0 -d 192.168.1.0/24 -j ACCEPT")
+            .expect("listed v4 range ACCEPT");
+        let v4_drop = log
+            .find("iptables -w -A RVPN_FORWARD -i tun0 -d 192.168.0.0/16 -j DROP")
+            .expect("192.168/16 drop");
+        assert!(v4_accept < v4_drop);
+        let v6_accept = log
+            .find("ip6tables -w -A RVPN_FORWARD -i tun0 -d 2001:db8::/32 -j ACCEPT")
+            .expect("listed v6 range ACCEPT in the v6 family");
+        let v6_drop = log
+            .find("ip6tables -w -A RVPN_FORWARD -i tun0 -d 2001:db8::/32 -j DROP")
+            .expect("documentation-range drop");
+        assert!(v6_accept < v6_drop);
+        // Unlisted neighbours stay dropped.
+        assert!(!log.contains("-d 192.168.2.0/24 -j ACCEPT"));
+    }
+
+    #[test]
+    fn linux_public_address_drops_precede_exemptions() {
+        let mut fake = FakeBinaries::new(IPTABLES_FAKE);
+        let public: Vec<std::net::IpAddr> = vec!["203.0.113.5".parse().unwrap()];
+        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &public, true, &[]).unwrap();
+        let log = fake.log();
+        let host_drop = log
+            .find("iptables -w -A RVPN_FORWARD -i tun0 -d 203.0.113.5 -j DROP")
+            .expect("configured public address drop");
+        let c2c = log
+            .find("-i tun0 -o tun0 -s 10.200.0.0/24 -d 10.200.0.0/24 -j ACCEPT")
+            .expect("c2c accept");
+        assert!(host_drop < c2c, "host denial must win over exemptions");
+    }
+
+    #[test]
+    fn linux_downlink_accepts_only_established_replies_even_with_c2c_on() {
+        // A13 per-direction assertion: unsolicited NEW from the segment
+        // toward a tunnel client must drop by chain order. The only ACCEPT
+        // toward tun0 is the conntrack reply rule (scoped to the pool), the
+        // catch-all drop sits after it, and no rule accepts NEW inbound —
+        // with the client-to-client flag ON as well, since the exemption is
+        // tun->tun only and must never become segment->tun port forwarding.
+        let mut fake = FakeBinaries::new(IPTABLES_FAKE);
+        setup_linux_firewall(&mut fake, "tun0", "10.200.0.0/24", true, &[], true, &[]).unwrap();
+        let log = fake.log();
+        let reply = log
+            .find("iptables -w -A RVPN_FORWARD -o tun0 -m conntrack --ctstate ESTABLISHED,RELATED -d 10.200.0.0/24 -j ACCEPT")
+            .expect("conntrack reply accept");
+        let catch_all = log
+            .find("iptables -w -A RVPN_FORWARD -o tun0 -j DROP")
+            .expect("inbound catch-all drop");
+        assert!(reply < catch_all);
+        assert!(!log.contains("iptables -w -A RVPN_FORWARD -o tun0 -j ACCEPT"));
+        // No exemption rule may carry a non-tun input interface.
+        for line in log.lines().filter(|line| line.contains("-j ACCEPT")) {
+            if line.contains("-o tun0") {
+                assert!(
+                    line.contains("-i tun0") || line.contains("conntrack"),
+                    "inbound ACCEPT without conntrack or tun source: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pf_exemptions_sit_between_host_blocks_and_special_use_blocks() {
+        let ranges = vec![egress::parse_cidr("192.168.1.0/24").unwrap()];
+        let public: Vec<std::net::IpAddr> = vec!["203.0.113.5".parse().unwrap()];
+        let rules = render_pf_anchor(
+            "tun0",
+            "10.200.0.0/24",
+            Some("vtnet0"),
+            true,
+            &public,
+            true,
+            &ranges,
+        );
+        let self_block = rules.find("to (self)").expect("(self) block");
+        let public_block = rules.find("to 203.0.113.5").expect("public block");
+        let c2c = rules.find("from $tun_net to $tun_net").expect("c2c pass");
+        let listed = rules.find("to 192.168.1.0/24").expect("listed pass");
+        let special = rules.find("to 192.168.0.0/16").expect("special-use block");
+        let broad = rules
+            .find("pass in quick on $tun_if from $tun_net to any keep state")
+            .expect("broad pass");
+        assert!(self_block < c2c, "host block before exemptions");
+        assert!(public_block < c2c, "public block before exemptions");
+        assert!(
+            c2c < special && listed < special,
+            "exemptions before special-use blocks"
+        );
+        assert!(special < broad, "special-use blocks before the broad pass");
+    }
+
+    #[test]
+    fn pf_flag_off_and_empty_list_keep_the_strict_anchor() {
+        let rules = render_pf_anchor(
+            "tun0",
+            "10.200.0.0/24",
+            Some("vtnet0"),
+            true,
+            &[],
+            false,
+            &[],
+        );
+        assert!(!rules.contains("to $tun_net keep state"));
+        assert!(!rules.contains("192.168.1.0/24"));
+        assert!(rules.contains("block in quick on $tun_if from any to 192.168.0.0/16"));
+        assert!(rules.contains("pass in quick on $tun_if from $tun_net to any keep state"));
     }
 }
