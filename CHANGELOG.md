@@ -4,6 +4,8 @@ All notable changes to rVPN are documented in this file.
 
 ## [Unreleased]
 
+## [1.3.8] — 2026-11-18
+
 ### Fixed
 
 - **Certificate issuance no longer dies at startup when the CA offers an
@@ -16,6 +18,15 @@ All notable changes to rVPN are documented in this file.
   `token` field, which RFC 8555 only requires for http-01/dns-01/
   tls-alpn-01. Shipped as a pinned backport of the upstream rustls-acme
   fixes; see the `[patch.crates-io]` note in `rvpn/Cargo.toml`. (#1)
+
+### Documentation
+
+- **README gains a "Why a new protocol instead of WireGuard?" section**
+  and an accuracy pass against the shipped code: the decoy claim now
+  describes what the server actually does (operator-supplied static
+  files; hosted servers get a per-hostname rendered page from
+  provisioning outside this repo), and the release/padding/flow-control
+  wording matches the implementation. (#12)
 
 ## [1.3.7] — 2026-11-17
 
