@@ -19,14 +19,24 @@ All notable changes to rVPN are documented in this file.
   tls-alpn-01. Shipped as a pinned backport of the upstream rustls-acme
   fixes; see the `[patch.crates-io]` note in `rvpn/Cargo.toml`. (#1)
 
+### Security
+
+- **Dependency security updates:** rustls 0.23.46, rustls-webpki 0.103.17 and
+  webpki-roots 1.0.12 (semver-compatible), fixing the open RustSec advisories
+  on those versions. The rustls 0.22 line used by the tunnel TLS stack still
+  carries advisories with no fix on 0.22; the 0.23 migration is tracked. (#9)
+- **CI now runs `cargo audit`** weekly and on lockfile changes, with a triaged,
+  dated ignore list. (#8, #10)
+
 ### Documentation
 
 - **README gains a "Why a new protocol instead of WireGuard?" section**
   and an accuracy pass against the shipped code: the decoy claim now
   describes what the server actually does (operator-supplied static
   files; hosted servers get a per-hostname rendered page from
-  provisioning outside this repo), and the release/padding/flow-control
-  wording matches the implementation. (#12)
+  provisioning outside this repo), the release/padding/flow-control
+  wording matches the implementation, and the README says plainly what
+  the server operator can see. (#6, #12)
 
 ## [1.3.7] — 2026-11-17
 
