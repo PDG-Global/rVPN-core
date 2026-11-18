@@ -550,7 +550,10 @@ mod tests {
 
     #[test]
     fn parse_head_detects_websocket_upgrade() {
-        let req = b"GET /api/v1/ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        // Not the RFC 6455 sample nonce: the RFC value is a published
+        // constant, and secret scanners flag it, so this fixture uses a
+        // clearly non-key string. The header value is never decoded here.
+        let req = b"GET /api/v1/ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: test-websocket-upgrade-fixture\r\nSec-WebSocket-Version: 13\r\n\r\n";
         let head = parse_request_head(req).expect("should parse");
         assert!(head.is_websocket_upgrade);
         assert_eq!(head.target, "/api/v1/ws");
