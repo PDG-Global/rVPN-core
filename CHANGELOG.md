@@ -21,10 +21,24 @@ All notable changes to rVPN are documented in this file.
   ahead of every exemption (including the TUN gateway and addresses that
   appear after startup), relay paths never consult the exemptions, and
   dangerous allow-list entries (default routes, loopback, link-local/cloud
-  metadata, IPv6 ULA, ranges containing a server address) refuse startup.
+  metadata, IPv6 ULA, ranges containing a server address, ranges overlapping
+  the TUN pool — which would re-open client-to-client with the flag off —
+  and IPv6 entries until an IPv6 pool exists) refuse startup.
   With both settings at their defaults the containment is unchanged.
   Operators upgrading from v1.3.6 who relied on client-to-client traffic
   must set `allow_client_to_client = true`.
+
+### Security
+
+- **TUN uplink packets must carry the session's own assigned tunnel IP as
+  their source.** Previously the server never checked the packet source
+  against the session's lease, so a client could spoof another client's
+  pool address — steering internet hosts' replies into that client's tunnel
+  (all versions), or impersonating them once client-to-client is enabled.
+  Packets with any other source (or sessions without an assigned lease) are
+  now dropped before they reach the TUN device. The allowed-range firewall
+  exemptions are bound to the pool as source (`-s <pool>` / `from $tun_net`)
+  so a spoofed source can never reach an operator-listed LAN.
 
 ## [1.3.8] — 2026-11-18
 

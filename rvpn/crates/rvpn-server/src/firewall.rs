@@ -103,8 +103,17 @@ fn parse_allowed_ranges(ranges: &[String]) -> Result<Vec<Cidr>> {
     ranges
         .iter()
         .map(|text| {
-            egress::parse_cidr(text)
-                .with_context(|| format!("Invalid allowed_internal_ranges entry: {text}"))
+            let cidr = egress::parse_cidr(text)
+                .with_context(|| format!("Invalid allowed_internal_ranges entry: {text}"))?;
+            // Startup validation (ClientEgressPolicy::from_config) already
+            // refuses v6 entries; refuse here too so the firewall layer can
+            // never install an ip6tables exemption without a v6 pool.
+            if cidr.0.is_ipv6() {
+                anyhow::bail!(
+                    "allowed_internal_ranges entry {text} is IPv6 — refused until an IPv6 pool exists"
+                );
+            }
+            Ok(cidr)
         })
         .collect()
 }
@@ -248,6 +257,13 @@ fn setup_linux_filter_family(
         if network.is_ipv4() != (program == "iptables") {
             continue;
         }
+        // Bind the exemption to the pool as source, like the broad accept:
+        // a spoofed source must not reach the operator's LAN with an address
+        // MASQUERADE (-s pool) will not rewrite. No pool in this family means
+        // no source to bind — install nothing.
+        let Some(pool) = subnet else {
+            continue;
+        };
         let cidr = format!("{network}/{prefix}");
         run_checked(
             runner,
@@ -258,6 +274,8 @@ fn setup_linux_filter_family(
                 FORWARD_CHAIN,
                 "-i",
                 tun_interface,
+                "-s",
+                pool,
                 "-d",
                 &cidr,
                 "-j",
@@ -608,7 +626,7 @@ fn render_pf_anchor(
     }
     for (network, prefix) in allowed_ranges {
         rendered.push_str(&format!(
-            "pass in quick on $tun_if from any to {network}/{prefix} keep state\n"
+            "pass in quick on $tun_if from $tun_net to {network}/{prefix} keep state\n"
         ));
     }
     for cidr in BLOCKED_IPV4_CIDRS.iter().chain(BLOCKED_IPV6_CIDRS) {
@@ -1113,12 +1131,9 @@ esac
     }
 
     #[test]
-    fn linux_allowed_range_accepts_precede_drops_per_family() {
+    fn linux_allowed_range_accepts_are_pool_bound_and_precede_drops() {
         let mut fake = FakeBinaries::new(IPTABLES_FAKE);
-        let ranges = vec![
-            egress::parse_cidr("192.168.1.0/24").unwrap(),
-            egress::parse_cidr("2001:db8::/32").unwrap(),
-        ];
+        let ranges = vec![egress::parse_cidr("192.168.1.0/24").unwrap()];
         setup_linux_firewall(
             &mut fake,
             "tun0",
@@ -1130,22 +1145,58 @@ esac
         )
         .unwrap();
         let log = fake.log();
+        // The exemption is bound to the pool as source, like the broad accept.
         let v4_accept = log
-            .find("iptables -w -A RVPN_FORWARD -i tun0 -d 192.168.1.0/24 -j ACCEPT")
-            .expect("listed v4 range ACCEPT");
+            .find(
+                "iptables -w -A RVPN_FORWARD -i tun0 -s 10.200.0.0/24 -d 192.168.1.0/24 -j ACCEPT",
+            )
+            .expect("pool-bound listed range ACCEPT");
         let v4_drop = log
             .find("iptables -w -A RVPN_FORWARD -i tun0 -d 192.168.0.0/16 -j DROP")
             .expect("192.168/16 drop");
         assert!(v4_accept < v4_drop);
-        let v6_accept = log
-            .find("ip6tables -w -A RVPN_FORWARD -i tun0 -d 2001:db8::/32 -j ACCEPT")
-            .expect("listed v6 range ACCEPT in the v6 family");
-        let v6_drop = log
-            .find("ip6tables -w -A RVPN_FORWARD -i tun0 -d 2001:db8::/32 -j DROP")
-            .expect("documentation-range drop");
-        assert!(v6_accept < v6_drop);
+        // No unbound exemption, and nothing installed in the v6 family.
+        assert!(!log.contains("-i tun0 -d 192.168.1.0/24 -j ACCEPT"));
+        assert!(!log.contains("ip6tables -w -A RVPN_FORWARD -i tun0 -d 192.168.1.0/24"));
         // Unlisted neighbours stay dropped.
         assert!(!log.contains("-d 192.168.2.0/24 -j ACCEPT"));
+    }
+
+    #[test]
+    fn ipv6_allow_list_entries_are_refused_before_any_rule_is_installed() {
+        // No IPv6 pool exists and the uplink drops every v6 packet; a v6
+        // entry would break the no-v6-forward invariant. Refused at startup
+        // (from_config) and again at the firewall layer.
+        assert!(egress::ClientEgressPolicy::from_config(
+            false,
+            "10.200.0.1/24",
+            &["2001:db8::/32".to_string()]
+        )
+        .is_err());
+        assert!(parse_allowed_ranges(&["2001:db8::/32".to_string()]).is_err());
+        assert!(parse_allowed_ranges(&["192.168.1.0/24".to_string()]).is_ok());
+        // And the chain with a non-empty v4 list still forwards no IPv6
+        // from the TUN interface.
+        let mut fake = FakeBinaries::new(IPTABLES_FAKE);
+        let ranges = vec![egress::parse_cidr("192.168.1.0/24").unwrap()];
+        setup_linux_firewall(
+            &mut fake,
+            "tun0",
+            "10.200.0.0/24",
+            true,
+            &[],
+            false,
+            &ranges,
+        )
+        .unwrap();
+        let log = fake.log();
+        // The invariant is no IPv6 forwarded FROM the TUN interface; the
+        // conntrack reply accept toward tun0 legitimately exists per family.
+        assert!(!log.lines().any(|line| {
+            line.starts_with("ip6tables -w -A RVPN_FORWARD")
+                && line.contains("-i tun0")
+                && line.contains("-j ACCEPT")
+        }));
     }
 
     #[test]
@@ -1209,7 +1260,9 @@ esac
         let self_block = rules.find("to (self)").expect("(self) block");
         let public_block = rules.find("to 203.0.113.5").expect("public block");
         let c2c = rules.find("from $tun_net to $tun_net").expect("c2c pass");
-        let listed = rules.find("to 192.168.1.0/24").expect("listed pass");
+        let listed = rules
+            .find("from $tun_net to 192.168.1.0/24")
+            .expect("pool-bound listed pass");
         let special = rules.find("to 192.168.0.0/16").expect("special-use block");
         let broad = rules
             .find("pass in quick on $tun_if from $tun_net to any keep state")

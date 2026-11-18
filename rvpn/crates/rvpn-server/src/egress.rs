@@ -144,6 +144,27 @@ impl ClientEgressPolicy {
             let cidr = parse_cidr(text)
                 .with_context(|| format!("Invalid allowed_internal_ranges entry: {text}"))?;
             validate_allowed_range(&cidr, text)?;
+            // No IPv6 pool exists and the uplink drops every IPv6 packet, so
+            // a v6 entry could never be used — but it would still install an
+            // ip6tables exemption, breaking the no-v6-forward invariant.
+            // Refuse until an IPv6 pool exists.
+            if cidr.0.is_ipv6() {
+                anyhow::bail!(
+                    "allowed_internal_ranges entry {text} is IPv6 — refused until an IPv6 pool exists (the IPv6 uplink is disabled)"
+                );
+            }
+            // An entry overlapping the pool would re-open client-to-client
+            // through the allow-list with the flag off. The pool is governed
+            // by allow_client_to_client only.
+            if let Some((network, prefix)) = policy.tun_subnet {
+                let pool = (IpAddr::V4(network), prefix);
+                if cidrs_overlap(&cidr, &pool) {
+                    anyhow::bail!(
+                        "allowed_internal_ranges entry {text} overlaps the TUN pool {} — client-to-client is governed by allow_client_to_client only; refusing to start",
+                        fmt_cidr(&pool)
+                    );
+                }
+            }
             policy.allowed_ranges.push(cidr);
         }
         Ok(policy)
@@ -1026,6 +1047,14 @@ mod tests {
             "fd00:ec2::254/128",
             "not-a-cidr",
             "192.168.1.0/33",
+            // Pool overlap: the allow-list must not re-open client-to-client
+            // with the flag off (exact, subset and superset all refused).
+            "10.200.0.0/24",
+            "10.200.0.128/25",
+            "10.0.0.0/8",
+            // IPv6 entries are refused until an IPv6 pool exists.
+            "2001:db8::/32",
+            "2606:4700::/32",
         ] {
             assert!(
                 ClientEgressPolicy::from_config(false, "10.200.0.1/24", &[bad.to_string()])
