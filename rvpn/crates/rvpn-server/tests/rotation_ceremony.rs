@@ -46,16 +46,15 @@ bind_address       = "127.0.0.1:8443"
 identity_key_file  = "{}"
 prekey_bundle_file = "{}"
 "#,
-        dir.join(identity_key).display(),
-        dir.join(bundle_file).display()
+        identity_key, bundle_file
     );
     std::fs::write(&path, contents).expect("write server.toml");
     path
 }
 
 /// Run `rvpn-server` with the given args and assert the exit is clean.
-/// Working directory is the temp dir so relative paths in the config or
-/// arguments resolve alongside it.
+/// CLI identity/output overrides use the working directory; configuration
+/// entries resolve beside server.toml.
 fn run_server(dir: &Path, args: &[&str]) {
     let output = Command::new(server_bin())
         .current_dir(dir)
@@ -99,6 +98,27 @@ fn fresh_bundle_publishes_version_1_no_rotation() {
     let bundle = load_bundle(&dir.path().join("bundle.json"));
     assert_eq!(bundle.identity_key_version, 1);
     assert!(bundle.rotation_signature.is_none());
+}
+
+#[test]
+fn relative_config_keys_and_bundles_work_from_a_different_working_directory() {
+    let dir = TempDir::new().unwrap();
+    let working_directory = TempDir::new().unwrap();
+    let toml = write_minimal_server_toml(dir.path(), "./id.key", "./bundle.json");
+    run_server(
+        working_directory.path(),
+        &["-c", toml.to_str().unwrap(), "keygen"],
+    );
+    run_server(
+        working_directory.path(),
+        &["-c", toml.to_str().unwrap(), "prekey-bundle"],
+    );
+    assert!(dir.path().join("id.key").is_file());
+    assert!(!working_directory.path().join("id.key").exists());
+    assert_eq!(
+        load_bundle(&dir.path().join("bundle.json")).identity_key_version,
+        1
+    );
 }
 
 #[test]

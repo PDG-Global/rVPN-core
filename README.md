@@ -169,6 +169,15 @@ This starts a SOCKS5 proxy on `127.0.0.1:1080`. Configure your browser or system
 sudo cargo run --release --package rvpn-client -- --config client.toml --tun
 ```
 
+### Configuration paths
+
+When `--config` is omitted, the client and server look for `client.toml` or
+`server.toml` in the working directory first, then beside the executable.
+Explicit relative command-line paths are relative to the working directory.
+Relative file paths in TOML and JSON configurations are resolved beside the
+configuration file. If an existing deployment keeps those files elsewhere,
+use absolute paths in the configuration.
+
 ## Releases
 
 Pre-built binaries for all platforms are published as GitHub releases on this repository. The native apps (macOS, iOS, Android) are distributed through their respective app stores.
