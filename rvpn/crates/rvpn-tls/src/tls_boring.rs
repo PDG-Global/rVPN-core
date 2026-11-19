@@ -139,6 +139,50 @@ fn set_ios_cert_verify(builder: &mut boring::ssl::SslConnectorBuilder, _hostname
     builder.set_verify(boring::ssl::SslVerifyMode::PEER);
 }
 
+/// Snapshot the platform trust anchors once per process. OpenSSL's default
+/// file paths do not load the Windows certificate store or macOS Keychain.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn system_trust_store() -> Result<boring::x509::store::X509Store> {
+    use boring::x509::store::X509Store;
+    use std::sync::OnceLock;
+
+    static STORE: OnceLock<std::result::Result<X509Store, String>> = OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            let native = rustls_native_certs::load_native_certs();
+            for error in &native.errors {
+                tracing::warn!("Unable to load some system CA certificates: {}", error);
+            }
+            trust_store_from_der(native.certs.iter().map(|cert| cert.as_ref()))
+                .map_err(|error| format!("Failed to load system TLS trust store: {error:#}"))
+        })
+        .as_ref()
+        .cloned()
+        .map_err(|error| anyhow::anyhow!(error.clone()))
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn trust_store_from_der<'a>(
+    certs: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<boring::x509::store::X509Store> {
+    use boring::x509::{store::X509StoreBuilder, X509};
+
+    let mut store = X509StoreBuilder::new().context("Failed to create system CA store")?;
+    let mut loaded = 0;
+    for der in certs {
+        match X509::from_der(der).and_then(|cert| store.add_cert(cert)) {
+            Ok(()) => loaded += 1,
+            Err(error) => tracing::warn!("Skipping unusable system CA certificate: {}", error),
+        }
+    }
+    anyhow::ensure!(loaded > 0, "No usable system CA certificates found; check the OS trust store or SSL_CERT_FILE/SSL_CERT_DIR");
+    debug!(
+        "Loaded {} system CA certificates for TLS verification",
+        loaded
+    );
+    Ok(store.build())
+}
+
 /// Build a TLS connector that mimics Chrome
 ///
 /// Key aspects of Chrome's TLS fingerprint:
@@ -192,10 +236,8 @@ fn build_chrome_connector_ext(
     // implement set_ciphersuites(), and set_cipher_list() only controls TLS 1.2
     // ciphers which are disabled here (TLS 1.3 only).
 
-    // Certificate verification.
-    // On iOS: the Network Extension sandbox blocks /etc/ssl/ entirely, so we use a
-    // custom callback that delegates to the iOS Security framework instead.
-    // On other platforms: use boring's built-in CA store via set_default_verify_paths().
+    // iOS uses bundled roots in its sandbox. Desktop imports platform trust
+    // anchors; BoringSSL still verifies the certificate chain and hostname.
     #[cfg(target_os = "ios")]
     {
         let sni = sni_hostname.unwrap_or(host);
@@ -209,7 +251,9 @@ fn build_chrome_connector_ext(
             Some(store) => builder
                 .set_verify_cert_store(store)
                 .context("Failed to install TLS trust store")?,
-            None => builder.set_default_verify_paths()?,
+            None => builder
+                .set_verify_cert_store(system_trust_store()?)
+                .context("Failed to install system TLS trust store")?,
         }
     }
 
@@ -393,10 +437,12 @@ async fn connect_standard(
     #[cfg(target_os = "ios")]
     set_ios_cert_verify(&mut builder, sni);
 
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
         builder.set_verify(boring::ssl::SslVerifyMode::PEER);
-        builder.set_default_verify_paths()?;
+        builder
+            .set_verify_cert_store(system_trust_store()?)
+            .context("Failed to install system TLS trust store")?;
     }
 
     let connector = builder.build();
@@ -439,6 +485,18 @@ mod tests {
     fn test_chrome_connector_builds() {
         let connector = build_chrome_connector("example.com", None);
         assert!(connector.is_ok());
+        assert!(connector
+            .unwrap()
+            .context()
+            .verify_mode()
+            .contains(boring::ssl::SslVerifyMode::PEER));
+    }
+
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[test]
+    fn unusable_system_roots_fail_closed() {
+        assert!(trust_store_from_der(std::iter::empty::<&[u8]>()).is_err());
+        assert!(trust_store_from_der([&b"invalid certificate"[..]]).is_err());
     }
 
     #[cfg(not(target_os = "android"))]
@@ -508,6 +566,57 @@ mod tests {
             (addr, cert)
         }
 
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        #[tokio::test]
+        async fn system_roots_reject_untrusted_certificates_in_both_modes() {
+            let (addr, _) = spawn_test_server().await;
+            for fingerprint in [TlsFingerprint::Chrome, TlsFingerprint::None] {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    connect_chrome_like(
+                        &addr.ip().to_string(),
+                        addr.port(),
+                        fingerprint,
+                        Some("localhost"),
+                    ),
+                )
+                .await;
+                let error = match result.expect("TLS test timed out") {
+                    Ok(_) => panic!("Untrusted certificate was accepted"),
+                    Err(error) => format!("{error:#}"),
+                };
+                assert!(error.contains("CERTIFICATE_VERIFY_FAILED"), "{error}");
+            }
+        }
+
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        #[tokio::test]
+        async fn imported_roots_verify_matching_and_mismatched_hostnames() {
+            let (addr, cert) = spawn_test_server().await;
+            let der = cert.to_der().unwrap();
+            for hostname in ["localhost", "wrong.example"] {
+                let trust = trust_store_from_der([der.as_slice()]).unwrap();
+                let connector =
+                    build_chrome_connector_ext("localhost", None, None, Some(trust)).unwrap();
+                let tcp = TcpStream::connect(addr).await.unwrap();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    connect_with_connector(&connector, tcp, hostname, None),
+                )
+                .await
+                .expect("TLS test timed out");
+                if hostname == "localhost" {
+                    assert!(result.is_ok(), "Trusted matching certificate was rejected");
+                } else {
+                    let error = match result {
+                        Ok(_) => panic!("Mismatched hostname was accepted"),
+                        Err(error) => format!("{error:#}"),
+                    };
+                    assert!(error.contains("CERTIFICATE_VERIFY_FAILED"), "{error}");
+                }
+            }
+        }
+
         /// Two sequential connections through one [`ResumptionStore`]: the
         /// second must report `session_reused() == true`.
         #[tokio::test]
@@ -515,7 +624,7 @@ mod tests {
             let (addr, cert) = spawn_test_server().await;
 
             // Trust store pinning the self-signed server cert (test-only
-            // override; production uses set_default_verify_paths).
+            // override; production imports the platform's system CA store).
             let mut trust = X509StoreBuilder::new().expect("x509 store builder");
             trust.add_cert(cert).expect("add cert");
             let trust = trust.build();
