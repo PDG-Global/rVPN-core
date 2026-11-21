@@ -115,7 +115,7 @@ pub const CAP_RATCHET_V2: u32 = 1;
 /// Sized to the Android rollout through the release lane; adjust only by
 /// PR, never by config. The cleanup commit deletes `negotiate_version`'s
 /// V1 arm together with every `RatchetVersion::V1` AAD path — one commit,
-/// no archaeology (Thomas's coded-sunset rule).
+/// no archaeology: a sunset that lives only in a design doc never happens.
 pub const V1_SUNSET_UNIX: u64 = 1801440000;
 
 /// Which side of the handshake is asking: the downgrade rules differ.
@@ -124,9 +124,9 @@ pub const V1_SUNSET_UNIX: u64 = 1801440000;
 /// genuinely old clients in v1 until the sunset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NegotiationSide {
-    /// V2 or an error, never V1: stripping BOTH capability fields must not
-    /// downgrade a new client onto the unauthenticated header (Thomas's
-    /// both-strip finding). V1 on this side is simply not an outcome.
+    /// V2 or an error, never V1: while bundles are unsigned, stripping
+    /// BOTH capability fields would otherwise downgrade a new client onto
+    /// the unauthenticated header. V1 on this side is simply not an outcome.
     Client,
     /// V2 when both advertise it; V1 for old clients until
     /// [`V1_SUNSET_UNIX`], an error after.
@@ -166,8 +166,8 @@ pub fn negotiate_version(
 /// derive identical keys; V2 mixes both capability sets into the KDF input
 /// with a fresh info string, so a stripped or altered capability field
 /// makes the two ends derive different secrets and the handshake dies at
-/// the first tag check instead of silently downgrading (Thomas's rule:
-/// the capability is inside what the handshake authenticates).
+/// the first tag check instead of silently downgrading: the capability
+/// lives inside what the handshake authenticates.
 fn derive_session_secret(
     dh_concat: &[u8],
     client_caps: u32,
@@ -906,10 +906,10 @@ mod q1_negotiation_tests {
 
     #[test]
     fn both_strip_is_refused_by_the_client() {
-        // Thomas's both-strip: attacker removes CAP_RATCHET_V2 from the
-        // (unsigned) server bundle AND from the client's handshake. Before
-        // the asymmetric rule the client negotiated V1 and the handshake
-        // succeeded on the unauthenticated header. Now the client side
+        // The both-strip attack: remove CAP_RATCHET_V2 from the
+        // (unsigned) server bundle AND from the client's handshake. With a
+        // symmetric rule both ends would negotiate V1 and the handshake
+        // would succeed on the unauthenticated header. The client side
         // never accepts V1, so the tampered bundle kills the handshake at
         // agree() — before any secret is derived.
         let (initiator, responder) = pair();

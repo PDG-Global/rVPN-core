@@ -38,7 +38,7 @@ pub enum RatchetVersion {
 
 /// AEAD associated data for a header under a session version. One canonical
 /// serializer ([`MessageHeader::to_bytes`]) is used by seal and open, so a
-/// re-encoding can never change the tag (review condition 3).
+/// re-encoding can never change the tag.
 fn aad_for(version: RatchetVersion, header: &MessageHeader) -> Vec<u8> {
     match version {
         RatchetVersion::V1 => vec![header.payload_type],
@@ -541,8 +541,8 @@ impl DoubleRatchet {
     /// Skip message keys for out-of-order handling
     /// A full copy of the decrypt-mutable state, for trial-decrypt: DH
     /// pair, skipped-key set, both chain keys, both counters, the root key
-    /// and the remote-DH bookmarks — every field a decrypt can move (review
-    /// condition 2). The copy drops (and zeroizes) when a tag fails.
+    /// and the remote-DH bookmarks — every field a decrypt can move. The
+    /// copy drops (and zeroizes) when a tag fails.
     /// `public_key` is copied as bytes, not recomputed: this runs on the
     /// hot frame path.
     fn trial_clone(&self) -> DoubleRatchet {
@@ -1872,7 +1872,7 @@ mod q1_v2_tests {
     #[test]
     fn header_to_bytes_has_a_fixed_canonical_layout() {
         // One serializer, one layout: seal and open authenticate identical
-        // bytes (review condition 3). Guard the layout explicitly.
+        // bytes. Guard the layout explicitly.
         let h = MessageHeader {
             dh_public: Some([0x11; 32]),
             message_number: 0x01020304,
