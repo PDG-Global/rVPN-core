@@ -118,11 +118,28 @@ pub const CAP_RATCHET_V2: u32 = 1;
 /// no archaeology (Thomas's coded-sunset rule).
 pub const V1_SUNSET_UNIX: u64 = 1801440000;
 
+/// Which side of the handshake is asking: the downgrade rules differ.
+/// Servers deploy first, so a v2-capable **client** can demand v2 — every
+/// server it meets speaks it — while the **server** must still answer
+/// genuinely old clients in v1 until the sunset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegotiationSide {
+    /// V2 or an error, never V1: stripping BOTH capability fields must not
+    /// downgrade a new client onto the unauthenticated header (Thomas's
+    /// both-strip finding). V1 on this side is simply not an outcome.
+    Client,
+    /// V2 when both advertise it; V1 for old clients until
+    /// [`V1_SUNSET_UNIX`], an error after.
+    Server,
+}
+
 /// What the two capability sets negotiate to. `now_unix` is injectable for
-/// tests. Refusing v1 after the sunset is the whole downgrade story: an
-/// on-path attacker who strips both capability fields forces a V1 answer,
-/// and after the sunset that answer is an error, not a session.
+/// tests. The both-strip attack (unsigned bundles until area-1 Q5 signs
+/// them) is closed asymmetrically: the client side never accepts V1, so a
+/// both-strip fails the client; the server side accepts v1 only until the
+/// coded sunset, after which it fails too.
 pub fn negotiate_version(
+    side: NegotiationSide,
     client_caps: u32,
     server_caps: u32,
     now_unix: u64,
@@ -130,12 +147,18 @@ pub fn negotiate_version(
     if client_caps & CAP_RATCHET_V2 != 0 && server_caps & CAP_RATCHET_V2 != 0 {
         return Ok(super::ratchet::RatchetVersion::V2);
     }
-    if now_unix < V1_SUNSET_UNIX {
-        return Ok(super::ratchet::RatchetVersion::V1);
+    match side {
+        NegotiationSide::Client => Err(crate::Error::HandshakeFailed(
+            "server does not speak ratchet v2; a v2-capable client refuses v1"
+                .to_string(),
+        )),
+        NegotiationSide::Server if now_unix < V1_SUNSET_UNIX => {
+            Ok(super::ratchet::RatchetVersion::V1)
+        }
+        NegotiationSide::Server => Err(crate::Error::HandshakeFailed(format!(
+            "peer cannot negotiate ratchet v2 and the v1 sunset ({V1_SUNSET_UNIX}) has passed"
+        ))),
     }
-    Err(crate::Error::HandshakeFailed(format!(
-        "peer cannot negotiate ratchet v2 and the v1 sunset ({V1_SUNSET_UNIX}) has passed"
-    )))
 }
 
 /// The shared-secret derivation for a negotiated version. V1 is the legacy
@@ -347,7 +370,8 @@ impl X3DHInitiator {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let version = negotiate_version(client_caps, server_caps, now)?;
+        let version =
+            negotiate_version(NegotiationSide::Client, client_caps, server_caps, now)?;
         let shared_secret = derive_session_secret(&dh_concat, client_caps, server_caps, version);
 
         let material = X3DHMaterial {
@@ -503,7 +527,8 @@ impl X3DHResponder {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let version = negotiate_version(client_caps, server_caps, now)?;
+        let version =
+            negotiate_version(NegotiationSide::Server, client_caps, server_caps, now)?;
         let shared_secret = derive_session_secret(&dh_concat, client_caps, server_caps, version);
 
         Ok((shared_secret, version))
@@ -880,38 +905,63 @@ mod q1_negotiation_tests {
     }
 
     #[test]
-    fn altered_server_capability_diverges_the_secrets() {
-        // Attacker flips the bundle's capability bits; the honest server
-        // derives v2, the client derives v1 from the tampered bundle.
+    fn both_strip_is_refused_by_the_client() {
+        // Thomas's both-strip: attacker removes CAP_RATCHET_V2 from the
+        // (unsigned) server bundle AND from the client's handshake. Before
+        // the asymmetric rule the client negotiated V1 and the handshake
+        // succeeded on the unauthenticated header. Now the client side
+        // never accepts V1, so the tampered bundle kills the handshake at
+        // agree() — before any secret is derived.
         let (initiator, responder) = pair();
         let mut bundle = responder.get_public_bundle();
-        bundle.capabilities = 0; // tampered in flight
-        let (client_secret, material, _) = initiator.agree(&bundle).unwrap();
-        let (server_secret, _) = responder
-            .agree(
-                &material.identity_x25519_public,
-                &material.ephemeral_public,
-                false,
-                material.capabilities,
+        bundle.capabilities = 0; // stripped in flight
+        assert!(
+            initiator.agree(&bundle).is_err(),
+            "a v2-capable client must refuse a v1-only negotiation"
+        );
+    }
+
+    #[test]
+    fn server_side_still_answers_old_clients_until_the_sunset() {
+        // The asymmetry's other half: a genuinely old client (no caps)
+        // still gets a working v1 session from a new server, pre-sunset,
+        // and both derive the SAME legacy secret.
+        let legacy_client_caps = 0;
+        let (_, responder) = pair();
+        let bundle = responder.get_public_bundle();
+        assert_eq!(bundle.capabilities, CAP_RATCHET_V2);
+        assert_eq!(
+            negotiate_version(
+                NegotiationSide::Server,
+                legacy_client_caps,
+                bundle.capabilities,
+                V1_SUNSET_UNIX - 1
             )
-            .unwrap();
-        assert_ne!(client_secret, server_secret);
+            .unwrap(),
+            super::super::ratchet::RatchetVersion::V1
+        );
     }
 
     #[test]
     fn v1_is_refused_after_the_coded_sunset() {
-        assert!(negotiate_version(0, 0, V1_SUNSET_UNIX + 1).is_err());
-        assert!(negotiate_version(CAP_RATCHET_V2, 0, V1_SUNSET_UNIX + 1).is_err());
-        assert!(negotiate_version(0, CAP_RATCHET_V2, V1_SUNSET_UNIX + 1).is_err());
+        use super::super::ratchet::RatchetVersion as V;
+        // Client side: never v1, before or after the sunset.
+        assert!(negotiate_version(NegotiationSide::Client, 0, 0, 1).is_err());
+        assert!(negotiate_version(NegotiationSide::Client, CAP_RATCHET_V2, 0, 1).is_err());
+        // Server side: v1 only until the sunset.
+        assert!(negotiate_version(NegotiationSide::Server, 0, 0, V1_SUNSET_UNIX + 1).is_err());
         assert_eq!(
-            negotiate_version(CAP_RATCHET_V2, CAP_RATCHET_V2, V1_SUNSET_UNIX + 1).unwrap(),
-            super::super::ratchet::RatchetVersion::V2
+            negotiate_version(NegotiationSide::Server, 0, 0, V1_SUNSET_UNIX - 1).unwrap(),
+            V::V1
         );
-        // And before it, mixed pairs still get v1.
-        assert_eq!(
-            negotiate_version(CAP_RATCHET_V2, 0, V1_SUNSET_UNIX - 1).unwrap(),
-            super::super::ratchet::RatchetVersion::V1
-        );
+        // v2 is always available to both sides when both advertise it.
+        for side in [NegotiationSide::Client, NegotiationSide::Server] {
+            assert_eq!(
+                negotiate_version(side, CAP_RATCHET_V2, CAP_RATCHET_V2, V1_SUNSET_UNIX + 1)
+                    .unwrap(),
+                V::V2
+            );
+        }
     }
 
     #[test]

@@ -2339,6 +2339,7 @@ mod tests {
             identity_key_version: 1,
             rotation_signature: None,
             identity_x25519_signature: None,
+            capabilities: 0,
         };
         let session = Arc::new(ServerSession::new(
             shared,
@@ -2369,6 +2370,7 @@ mod tests {
             identity_key: bundle.identity_key.to_vec(),
             identity_x25519_key: None,
             identity_x25519_signature: None,
+            capabilities: None,
         };
         assert!(session.security.validate(unsigned, &bundle).is_err());
     }

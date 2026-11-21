@@ -712,7 +712,11 @@ pub struct ReceivingChain {
 
 /// Split Ratchet state that allows concurrent encryption and decryption
 /// by separating the sending and receiving chains into independently lockable structs
-pub struct SplitRatchet {
+/// `pub(crate)`, not `pub`: the type is unused outside this crate's own
+/// tests, and it carries Q1's unauthenticated-header shape — it must not be
+/// reachable from outside the crate. Fixed or deleted in the v1 cleanup
+/// commit (named in the PR description).
+pub(crate) struct SplitRatchet {
     /// Root key (shared between chains, only changes during DH ratchet)
     root_key: std::sync::Arc<tokio::sync::Mutex<[u8; 32]>>,
     /// Our current DH key pair
