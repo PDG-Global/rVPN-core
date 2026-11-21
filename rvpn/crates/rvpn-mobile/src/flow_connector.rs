@@ -245,6 +245,7 @@ async fn perform_handshake(
         identity_key: Some(identity_public.to_vec()),
         session_token: None,
         connection_nonce: None,
+        capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
     };
 
     let hello_bytes = serde_json::to_vec(&hello).context("Failed to serialize Hello message")?;
@@ -267,14 +268,14 @@ async fn perform_handshake(
             let server_hello: HandshakeMessage =
                 serde_json::from_slice(&data).context("Failed to parse ServerHello message")?;
             let validated = security.validate(server_hello, server_bundle)?;
-            let (shared_secret, _) = initiator
+            let (shared_secret, _, ratchet_version) = initiator
                 .agree(&validated.bundle)
                 .context("X3DH key agreement failed")?;
             validated.commit(security);
 
             debug!("X3DH shared secret derived successfully");
             info!("Double Ratchet initialized after server identity validation");
-            Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32]))
+            Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32], ratchet_version))
         }
         _ => Err(anyhow::anyhow!("Expected binary message during handshake")),
     }

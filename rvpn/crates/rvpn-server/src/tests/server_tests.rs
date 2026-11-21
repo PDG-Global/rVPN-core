@@ -1,6 +1,7 @@
 //! Server connection tests
 
 use std::time::Duration;
+use rvpn_core::crypto::RatchetVersion;
 
 use tokio::net::TcpListener;
 
@@ -60,6 +61,7 @@ async fn test_handshake_message() -> anyhow::Result<()> {
         identity_key: Some(vec![4, 5, 6]),
         session_token: None,
         connection_nonce: Some(vec![7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]),
+        capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
     };
 
     // Serialize
@@ -198,8 +200,8 @@ async fn relay_test_rig(
 
     // Paired ratchets over a fixed shared secret (client = Alice, server = Bob).
     let secret = [42u8; 32];
-    let alice = rvpn_core::crypto::DoubleRatchet::init_alice(secret, [0u8; 32]);
-    let bob = rvpn_core::crypto::DoubleRatchet::init_bob(secret);
+    let alice = rvpn_core::crypto::DoubleRatchet::init_alice(secret, [0u8; 32], RatchetVersion::V1);
+    let bob = rvpn_core::crypto::DoubleRatchet::init_bob(secret, RatchetVersion::V1);
 
     let target_stream = tokio::net::TcpStream::connect(target_addr).await?;
 
@@ -336,8 +338,8 @@ async fn test_tun_response_loop_batches_packets() -> anyhow::Result<()> {
 
     // Paired ratchets: server encrypts as Bob, test decrypts as Alice.
     let secret = [99u8; 32];
-    let mut alice = rvpn_core::crypto::DoubleRatchet::init_alice(secret, [0u8; 32]);
-    let bob = rvpn_core::crypto::DoubleRatchet::init_bob(secret);
+    let mut alice = rvpn_core::crypto::DoubleRatchet::init_alice(secret, [0u8; 32], RatchetVersion::V1);
+    let bob = rvpn_core::crypto::DoubleRatchet::init_bob(secret, RatchetVersion::V1);
     let bob = std::sync::Arc::new(tokio::sync::Mutex::new(bob));
 
     // Queue 20 packets BEFORE the loop starts so the first iterations find a
@@ -784,9 +786,9 @@ async fn test_ws_sender_prioritizes_control() -> anyhow::Result<()> {
 
     // Paired ratchets: server encrypts as Bob, test decrypts as Alice.
     let secret = [7u8; 32];
-    let mut alice = rvpn_core::crypto::DoubleRatchet::init_alice(secret, [0u8; 32]);
+    let mut alice = rvpn_core::crypto::DoubleRatchet::init_alice(secret, [0u8; 32], RatchetVersion::V1);
     let bob = std::sync::Arc::new(tokio::sync::Mutex::new(
-        rvpn_core::crypto::DoubleRatchet::init_bob(secret),
+        rvpn_core::crypto::DoubleRatchet::init_bob(secret, RatchetVersion::V1),
     ));
 
     let (tx, rx) = mpsc::channel::<MuxMessage>(64);
@@ -873,8 +875,8 @@ async fn dns_responses_preserve_wire_order_under_contention() -> anyhow::Result<
 
     // Server encrypts as Bob; the test decrypts as Alice in wire order.
     let secret = [9u8; 32];
-    let mut alice = DoubleRatchet::init_alice(secret, [0u8; 32]);
-    let bob = Arc::new(tokio::sync::Mutex::new(DoubleRatchet::init_bob(secret)));
+    let mut alice = DoubleRatchet::init_alice(secret, [0u8; 32], RatchetVersion::V1);
+    let bob = Arc::new(tokio::sync::Mutex::new(DoubleRatchet::init_bob(secret, RatchetVersion::V1)));
     let send_lock = Arc::new(tokio::sync::Mutex::new(()));
     // Capacity 1 forces send awaits → maximal interleaving between tasks.
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(1);

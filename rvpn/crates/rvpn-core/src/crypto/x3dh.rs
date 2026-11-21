@@ -106,6 +106,89 @@ fn ed25519_public_key_to_x25519(ed25519_public: &[u8; 32]) -> crate::Result<[u8;
 }
 
 /// X3DH key bundle (published by server)
+/// Capability bit: the peer speaks ratchet wire version 2 (the
+/// header-authenticating AAD and commit-after-verify decrypt, Q1).
+pub const CAP_RATCHET_V2: u32 = 1;
+
+/// v1 handshake sunset, 2027-02-01T00:00:00Z. After this moment a session
+/// that cannot negotiate V2 is REFUSED (visible error), on both sides.
+/// Sized to the Android rollout through the release lane; adjust only by
+/// PR, never by config. The cleanup commit deletes `negotiate_version`'s
+/// V1 arm together with every `RatchetVersion::V1` AAD path — one commit,
+/// no archaeology: a sunset that lives only in a design doc never happens.
+pub const V1_SUNSET_UNIX: u64 = 1801440000;
+
+/// Which side of the handshake is asking: the downgrade rules differ.
+/// Servers deploy first, so a v2-capable **client** can demand v2 — every
+/// server it meets speaks it — while the **server** must still answer
+/// genuinely old clients in v1 until the sunset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegotiationSide {
+    /// V2 or an error, never V1: while bundles are unsigned, stripping
+    /// BOTH capability fields would otherwise downgrade a new client onto
+    /// the unauthenticated header. V1 on this side is simply not an outcome.
+    Client,
+    /// V2 when both advertise it; V1 for old clients until
+    /// [`V1_SUNSET_UNIX`], an error after.
+    Server,
+}
+
+/// What the two capability sets negotiate to. `now_unix` is injectable for
+/// tests. The both-strip attack (unsigned bundles until area-1 Q5 signs
+/// them) is closed asymmetrically: the client side never accepts V1, so a
+/// both-strip fails the client; the server side accepts v1 only until the
+/// coded sunset, after which it fails too.
+pub fn negotiate_version(
+    side: NegotiationSide,
+    client_caps: u32,
+    server_caps: u32,
+    now_unix: u64,
+) -> crate::Result<super::ratchet::RatchetVersion> {
+    if client_caps & CAP_RATCHET_V2 != 0 && server_caps & CAP_RATCHET_V2 != 0 {
+        return Ok(super::ratchet::RatchetVersion::V2);
+    }
+    match side {
+        NegotiationSide::Client => Err(crate::Error::HandshakeFailed(
+            "server does not speak ratchet v2; a v2-capable client refuses v1"
+                .to_string(),
+        )),
+        NegotiationSide::Server if now_unix < V1_SUNSET_UNIX => {
+            Ok(super::ratchet::RatchetVersion::V1)
+        }
+        NegotiationSide::Server => Err(crate::Error::HandshakeFailed(format!(
+            "peer cannot negotiate ratchet v2 and the v1 sunset ({V1_SUNSET_UNIX}) has passed"
+        ))),
+    }
+}
+
+/// The shared-secret derivation for a negotiated version. V1 is the legacy
+/// construction (DH results only, legacy info string) so pre-v2 peers
+/// derive identical keys; V2 mixes both capability sets into the KDF input
+/// with a fresh info string, so a stripped or altered capability field
+/// makes the two ends derive different secrets and the handshake dies at
+/// the first tag check instead of silently downgrading: the capability
+/// lives inside what the handshake authenticates.
+fn derive_session_secret(
+    dh_concat: &[u8],
+    client_caps: u32,
+    server_caps: u32,
+    version: super::ratchet::RatchetVersion,
+) -> SharedSecret {
+    match version {
+        super::ratchet::RatchetVersion::V1 => derive_shared_secret(dh_concat),
+        super::ratchet::RatchetVersion::V2 => {
+            let mut input = Vec::with_capacity(dh_concat.len() + 8);
+            input.extend_from_slice(dh_concat);
+            input.extend_from_slice(&client_caps.to_be_bytes());
+            input.extend_from_slice(&server_caps.to_be_bytes());
+            let mut result = [0u8; 32];
+            let derived = hkdf_derive(&[], &input, b"R-VPN-v2 X3DH", 32);
+            result.copy_from_slice(&derived);
+            result
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct X3DHPublicBundle {
     /// Identity public key (Ed25519, for signing)
@@ -164,6 +247,11 @@ pub struct X3DHPublicBundle {
         deserialize_with = "deserialize_base64_opt"
     )]
     pub rotation_signature: Option<[u8; 64]>,
+    /// Server capability bits (see [`CAP_RATCHET_V2`]). Pre-v2 bundles omit
+    /// the field and deserialize as 0 = v1-only. Mixed into the KDF input
+    /// for V2 sessions, so an on-path alteration diverges the secrets.
+    #[serde(default)]
+    pub capabilities: u32,
 }
 
 fn default_identity_key_version() -> u32 {
@@ -235,7 +323,7 @@ impl X3DHInitiator {
     pub fn agree(
         &self,
         server_bundle: &X3DHPublicBundle,
-    ) -> crate::Result<(SharedSecret, X3DHMaterial)> {
+    ) -> crate::Result<(SharedSecret, X3DHMaterial, super::ratchet::RatchetVersion)> {
         // Derive X25519 private key from Ed25519 signing key for the client
         let ik_client_x25519_private =
             ed25519_signing_key_to_x25519_private_key(&self.identity_key.signing_key);
@@ -273,17 +361,28 @@ impl X3DHInitiator {
             dh_concat.extend_from_slice(dh4);
         }
 
-        // Derive shared secret using HKDF
-        let shared_secret = derive_shared_secret(&dh_concat);
+        // Negotiate the ratchet version from the two capability sets and
+        // derive with them inside the KDF input (V2), so a stripped or
+        // altered capability diverges the secrets instead of downgrading.
+        let client_caps = CAP_RATCHET_V2;
+        let server_caps = server_bundle.capabilities;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let version =
+            negotiate_version(NegotiationSide::Client, client_caps, server_caps, now)?;
+        let shared_secret = derive_session_secret(&dh_concat, client_caps, server_caps, version);
 
         let material = X3DHMaterial {
             ephemeral_public: self.ephemeral_key.public_key.to_bytes(),
             identity_public: self.identity_key.verifying_key.to_bytes(),
             identity_x25519_public: ik_client_x25519_public.to_bytes(),
             one_time_prekey: server_bundle.one_time_prekey,
+            capabilities: client_caps,
         };
 
-        Ok((shared_secret, material))
+        Ok((shared_secret, material, version))
     }
 }
 
@@ -384,7 +483,8 @@ impl X3DHResponder {
         client_identity_x25519: &[u8; 32],
         client_ephemeral: &[u8; 32],
         used_one_time_prekey: bool,
-    ) -> crate::Result<SharedSecret> {
+        client_caps: u32,
+    ) -> crate::Result<(SharedSecret, super::ratchet::RatchetVersion)> {
         // DH1: SPK_server * IK_client
         let dh1 = x25519_diffie_hellman(
             &self.private_bundle.signed_prekey.to_bytes(),
@@ -422,9 +522,16 @@ impl X3DHResponder {
             dh_concat.extend_from_slice(dh4);
         }
 
-        let shared_secret = derive_shared_secret(&dh_concat);
+        let server_caps = self.get_public_bundle().capabilities;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let version =
+            negotiate_version(NegotiationSide::Server, client_caps, server_caps, now)?;
+        let shared_secret = derive_session_secret(&dh_concat, client_caps, server_caps, version);
 
-        Ok(shared_secret)
+        Ok((shared_secret, version))
     }
 
     /// Get public bundle for publishing
@@ -465,6 +572,7 @@ impl X3DHResponder {
             // `rvpn_server::main::prekey_bundle`.
             identity_key_version: 1,
             rotation_signature: None,
+                   capabilities: CAP_RATCHET_V2,
         }
     }
 
@@ -517,6 +625,8 @@ pub struct X3DHMaterial {
     pub identity_x25519_public: [u8; 32],
     /// One-time prekey used (if any)
     pub one_time_prekey: Option<[u8; 32]>,
+    /// Client capability bits offered in this handshake.
+    pub capabilities: u32,
 }
 
 /// Perform X25519 Diffie-Hellman
@@ -645,7 +755,7 @@ mod tests {
         let initiator = X3DHInitiator::new();
 
         // Client performs X3DH - with OTPK available
-        let (client_secret, material) = initiator.agree(&server_bundle).unwrap();
+        let (client_secret, material, _version) = initiator.agree(&server_bundle).unwrap();
 
         // Server performs X3DH with the OTPK
         let used_otpk = material.one_time_prekey.is_some();
@@ -654,11 +764,12 @@ mod tests {
                 &material.identity_x25519_public,
                 &material.ephemeral_public,
                 used_otpk,
+                material.capabilities,
             )
             .unwrap();
 
         // Secrets should match
-        assert_eq!(client_secret, server_secret);
+        assert_eq!(client_secret, server_secret.0);
     }
 
     /// Test that simulates the bug where server's bundle is missing identity_x25519_key
@@ -680,13 +791,14 @@ mod tests {
             identity_key_version: server_bundle_full.identity_key_version,
             rotation_signature: server_bundle_full.rotation_signature,
             identity_x25519_signature: server_bundle_full.identity_x25519_signature,
+            capabilities: server_bundle_full.capabilities,
         };
 
         // Create initiator (client)
         let initiator = X3DHInitiator::new();
 
         // Client performs X3DH with the broken bundle (missing identity_x25519_key)
-        let (client_secret, material) = initiator.agree(&server_bundle_broken).unwrap();
+        let (client_secret, material, _version) = initiator.agree(&server_bundle_broken).unwrap();
 
         // Server performs X3DH with its actual keys
         let server_secret = responder
@@ -694,22 +806,23 @@ mod tests {
                 &material.identity_x25519_public,
                 &material.ephemeral_public,
                 false, // no OTPK used
+                material.capabilities,
             )
             .unwrap();
 
         // This will FAIL because the client used [0u8; 32] for IK_server
         // but the server used its actual identity_x25519_key
         println!("Client secret: {:?}", hex::encode(&client_secret[..8]));
-        println!("Server secret: {:?}", hex::encode(&server_secret[..8]));
+        println!("Server secret: {:?}", hex::encode(&server_secret.0[..8]));
 
         // This assertion should fail, demonstrating the bug
-        if client_secret != server_secret {
+        if client_secret != server_secret.0 {
             println!("BUG REPRODUCED: Client and server secrets don't match!");
             println!("This happens when identity_x25519_key is missing from the prekey bundle");
         }
 
         // For the test, we expect them to be different (demonstrating the bug)
-        assert_ne!(client_secret, server_secret, "This demonstrates the bug - secrets should NOT match when identity_x25519_key is missing");
+        assert_ne!(client_secret, server_secret.0, "This demonstrates the bug - secrets should NOT match when identity_x25519_key is missing");
     }
 
     /// Test that shows the fix - when identity_x25519_key is properly included
@@ -723,7 +836,7 @@ mod tests {
         let initiator = X3DHInitiator::new();
 
         // Client performs X3DH with the complete bundle
-        let (client_secret, material) = initiator.agree(&server_bundle).unwrap();
+        let (client_secret, material, _version) = initiator.agree(&server_bundle).unwrap();
 
         // Server performs X3DH with its actual keys
         let server_secret = responder
@@ -731,10 +844,137 @@ mod tests {
                 &material.identity_x25519_public,
                 &material.ephemeral_public,
                 false, // no OTPK used
+                material.capabilities,
             )
             .unwrap();
 
         // Secrets should match when identity_x25519_key is properly included
+        assert_eq!(client_secret, server_secret.0);
+    }
+}
+
+#[cfg(test)]
+mod q1_negotiation_tests {
+    use super::*;
+
+    fn pair() -> (X3DHInitiator, X3DHResponder) {
+        (X3DHInitiator::new(), X3DHResponder::new())
+    }
+
+    #[test]
+    fn v2_handshake_secrets_match_and_version_is_v2() {
+        let (initiator, responder) = pair();
+        let bundle = responder.get_public_bundle();
+        assert_eq!(bundle.capabilities, CAP_RATCHET_V2);
+        let (client_secret, material, c_version) = initiator.agree(&bundle).unwrap();
+        let (server_secret, s_version) = responder
+            .agree(
+                &material.identity_x25519_public,
+                &material.ephemeral_public,
+                false,
+                material.capabilities,
+            )
+            .unwrap();
         assert_eq!(client_secret, server_secret);
+        assert_eq!(c_version, super::super::ratchet::RatchetVersion::V2);
+        assert_eq!(s_version, super::super::ratchet::RatchetVersion::V2);
+    }
+
+    #[test]
+    fn stripped_client_capability_diverges_the_secrets() {
+        // On-path attacker removes the client's capability field: server
+        // sees 0 and derives the v1 secret; the honest client derives v2.
+        // The handshake must DIE (secrets differ), not fall back to v1.
+        let (initiator, responder) = pair();
+        let bundle = responder.get_public_bundle();
+        let (client_secret, material, c_version) = initiator.agree(&bundle).unwrap();
+        let (server_secret, s_version) = responder
+            .agree(
+                &material.identity_x25519_public,
+                &material.ephemeral_public,
+                false,
+                0, // stripped in flight
+            )
+            .unwrap();
+        assert_eq!(c_version, super::super::ratchet::RatchetVersion::V2);
+        assert_eq!(s_version, super::super::ratchet::RatchetVersion::V1);
+        assert_ne!(
+            client_secret, server_secret,
+            "strip must diverge the secrets: the session dies at the first tag"
+        );
+    }
+
+    #[test]
+    fn both_strip_is_refused_by_the_client() {
+        // The both-strip attack: remove CAP_RATCHET_V2 from the
+        // (unsigned) server bundle AND from the client's handshake. With a
+        // symmetric rule both ends would negotiate V1 and the handshake
+        // would succeed on the unauthenticated header. The client side
+        // never accepts V1, so the tampered bundle kills the handshake at
+        // agree() — before any secret is derived.
+        let (initiator, responder) = pair();
+        let mut bundle = responder.get_public_bundle();
+        bundle.capabilities = 0; // stripped in flight
+        assert!(
+            initiator.agree(&bundle).is_err(),
+            "a v2-capable client must refuse a v1-only negotiation"
+        );
+    }
+
+    #[test]
+    fn server_side_still_answers_old_clients_until_the_sunset() {
+        // The asymmetry's other half: a genuinely old client (no caps)
+        // still gets a working v1 session from a new server, pre-sunset,
+        // and both derive the SAME legacy secret.
+        let legacy_client_caps = 0;
+        let (_, responder) = pair();
+        let bundle = responder.get_public_bundle();
+        assert_eq!(bundle.capabilities, CAP_RATCHET_V2);
+        assert_eq!(
+            negotiate_version(
+                NegotiationSide::Server,
+                legacy_client_caps,
+                bundle.capabilities,
+                V1_SUNSET_UNIX - 1
+            )
+            .unwrap(),
+            super::super::ratchet::RatchetVersion::V1
+        );
+    }
+
+    #[test]
+    fn v1_is_refused_after_the_coded_sunset() {
+        use super::super::ratchet::RatchetVersion as V;
+        // Client side: never v1, before or after the sunset.
+        assert!(negotiate_version(NegotiationSide::Client, 0, 0, 1).is_err());
+        assert!(negotiate_version(NegotiationSide::Client, CAP_RATCHET_V2, 0, 1).is_err());
+        // Server side: v1 only until the sunset.
+        assert!(negotiate_version(NegotiationSide::Server, 0, 0, V1_SUNSET_UNIX + 1).is_err());
+        assert_eq!(
+            negotiate_version(NegotiationSide::Server, 0, 0, V1_SUNSET_UNIX - 1).unwrap(),
+            V::V1
+        );
+        // v2 is always available to both sides when both advertise it.
+        for side in [NegotiationSide::Client, NegotiationSide::Server] {
+            assert_eq!(
+                negotiate_version(side, CAP_RATCHET_V2, CAP_RATCHET_V2, V1_SUNSET_UNIX + 1)
+                    .unwrap(),
+                V::V2
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_bundle_without_capabilities_deserializes_as_v1_only() {
+        // Pre-v2 bundle JSON has no capabilities field: must read as 0.
+        let responder = X3DHResponder::new();
+        let bundle = responder.get_public_bundle();
+        let json = serde_json::to_string(&bundle).unwrap();
+        let stripped: serde_json::Value =
+            serde_json::from_str(&json).unwrap();
+        let mut obj = stripped.clone();
+        obj.as_object_mut().unwrap().remove("capabilities");
+        let legacy: X3DHPublicBundle = serde_json::from_value(obj).unwrap();
+        assert_eq!(legacy.capabilities, 0);
     }
 }

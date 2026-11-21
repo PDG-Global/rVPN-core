@@ -103,6 +103,11 @@ pub enum HandshakeMessage {
         /// Prevents session reuse when client reconnects
         #[serde(with = "serde_bytes")]
         connection_nonce: Option<Vec<u8>>,
+        /// Client capability bits (`rvpn_core::crypto::x3dh::CAP_RATCHET_V2`).
+        /// Absent in pre-v2 clients: treated as 0 (v1-only). Mixed into the
+        /// X3DH KDF input, so altering it in flight diverges the secrets.
+        #[serde(default)]
+        capabilities: Option<u32>,
     },
 
     /// Server response with key bundle
@@ -125,6 +130,9 @@ pub enum HandshakeMessage {
         /// Signature over the identity X25519 key, when supplied.
         #[serde(default, with = "serde_bytes")]
         identity_x25519_signature: Option<Vec<u8>>,
+        /// Server capability bits, from the signed public bundle.
+        #[serde(default)]
+        capabilities: Option<u32>,
     },
 
     /// Client authentication proof
@@ -227,6 +235,7 @@ mod tests {
             identity_key: vec![3; 32],
             identity_x25519_key: Some(vec![4; 32]),
             identity_x25519_signature: Some(vec![5; 64]),
+            capabilities: None,
         }
     }
 

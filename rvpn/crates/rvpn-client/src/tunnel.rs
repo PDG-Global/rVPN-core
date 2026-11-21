@@ -228,6 +228,7 @@ impl VpnTunnel {
             identity_key: Some(identity_public.to_vec()),
             session_token: None,
             connection_nonce: None,
+            capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
         };
 
         let hello_bytes =
@@ -256,6 +257,7 @@ impl VpnTunnel {
                         identity_key: server_identity_key,
                         signed_prekey: server_signed_prekey,
                         prekey_signature: server_prekey_signature,
+                        capabilities: server_capabilities,
                         ..
                     } => {
                         debug!("Received ServerHello with ephemeral key");
@@ -303,6 +305,7 @@ impl VpnTunnel {
                             identity_key_version: 1,
                             rotation_signature: None,
                             identity_x25519_signature: None,
+                            capabilities: server_capabilities.unwrap_or(0),
                         };
 
                         // Verify server identity if configured
@@ -326,6 +329,7 @@ impl VpnTunnel {
                             identity_key_version: 1,
                             rotation_signature: None,
                             identity_x25519_signature: None,
+                            capabilities: server_capabilities.unwrap_or(0),
                         };
 
                         // Verify the server identity
@@ -368,7 +372,7 @@ impl VpnTunnel {
                         }
 
                         // Complete X3DH agreement using the SERVER'S ACTUAL bundle
-                        let (shared_secret, _x3dh_material) = initiator
+                        let (shared_secret, _x3dh_material, ratchet_version) = initiator
                             .agree(&server_bundle_from_hello)
                             .context("X3DH key agreement failed")?;
 
@@ -377,7 +381,7 @@ impl VpnTunnel {
                         // Initialize Double Ratchet as Alice (initiator)
                         // In X3DH, the server (Bob) doesn't generate an ephemeral key.
                         // The server_ephemeral field is empty - init_alice doesn't use this parameter.
-                        let ratchet = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
+                        let ratchet = DoubleRatchet::init_alice(shared_secret, [0u8; 32], ratchet_version);
 
                         info!("Double Ratchet initialized as Alice (initiator)");
 

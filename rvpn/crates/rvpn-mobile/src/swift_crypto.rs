@@ -10,7 +10,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::ptr;
 
 use ed25519_dalek::Verifier;
-use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
+use rvpn_core::crypto::{DoubleRatchet, IdentityKey, RatchetVersion, X3DHPublicBundle};
 use rvpn_core::protocol::padding::{pad_packet, unpad_packet};
 
 // --- Handle types ---
@@ -168,15 +168,26 @@ pub unsafe extern "C" fn rvpn_ratchet_decrypt(
 ///
 /// # Returns
 /// Opaque ratchet handle, or null on error.
+/// `version`: the negotiated ratchet wire version from `rvpn_x3dh_agree*`
+/// (1 = v1, 2 = v2). Any other value is an error — a guessed version
+/// breaks every tag, so it is refused rather than defaulted.
 #[no_mangle]
-pub unsafe extern "C" fn rvpn_ratchet_init_alice(shared_secret: *const u8) -> *mut RatchetHandle {
+pub unsafe extern "C" fn rvpn_ratchet_init_alice(
+    shared_secret: *const u8,
+    version: u8,
+) -> *mut RatchetHandle {
     if shared_secret.is_null() {
         return ptr::null_mut();
     }
+    let version = match version {
+        1 => RatchetVersion::V1,
+        2 => RatchetVersion::V2,
+        _ => return ptr::null_mut(),
+    };
     let secret = std::slice::from_raw_parts(shared_secret, 32);
     let mut ss = [0u8; 32];
     ss.copy_from_slice(secret);
-    let ratchet = DoubleRatchet::init_alice(ss, [0u8; 32]);
+    let ratchet = DoubleRatchet::init_alice(ss, [0u8; 32], version);
     Box::into_raw(Box::new(RatchetHandle { ratchet }))
 }
 
@@ -400,8 +411,10 @@ pub unsafe extern "C" fn rvpn_x3dh_agree(
     server_identity_x25519: *const u8,
     server_signed_prekey: *const u8,
     server_prekey_signature: *const u8,
+    server_capabilities: u32,
     ephemeral_pubkey_out: *mut u8,
     shared_secret_out: *mut u8,
+    version_out: *mut u8,
 ) -> c_int {
     if identity.is_null()
         || server_identity_key.is_null()
@@ -458,6 +471,7 @@ pub unsafe extern "C" fn rvpn_x3dh_agree(
         identity_key_version: 1,
         rotation_signature: None,
         identity_x25519_signature: None,
+            capabilities: server_capabilities,
     };
 
     // Create X3DH initiator
@@ -471,13 +485,19 @@ pub unsafe extern "C" fn rvpn_x3dh_agree(
     epk_out.copy_from_slice(&epk);
 
     // Perform X3DH agreement
-    let (shared_secret, _material) = match initiator.agree(&server_bundle) {
+    let (shared_secret, _material, ratchet_version) = match initiator.agree(&server_bundle) {
         Ok(v) => v,
         Err(e) => {
             super::ios_tun_ffi::set_last_error(&format!("x3dh agree: {}", e));
             return -1;
         }
     };
+    if !version_out.is_null() {
+        *version_out = match ratchet_version {
+            RatchetVersion::V1 => 1,
+            RatchetVersion::V2 => 2,
+        };
+    }
 
     let ss_out = std::slice::from_raw_parts_mut(shared_secret_out, 32);
     ss_out.copy_from_slice(&shared_secret);
@@ -546,6 +566,8 @@ pub unsafe extern "C" fn rvpn_x3dh_agree_with_ephemeral(
     server_signed_prekey: *const u8,
     server_prekey_signature: *const u8,
     shared_secret_out: *mut u8,
+    server_capabilities: u32,
+    version_out: *mut u8,
 ) -> c_int {
     if identity.is_null()
         || ephemeral.is_null()
@@ -603,6 +625,7 @@ pub unsafe extern "C" fn rvpn_x3dh_agree_with_ephemeral(
         identity_key_version: 1,
         rotation_signature: None,
         identity_x25519_signature: None,
+            capabilities: server_capabilities,
     };
 
     // Create X3DH initiator with the pre-generated ephemeral key
@@ -618,13 +641,19 @@ pub unsafe extern "C" fn rvpn_x3dh_agree_with_ephemeral(
     };
 
     // Perform X3DH agreement
-    let (shared_secret, _material) = match initiator.agree(&server_bundle) {
+    let (shared_secret, _material, ratchet_version) = match initiator.agree(&server_bundle) {
         Ok(v) => v,
         Err(e) => {
             super::ios_tun_ffi::set_last_error(&format!("x3dh agree: {}", e));
             return -1;
         }
     };
+    if !version_out.is_null() {
+        *version_out = match ratchet_version {
+            RatchetVersion::V1 => 1,
+            RatchetVersion::V2 => 2,
+        };
+    }
 
     let ss_out = std::slice::from_raw_parts_mut(shared_secret_out, 32);
     ss_out.copy_from_slice(&shared_secret);

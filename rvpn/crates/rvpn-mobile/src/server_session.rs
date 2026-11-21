@@ -37,7 +37,7 @@ use crate::ws::{FrameType, MinimalWebSocket, MinimalWsReader, MinimalWsWriter};
 
 use rvpn_core::crypto::ratchet::{RatchetMessage, RatchetMessageRef};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
-use rvpn_core::crypto::{DoubleRatchet, EphemeralKey, IdentityKey, X3DHPublicBundle};
+use rvpn_core::crypto::{DoubleRatchet, EphemeralKey, IdentityKey, X3DHPublicBundle, RatchetVersion};
 use rvpn_core::protocol::padding::{pad_packet, unpad_packet, unpad_packet_slice};
 use rvpn_core::protocol::{
     ControlMessage, HandshakeMessage, MultiplexedFrame, PayloadType, VirtualIp,
@@ -850,6 +850,7 @@ impl ServerSession {
             identity_key: Some(identity_public.to_vec()),
             session_token: None,
             connection_nonce: None,
+            capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
         };
 
         let hello_bytes =
@@ -879,12 +880,12 @@ impl ServerSession {
                         .context("Failed to parse ServerHello message")?;
 
                 let validated = self.security.validate(server_hello, &self.server_bundle)?;
-                let (shared_secret, _) = initiator
+                let (shared_secret, _, ratchet_version) = initiator
                     .agree(&validated.bundle)
                     .context("X3DH key agreement failed")?;
                 validated.commit(&self.security);
                 info!("[IosTun] Double Ratchet initialized after server identity validation");
-                Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32]))
+                Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32], ratchet_version))
             }
             _ => Err(anyhow::anyhow!("Expected binary message during handshake")),
         }
@@ -2338,6 +2339,7 @@ mod tests {
             identity_key_version: 1,
             rotation_signature: None,
             identity_x25519_signature: None,
+            capabilities: 0,
         };
         let session = Arc::new(ServerSession::new(
             shared,
@@ -2368,6 +2370,7 @@ mod tests {
             identity_key: bundle.identity_key.to_vec(),
             identity_x25519_key: None,
             identity_x25519_signature: None,
+            capabilities: None,
         };
         assert!(session.security.validate(unsigned, &bundle).is_err());
     }

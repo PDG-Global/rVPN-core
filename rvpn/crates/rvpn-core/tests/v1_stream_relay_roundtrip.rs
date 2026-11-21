@@ -55,6 +55,8 @@ fn client_side_wire_bundle(
         identity_key_version: stale_local_bundle.identity_key_version,
         rotation_signature: stale_local_bundle.rotation_signature,
         identity_x25519_signature: stale_local_bundle.identity_x25519_signature,
+        // A current server advertises v2; the wire bundle mirrors it.
+        capabilities: rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
     }
 }
 
@@ -68,14 +70,15 @@ fn v1_first_frame_roundtrips_when_bundles_match() {
     let client_identity_pub = initiator.identity_key.x25519_public_key();
     let client_ephemeral_pub = initiator.ephemeral_key.public_key.to_bytes();
 
-    let (client_shared, _) = initiator.agree(&server_bundle).expect("client agree");
-    let server_shared = responder
-        .agree(&client_identity_pub, &client_ephemeral_pub, false)
+    let (client_shared, material, c_version) = initiator.agree(&server_bundle).expect("client agree");
+    let (server_shared, s_version) = responder
+        .agree(&client_identity_pub, &client_ephemeral_pub, false, material.capabilities)
         .expect("server agree");
     assert_eq!(client_shared, server_shared);
+    assert_eq!(c_version, s_version);
 
-    let mut alice = DoubleRatchet::init_alice(client_shared, [0u8; 32]);
-    let mut bob = DoubleRatchet::init_bob(server_shared);
+    let mut alice = DoubleRatchet::init_alice(client_shared, [0u8; 32], c_version);
+    let mut bob = DoubleRatchet::init_bob(server_shared, s_version);
 
     let target = b"\x0dapi.ipify.org\x01\xbb";
     let padded = padding::pad_packet(target).expect("pad");
@@ -129,18 +132,19 @@ fn v1_first_frame_survives_stale_local_signed_prekey() {
 
     // 4. Client agrees against the wire bundle; server agrees against
     //    its own responder. Should match.
-    let (client_shared, _) = initiator.agree(&wire_bundle).expect("client agree");
-    let server_shared = responder
-        .agree(&client_identity_pub, &client_ephemeral_pub, false)
+    let (client_shared, material, c_version) = initiator.agree(&wire_bundle).expect("client agree");
+    let (server_shared, s_version) = responder
+        .agree(&client_identity_pub, &client_ephemeral_pub, false, material.capabilities)
         .expect("server agree");
     assert_eq!(
         client_shared, server_shared,
         "client used stale signed_prekey instead of wire value — regression"
     );
+    assert_eq!(c_version, s_version);
 
     // 5. Round-trip a frame end-to-end.
-    let mut alice = DoubleRatchet::init_alice(client_shared, [0u8; 32]);
-    let mut bob = DoubleRatchet::init_bob(server_shared);
+    let mut alice = DoubleRatchet::init_alice(client_shared, [0u8; 32], c_version);
+    let mut bob = DoubleRatchet::init_bob(server_shared, s_version);
     let target = b"\x0dapi.ipify.org\x01\xbb";
     let padded = padding::pad_packet(target).expect("pad");
     let msg = alice.encrypt(&padded, &[0x01]).expect("encrypt");

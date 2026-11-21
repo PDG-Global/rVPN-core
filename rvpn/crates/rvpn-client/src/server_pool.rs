@@ -240,6 +240,7 @@ mod tests {
                 identity_key_version: 1,
                 rotation_signature: None,
                 identity_x25519_signature: None,
+                           capabilities: 0,
             }),
             identity_config: ServerIdentityConfig::default(),
             resumption: ResumptionStore::new(),
