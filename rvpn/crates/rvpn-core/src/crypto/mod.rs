@@ -10,7 +10,7 @@ pub mod cipher;
 pub mod ratchet;
 pub mod x3dh;
 
-pub use ratchet::{DoubleRatchet, MessageHeader, RatchetMessage, RatchetMessageRef};
+pub use ratchet::{DoubleRatchet, MessageHeader, RatchetMessage, RatchetMessageRef, RatchetVersion};
 pub use x3dh::{verify_identity_x25519_signature, X3DHPublicBundle, X3DHResponder};
 
 /// Ed25519 identity key pair

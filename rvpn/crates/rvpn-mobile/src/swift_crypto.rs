@@ -10,7 +10,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::ptr;
 
 use ed25519_dalek::Verifier;
-use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
+use rvpn_core::crypto::{DoubleRatchet, IdentityKey, RatchetVersion, X3DHPublicBundle};
 use rvpn_core::protocol::padding::{pad_packet, unpad_packet};
 
 // --- Handle types ---
@@ -176,7 +176,7 @@ pub unsafe extern "C" fn rvpn_ratchet_init_alice(shared_secret: *const u8) -> *m
     let secret = std::slice::from_raw_parts(shared_secret, 32);
     let mut ss = [0u8; 32];
     ss.copy_from_slice(secret);
-    let ratchet = DoubleRatchet::init_alice(ss, [0u8; 32]);
+    let ratchet = DoubleRatchet::init_alice(ss, [0u8; 32], ratchet_version);
     Box::into_raw(Box::new(RatchetHandle { ratchet }))
 }
 

@@ -37,6 +37,7 @@ fn server_hello(bundle: &X3DHPublicBundle) -> HandshakeMessage {
         identity_key: bundle.identity_key.to_vec(),
         identity_x25519_key: Some(bundle.identity_x25519_key.to_vec()),
         identity_x25519_signature: bundle.identity_x25519_signature.map(|sig| sig.to_vec()),
+        capabilities: Some(bundle.capabilities),
     }
 }
 
@@ -359,6 +360,7 @@ impl VpnHandler {
                 auth_method,
                 ephemeral_key,
                 identity_key,
+                capabilities,
                 ..
             } => {
                 // Protocol version detection and compatibility check
@@ -457,9 +459,13 @@ impl VpnHandler {
                 };
 
                 // Perform X3DH agreement
-                let shared_secret =
-                    match responder.agree(&client_identity, &client_ephemeral, false) {
-                        Ok(secret) => secret,
+                let (shared_secret, ratchet_version) = match responder.agree(
+                    &client_identity,
+                    &client_ephemeral,
+                    false,
+                    capabilities.unwrap_or(0),
+                ) {
+                    Ok(pair) => pair,
                         Err(e) => {
                             debug!("X3DH agreement failed from {}: {}", peer_addr, e);
                             return Ok(None);
@@ -469,7 +475,7 @@ impl VpnHandler {
                 debug!("X3DH handshake successful from {}", peer_addr);
 
                 // Initialize Double Ratchet as Bob (responder)
-                let ratchet = DoubleRatchet::init_bob(shared_secret);
+                let ratchet = DoubleRatchet::init_bob(shared_secret, ratchet_version);
 
                 // Send ServerHello response
                 // Note: Server doesn't generate an ephemeral key in X3DH - only the client does.
@@ -2868,6 +2874,7 @@ where
                 auth_method,
                 ephemeral_key,
                 identity_key,
+                capabilities,
                 ..
             } => {
                 debug!(
@@ -2959,9 +2966,13 @@ where
                 self.client_identity = Some(client_identity);
 
                 // Perform X3DH agreement
-                let shared_secret =
-                    match responder.agree(&client_identity, &client_ephemeral, false) {
-                        Ok(secret) => secret,
+                let (shared_secret, ratchet_version) = match responder.agree(
+                    &client_identity,
+                    &client_ephemeral,
+                    false,
+                    capabilities.unwrap_or(0),
+                ) {
+                    Ok(pair) => pair,
                         Err(e) => {
                             debug!("X3DH agreement failed from {}: {}", self.peer_addr, e);
                             return Ok(None);
@@ -2972,7 +2983,7 @@ where
 
                 // Initialize Double Ratchet as Bob (responder)
                 debug!("Initializing DoubleRatchet as Bob for {}", self.peer_addr);
-                let ratchet = DoubleRatchet::init_bob(shared_secret);
+                let ratchet = DoubleRatchet::init_bob(shared_secret, ratchet_version);
 
                 // Send ServerHello response
                 debug!("Preparing ServerHello for {}", self.peer_addr);
@@ -4165,6 +4176,7 @@ impl DnsHandler {
                 auth_method,
                 ephemeral_key,
                 identity_key,
+                capabilities,
                 ..
             } => {
                 if !version.is_compatible_with(&ProtocolVersion::CURRENT) {
@@ -4209,9 +4221,13 @@ impl DnsHandler {
                     }
                 };
 
-                let shared_secret =
-                    match responder.agree(&client_identity, &client_ephemeral, false) {
-                        Ok(s) => s,
+                let (shared_secret, ratchet_version) = match responder.agree(
+                    &client_identity,
+                    &client_ephemeral,
+                    false,
+                    capabilities.unwrap_or(0),
+                ) {
+                    Ok(pair) => pair,
                         Err(e) => {
                             debug!(
                                 "DNS handler: X3DH agreement failed for {}: {}",
@@ -4221,7 +4237,7 @@ impl DnsHandler {
                         }
                     };
 
-                let ratchet = DoubleRatchet::init_bob(shared_secret);
+                let ratchet = DoubleRatchet::init_bob(shared_secret, ratchet_version);
 
                 let public_bundle = responder.get_public_bundle();
                 let server_hello = server_hello(&public_bundle);

@@ -672,6 +672,7 @@ async fn dns_handshake(
         identity_key: Some(identity_public.to_vec()),
         session_token: None,
         connection_nonce: None,
+        capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
     };
 
     let hello_bytes = serde_json::to_vec(&hello).context("Failed to serialize Hello")?;
@@ -698,6 +699,7 @@ async fn dns_handshake(
                     identity_key: server_identity_key,
                     signed_prekey: server_signed_prekey,
                     prekey_signature: server_prekey_signature,
+                    capabilities: server_capabilities,
                     ..
                 } => {
                     // Use the SERVER'S ACTUAL wire values for X3DH.
@@ -746,15 +748,16 @@ async fn dns_handshake(
                         identity_key_version: server_bundle.identity_key_version,
                         rotation_signature: server_bundle.rotation_signature,
                         identity_x25519_signature: None,
+                        capabilities: server_capabilities.unwrap_or(0),
                     };
 
-                    let (shared_secret, _) = initiator
+                    let (shared_secret, _, ratchet_version) = initiator
                         .agree(&received_bundle)
                         .context("X3DH key agreement failed")?;
 
                     // In X3DH, the server (Bob) doesn't generate an ephemeral key.
                     // We pass zeros since init_alice doesn't use this parameter.
-                    Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32]))
+                    Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32], ratchet_version))
                 }
                 _ => Err(anyhow::anyhow!("Unexpected handshake message from server")),
             }

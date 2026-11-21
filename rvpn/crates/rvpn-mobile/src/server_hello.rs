@@ -134,6 +134,7 @@ impl ServerSecurity {
             prekey_signature,
             identity_x25519_key,
             identity_x25519_signature,
+            capabilities,
         ) = match message {
             HandshakeMessage::ServerHello {
                 identity_key,
@@ -141,6 +142,7 @@ impl ServerSecurity {
                 prekey_signature,
                 identity_x25519_key,
                 identity_x25519_signature,
+                capabilities,
                 ..
             } => (
                 identity_key,
@@ -148,6 +150,7 @@ impl ServerSecurity {
                 prekey_signature,
                 identity_x25519_key,
                 identity_x25519_signature,
+                capabilities,
             ),
             _ => bail!("Unexpected handshake message type from server"),
         };
@@ -223,6 +226,7 @@ impl ServerSecurity {
                 one_time_prekey: None,
                 identity_key_version: disk_bundle.identity_key_version,
                 rotation_signature: disk_bundle.rotation_signature,
+                capabilities: capabilities.unwrap_or(0),
             },
             used_signed_x25519,
             actual_pin,
@@ -244,6 +248,7 @@ mod tests {
             identity_x25519_key: signed.then(|| bundle.identity_x25519_key.to_vec()),
             identity_x25519_signature: signed
                 .then(|| bundle.identity_x25519_signature.unwrap().to_vec()),
+            capabilities: None,
         }
     }
 

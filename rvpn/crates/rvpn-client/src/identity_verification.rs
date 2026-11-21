@@ -358,7 +358,8 @@ mod tests {
             identity_key_version: 1,
             rotation_signature: None,
             identity_x25519_signature: None,
-        }
+           capabilities: 0,
+}
     }
 
     #[test]

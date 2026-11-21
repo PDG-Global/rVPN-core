@@ -10,6 +10,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::cipher::{Cipher, NONCE_SIZE};
 use super::{EphemeralKey, SharedSecret};
+use x25519_dalek::{StaticSecret as X25519StaticSecret, PublicKey as X25519PublicKey};
 
 /// Size of chain keys
 pub const CHAIN_KEY_SIZE: usize = 32;
@@ -20,9 +21,38 @@ pub const MAX_SKIP: usize = 1000;
 /// Maximum plaintext message size (1MB) to prevent memory exhaustion
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
+/// Wire/crypto version of a ratchet session, negotiated at handshake time
+/// (the capability is inside the X3DH KDF input, so it cannot be stripped
+/// or altered without diverging the shared secret — the handshake fails).
+///
+/// V1 authenticates only `payload_type` as AEAD AAD; V2 authenticates the
+/// whole canonically serialized header ([`MessageHeader::to_bytes`]). A V2
+/// session never accepts a V1-framed message: the tag fails (Q1, MEDIUM).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatchetVersion {
+    /// Legacy: AAD = [payload_type]. Accepted only until the coded sunset.
+    V1,
+    /// AAD = canonical header serialization.
+    V2,
+}
+
+/// AEAD associated data for a header under a session version. One canonical
+/// serializer ([`MessageHeader::to_bytes`]) is used by seal and open, so a
+/// re-encoding can never change the tag (review condition 3).
+fn aad_for(version: RatchetVersion, header: &MessageHeader) -> Vec<u8> {
+    match version {
+        RatchetVersion::V1 => vec![header.payload_type],
+        RatchetVersion::V2 => header.to_bytes(),
+    }
+}
+
 /// Double Ratchet state
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct DoubleRatchet {
+    /// Negotiated session version (selects the AAD construction).
+    #[zeroize(skip)]
+    version: RatchetVersion,
+
     /// Our current DH key pair
     #[zeroize(skip)]
     dh_pair: Option<EphemeralKey>,
@@ -61,7 +91,11 @@ impl DoubleRatchet {
     ///
     /// Uses the X3DH shared secret to derive initial chain keys.
     /// The DH ratchet will start when the first message is exchanged.
-    pub fn init_alice(shared_secret: SharedSecret, _server_public_key: [u8; 32]) -> Self {
+    pub fn init_alice(
+        shared_secret: SharedSecret,
+        _server_public_key: [u8; 32],
+        version: RatchetVersion,
+    ) -> Self {
         // Generate initial DH key pair for future ratchet steps
         let dh_pair = EphemeralKey::generate();
 
@@ -74,6 +108,7 @@ impl DoubleRatchet {
         receiving_chain_key.copy_from_slice(&keys.1);
 
         Self {
+            version,
             dh_pair: Some(dh_pair),
             remote_dh_key: None, // Will be set when we receive Bob's first message
             previous_remote_dh_key: None,
@@ -91,7 +126,7 @@ impl DoubleRatchet {
     ///
     /// Bob generates a DH key pair and derives initial chain keys from the shared secret.
     /// When Alice's first message arrives, a DH ratchet step will be performed.
-    pub fn init_bob(shared_secret: SharedSecret) -> Self {
+    pub fn init_bob(shared_secret: SharedSecret, version: RatchetVersion) -> Self {
         // Generate initial DH key pair
         let dh_pair = EphemeralKey::generate();
 
@@ -108,6 +143,7 @@ impl DoubleRatchet {
         sending_chain_key.copy_from_slice(&keys.1);
 
         Self {
+            version,
             dh_pair: Some(dh_pair),
             remote_dh_key: None,
             previous_remote_dh_key: None,
@@ -154,21 +190,21 @@ impl DoubleRatchet {
         let cipher = Cipher::new(&message_key);
 
         let payload_type = associated_data.first().copied().unwrap_or(0);
-        let aad = &[payload_type];
-
-        let nonce = super::cipher::generate_nonce();
-
-        ciphertext_out.clear();
-        ciphertext_out.extend_from_slice(plaintext);
-        cipher.encrypt_in_place(&nonce, aad, ciphertext_out)
-            .map_err(|e| crate::Error::EncryptionFailed(e.to_string()))?;
-
+        // Header first: the AAD authenticates exactly these fields (V2).
         let header = MessageHeader {
             dh_public: self.dh_pair.as_ref().map(|k| k.public_key.to_bytes()),
             message_number: self.send_message_number,
             previous_chain_length: self.previous_chain_length,
             payload_type,
         };
+        let aad = aad_for(self.version, &header);
+
+        let nonce = super::cipher::generate_nonce();
+
+        ciphertext_out.clear();
+        ciphertext_out.extend_from_slice(plaintext);
+        cipher.encrypt_in_place(&nonce, &aad, ciphertext_out)
+            .map_err(|e| crate::Error::EncryptionFailed(e.to_string()))?;
 
         self.sending_chain_key = Some(next_chain_key);
         self.send_message_number += 1;
@@ -183,6 +219,25 @@ impl DoubleRatchet {
     pub fn decrypt_to(
         &mut self,
         message: &RatchetMessage,
+        associated_data: &[u8],
+        plaintext_out: &mut Vec<u8>,
+    ) -> crate::Result<usize> {
+        // Trial-decrypt on a full state copy; the real state commits only
+        // after the AEAD tag verifies (Q1: a forged header must never move
+        // the ratchet). The failed trial is zeroized on drop.
+        let mut trial = self.trial_clone();
+        match trial.decrypt_to_inner(message, associated_data, plaintext_out) {
+            Ok(n) => {
+                *self = trial;
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn decrypt_to_inner(
+        &mut self,
+        message: &RatchetMessage,
         _associated_data: &[u8],
         plaintext_out: &mut Vec<u8>,
     ) -> crate::Result<usize> {
@@ -194,7 +249,9 @@ impl DoubleRatchet {
 
         let target_number = message.header.message_number;
         let current_number = self.recv_message_number;
-        let associated_data = &[message.header.payload_type];
+        // AAD authenticates the whole canonical header in V2 (Q1).
+        let aad = aad_for(self.version, &message.header);
+        let associated_data: &[u8] = &aad;
 
         let key = message.header.skipped_key_id();
 
@@ -253,6 +310,23 @@ impl DoubleRatchet {
     pub fn decrypt_to_ref(
         &mut self,
         message: &RatchetMessageRef<'_>,
+        associated_data: &[u8],
+        plaintext_out: &mut Vec<u8>,
+    ) -> crate::Result<usize> {
+        // Same trial-then-commit discipline as `decrypt_to`.
+        let mut trial = self.trial_clone();
+        match trial.decrypt_to_ref_inner(message, associated_data, plaintext_out) {
+            Ok(n) => {
+                *self = trial;
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn decrypt_to_ref_inner(
+        &mut self,
+        message: &RatchetMessageRef<'_>,
         _associated_data: &[u8],
         plaintext_out: &mut Vec<u8>,
     ) -> crate::Result<usize> {
@@ -264,7 +338,9 @@ impl DoubleRatchet {
 
         let target_number = message.header.message_number;
         let current_number = self.recv_message_number;
-        let associated_data = &[message.header.payload_type];
+        // AAD authenticates the whole canonical header in V2 (Q1).
+        let aad = aad_for(self.version, &message.header);
+        let associated_data: &[u8] = &aad;
 
         // Only construct the skipped-key lookup key (which allocates a Vec for
         // the header bytes) when there are actually skipped keys stored. On the
@@ -341,20 +417,20 @@ impl DoubleRatchet {
         // Extract payload type from associated data (first byte, or 0 if empty)
         let payload_type = associated_data.first().copied().unwrap_or(0);
         // Use payload_type as associated data for AEAD (must match decrypt)
-        let aad = &[payload_type];
-        
-        // Generate random nonce
-        let nonce = super::cipher::generate_nonce();
-        let ciphertext = cipher.encrypt(&nonce, aad, plaintext)
-            .map_err(|e| crate::Error::EncryptionFailed(e.to_string()))?;
-        
-        // Build header with CURRENT message number (before advancing)
+        // Build the header FIRST (with the current message number):
+        // in V2 the AAD authenticates exactly these fields.
         let header = MessageHeader {
             dh_public: self.dh_pair.as_ref().map(|k| k.public_key.to_bytes()),
             message_number: self.send_message_number,
             previous_chain_length: self.previous_chain_length,
             payload_type,
         };
+        let aad = aad_for(self.version, &header);
+        
+        // Generate random nonce
+        let nonce = super::cipher::generate_nonce();
+        let ciphertext = cipher.encrypt(&nonce, &aad, plaintext)
+            .map_err(|e| crate::Error::EncryptionFailed(e.to_string()))?;
         
         // NOW advance the chain - this ensures the header reflects the correct state
         self.sending_chain_key = Some(next_chain_key);
@@ -375,6 +451,22 @@ impl DoubleRatchet {
     pub fn decrypt(
         &mut self,
         message: &RatchetMessage,
+        associated_data: &[u8],
+    ) -> crate::Result<Vec<u8>> {
+        // Same trial-then-commit discipline as `decrypt_to`.
+        let mut trial = self.trial_clone();
+        match trial.decrypt_inner(message, associated_data) {
+            Ok(pt) => {
+                *self = trial;
+                Ok(pt)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn decrypt_inner(
+        &mut self,
+        message: &RatchetMessage,
         _associated_data: &[u8],  // Kept for API compatibility, but we use header.payload_type
     ) -> crate::Result<Vec<u8>> {
         // Reject oversized messages to prevent memory exhaustion
@@ -388,7 +480,9 @@ impl DoubleRatchet {
         let current_number = self.recv_message_number;
         
         // Use payload type from header as associated data
-        let associated_data = &[message.header.payload_type];
+        // AAD authenticates the whole canonical header in V2 (Q1).
+        let aad = aad_for(self.version, &message.header);
+        let associated_data: &[u8] = &aad;
         
         // Try to decrypt with skipped keys first (for out-of-order messages we've seen before)
         let key = message.header.skipped_key_id();
@@ -445,6 +539,67 @@ impl DoubleRatchet {
     }
     
     /// Skip message keys for out-of-order handling
+    /// A full copy of the decrypt-mutable state, for trial-decrypt: DH
+    /// pair, skipped-key set, both chain keys, both counters, the root key
+    /// and the remote-DH bookmarks — every field a decrypt can move (review
+    /// condition 2). The copy drops (and zeroizes) when a tag fails.
+    /// `public_key` is copied as bytes, not recomputed: this runs on the
+    /// hot frame path.
+    fn trial_clone(&self) -> DoubleRatchet {
+        let dh_pair = self.dh_pair.as_ref().map(|k| EphemeralKey {
+            private_key: X25519StaticSecret::from(k.private_key.to_bytes()),
+            public_key: X25519PublicKey::from(k.public_key.to_bytes()),
+        });
+        let mut skipped_keys = LruCache::new(NonZeroUsize::new(MAX_SKIP).unwrap());
+        for (k, v) in self.skipped_keys.iter() {
+            skipped_keys.put(k.clone(), *v);
+        }
+        DoubleRatchet {
+            version: self.version,
+            dh_pair,
+            remote_dh_key: self.remote_dh_key,
+            previous_remote_dh_key: self.previous_remote_dh_key,
+            root_key: self.root_key,
+            sending_chain_key: self.sending_chain_key,
+            receiving_chain_key: self.receiving_chain_key,
+            send_message_number: self.send_message_number,
+            recv_message_number: self.recv_message_number,
+            previous_chain_length: self.previous_chain_length,
+            skipped_keys,
+        }
+    }
+
+    /// A fixed-order digest of every decrypt-mutable field, for the
+    /// "tag fails ⇒ state byte-identical" test. Test-only.
+    #[cfg(test)]
+    pub(crate) fn state_digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        let dh = self
+            .dh_pair
+            .as_ref()
+            .map(|k| k.private_key.to_bytes())
+            .unwrap_or([0u8; 32]);
+        h.update(dh);
+        h.update(self.remote_dh_key.unwrap_or([0u8; 32]));
+        h.update(self.previous_remote_dh_key.unwrap_or([0u8; 32]));
+        h.update(self.root_key);
+        h.update(self.sending_chain_key.unwrap_or([0u8; 32]));
+        h.update(self.receiving_chain_key.unwrap_or([0u8; 32]));
+        h.update(self.send_message_number.to_be_bytes());
+        h.update(self.recv_message_number.to_be_bytes());
+        h.update(self.previous_chain_length.to_be_bytes());
+        // Sorted: the LRU order is an access artifact, not state meaning.
+        let mut entries: Vec<_> = self.skipped_keys.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for ((id, n), key) in entries {
+            h.update(id);
+            h.update(n.to_be_bytes());
+            h.update(key);
+        }
+        h.finalize().into()
+    }
+
     fn skip_message_keys(&mut self, until: u32) -> crate::Result<()> {
         if (self.recv_message_number + MAX_SKIP as u32) < until {
             return Err(crate::Error::DecryptionFailed(
@@ -1157,15 +1312,15 @@ mod tests {
     #[test]
     fn test_decrypt_to_ref_matches_decrypt_to() {
         let shared_secret = [0x42u8; 32];
-        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let mut bob = DoubleRatchet::init_bob(shared_secret);
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let mut bob = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
 
         let plaintext = b"Hello, zero-copy!";
         let msg = alice.encrypt(plaintext, &[0x05]).expect("encrypt failed");
         let wire = msg.to_bytes().unwrap();
 
         // Decrypt via owned path
-        let mut bob_owned = DoubleRatchet::init_bob(shared_secret);
+        let mut bob_owned = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
         let plain_owned = bob_owned.decrypt(&msg, &[0x05]).unwrap();
 
         // Decrypt via ref path
@@ -1181,8 +1336,8 @@ mod tests {
     fn test_double_ratchet_basic() {
         let shared_secret = [0x42u8; 32];
         
-        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let mut bob = DoubleRatchet::init_bob(shared_secret);
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let mut bob = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
         
         // Alice encrypts
         let plaintext = b"Hello, Bob!";
@@ -1197,8 +1352,8 @@ mod tests {
     fn test_double_ratchet_multiple_messages() {
         let shared_secret = [0x42u8; 32];
 
-        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let mut bob = DoubleRatchet::init_bob(shared_secret);
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let mut bob = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
 
         // Send multiple messages
         for i in 0..5 {
@@ -1213,8 +1368,8 @@ mod tests {
     fn test_double_ratchet_bidirectional() {
         let shared_secret = [0x42u8; 32];
 
-        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let mut bob = DoubleRatchet::init_bob(shared_secret);
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let mut bob = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
 
         // Alice -> Bob (first message, includes Alice's DH public key)
         let msg1 = alice.encrypt(b"Hello Bob", &[0x05]).expect("Alice encrypt failed");
@@ -1249,8 +1404,8 @@ mod tests {
         // key, looked up under the 42-byte serialized header) and message 1
         // failed permanently with "Message too old".
         let shared_secret = [0x42u8; 32];
-        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let mut bob = DoubleRatchet::init_bob(shared_secret);
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let mut bob = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
 
         let messages: Vec<RatchetMessage> = (0..4)
             .map(|i| {
@@ -1283,8 +1438,8 @@ mod tests {
         // Same reorder scenario through the buffer-reuse decrypt_to path
         // used by the Apple-platform Swift relay (swift_crypto.rs).
         let shared_secret = [0x42u8; 32];
-        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let mut bob = DoubleRatchet::init_bob(shared_secret);
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let mut bob = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
 
         let messages: Vec<RatchetMessage> = (0..3)
             .map(|i| {
@@ -1311,8 +1466,8 @@ mod tests {
         // used on the iOS direct-TUN hot path, including bincode wire
         // (de)serialization like real WebSocket frames.
         let shared_secret = [0x42u8; 32];
-        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let mut bob = DoubleRatchet::init_bob(shared_secret);
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let mut bob = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
 
         let wires: Vec<Vec<u8>> = (0..3)
             .map(|i| {
@@ -1347,8 +1502,8 @@ mod tests {
         // the cost shows up as a very late message failing to decrypt with
         // "Message too old" even though it was never seen before.
         let shared_secret = [0x42u8; 32];
-        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let mut bob = DoubleRatchet::init_bob(shared_secret);
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let mut bob = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
 
         // Messages 0..=MAX_SKIP+2, one chain, no DH steps in between.
         let messages: Vec<RatchetMessage> = (0..=MAX_SKIP as u32 + 2)
@@ -1410,8 +1565,8 @@ mod tests {
         // not settled behaviour; if capacity is raised above the skip
         // window there, the assertions below change deliberately.
         let shared_secret = [0x42u8; 32];
-        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let mut bob = DoubleRatchet::init_bob(shared_secret);
+        let mut alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let mut bob = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
 
         // Messages 0..=2*MAX_SKIP+1 needed to reach the maximal-gap message.
         let messages: Vec<RatchetMessage> = (0..=2 * MAX_SKIP as u32 + 1)
@@ -1540,8 +1695,8 @@ mod split_ratchet_tests {
         let shared_secret = [0x42u8; 32];
         
         // Create DoubleRatchets and extract their state for conversion
-        let alice_dr = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let bob_dr = DoubleRatchet::init_bob(shared_secret);
+        let alice_dr = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let bob_dr = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
         
         // Convert using the from_double_ratchet constructor
         // Note: In real usage, you'd add accessor methods to DoubleRatchet to get these fields
@@ -1633,5 +1788,116 @@ mod split_ratchet_tests {
         // A replay of the recovered message must not decrypt twice.
         let replay = bob.decrypt(&messages[1], &[0x05]).await;
         assert!(replay.is_err(), "replayed message must be rejected");
+    }
+}
+
+#[cfg(test)]
+mod q1_v2_tests {
+    use super::*;
+
+    fn v2_pair() -> (DoubleRatchet, DoubleRatchet) {
+        let shared = [0x42u8; 32];
+        (
+            DoubleRatchet::init_alice(shared, [0u8; 32], RatchetVersion::V2),
+            DoubleRatchet::init_bob(shared, RatchetVersion::V2),
+        )
+    }
+
+    /// Tamper with one header field of a genuine message; the open must
+    /// fail, the state must be byte-identical afterwards, and the next
+    /// genuine message must still decrypt (the load-bearing half).
+    fn tamper_and_check(tamper: impl Fn(&mut MessageHeader)) {
+        let (mut alice, mut bob) = v2_pair();
+        let m1 = alice.encrypt(b"first", &[0x05]).unwrap();
+        let m2 = alice.encrypt(b"second", &[0x05]).unwrap();
+
+        let before = bob.state_digest();
+        let mut forged = m1.clone();
+        tamper(&mut forged.header);
+        assert!(
+            bob.decrypt(&forged, &[0x05]).is_err(),
+            "tampered header must not open"
+        );
+        assert_eq!(
+            bob.state_digest(),
+            before,
+            "failed tag must leave the ratchet state byte-identical"
+        );
+
+        // The genuine messages still decrypt, in order.
+        assert_eq!(bob.decrypt(&m1, &[0x05]).unwrap(), b"first");
+        assert_eq!(bob.decrypt(&m2, &[0x05]).unwrap(), b"second");
+    }
+
+    #[test]
+    fn v2_tampered_dh_public_fails_state_intact_next_decrypts() {
+        // A forged dh_public is exactly the desync attack from Q1: in v1 it
+        // moved the receiver's ratchet before the tag check.
+        tamper_and_check(|h| h.dh_public = Some([0xEE; 32]));
+    }
+
+    #[test]
+    fn v2_tampered_message_number_fails_state_intact_next_decrypts() {
+        tamper_and_check(|h| h.message_number += 1);
+    }
+
+    #[test]
+    fn v2_tampered_previous_chain_length_fails_state_intact_next_decrypts() {
+        tamper_and_check(|h| h.previous_chain_length += 7);
+    }
+
+    #[test]
+    fn v2_tampered_payload_type_fails_state_intact_next_decrypts() {
+        // payload_type rode in the v1 AAD alone; it must stay covered.
+        tamper_and_check(|h| h.payload_type = 0x99);
+    }
+
+    #[test]
+    fn v1_framed_message_is_refused_in_a_v2_session() {
+        // No in-session downgrade: a v1-AAD message never opens in v2.
+        let shared = [0x42u8; 32];
+        let mut v1_alice =
+            DoubleRatchet::init_alice(shared, [0u8; 32], RatchetVersion::V1);
+        let mut v2_bob = DoubleRatchet::init_bob(shared, RatchetVersion::V2);
+        let m = v1_alice.encrypt(b"legacy", &[0x05]).unwrap();
+        let before = v2_bob.state_digest();
+        assert!(v2_bob.decrypt(&m, &[0x05]).is_err());
+        assert_eq!(v2_bob.state_digest(), before);
+    }
+
+    #[test]
+    fn header_to_bytes_has_a_fixed_canonical_layout() {
+        // One serializer, one layout: seal and open authenticate identical
+        // bytes (review condition 3). Guard the layout explicitly.
+        let h = MessageHeader {
+            dh_public: Some([0x11; 32]),
+            message_number: 0x01020304,
+            previous_chain_length: 0x05060708,
+            payload_type: 0x09,
+        };
+        let b = h.to_bytes();
+        assert_eq!(b.len(), 1 + 32 + 4 + 4 + 1);
+        assert_eq!(b[0], 1);
+        assert_eq!(&b[1..33], &[0x11; 32]);
+        assert_eq!(&b[33..37], [1, 2, 3, 4]);
+        assert_eq!(&b[37..41], [5, 6, 7, 8]);
+        assert_eq!(b[41], 0x09);
+
+        let h2 = MessageHeader { dh_public: None, ..h.clone() };
+        let b2 = h2.to_bytes();
+        assert_eq!(b2.len(), 1 + 4 + 4 + 1);
+        assert_eq!(b2[0], 0);
+    }
+
+    #[test]
+    fn v2_roundtrip_and_out_of_order_still_work() {
+        // The fix must not break the legitimate paths: order, gap, reorder.
+        let (mut alice, mut bob) = v2_pair();
+        let m0 = alice.encrypt(b"zero", &[0x05]).unwrap();
+        let m1 = alice.encrypt(b"one", &[0x05]).unwrap();
+        let m2 = alice.encrypt(b"two", &[0x05]).unwrap();
+        assert_eq!(bob.decrypt(&m0, &[0x05]).unwrap(), b"zero");
+        assert_eq!(bob.decrypt(&m2, &[0x05]).unwrap(), b"two"); // skips m1
+        assert_eq!(bob.decrypt(&m1, &[0x05]).unwrap(), b"one"); // skipped key
     }
 }

@@ -364,6 +364,7 @@ impl Socks5Tunnel {
             identity_key: Some(identity_public.to_vec()),
             session_token: None,
             connection_nonce: None,
+            capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
         };
         ws_writer
             .send(Message::Binary(serde_json::to_vec(&hello)?))
@@ -390,6 +391,7 @@ impl Socks5Tunnel {
                 identity_key: server_identity_key,
                 signed_prekey: server_signed_prekey,
                 prekey_signature: server_prekey_signature,
+                capabilities: server_capabilities,
                 ..
             } => {
                 let srv_id: [u8; 32] = server_identity_key
@@ -425,6 +427,7 @@ impl Socks5Tunnel {
                     identity_key_version: server_bundle.identity_key_version,
                     rotation_signature: server_bundle.rotation_signature,
                     identity_x25519_signature: None,
+                    capabilities: server_capabilities.unwrap_or(0),
                 };
 
                 // Optional identity verification. Load-mutate-save the
@@ -450,10 +453,10 @@ impl Socks5Tunnel {
                     }
                 }
 
-                let (shared, _) = initiator
+                let (shared, _, ratchet_version) = initiator
                     .agree(&bundle)
                     .context("X3DH key agreement failed")?;
-                let ratchet = DoubleRatchet::init_alice(shared, [0u8; 32]);
+                let ratchet = DoubleRatchet::init_alice(shared, [0u8; 32], ratchet_version);
                 Ok(ratchet)
             }
             HandshakeMessage::Error { code, message } => {
@@ -1109,6 +1112,7 @@ pub async fn handle_multiplexed_connection(
 mod tests {
     use super::*;
     use rvpn_core::crypto::RatchetMessage;
+use rvpn_core::crypto::RatchetVersion;
     use std::collections::HashSet;
 
     /// Regression test for the production "Message too old" stall (hk2):
@@ -1125,8 +1129,8 @@ mod tests {
         const TOTAL: usize = TASKS * MSGS_PER_TASK;
 
         let shared_secret = [0x42u8; 32];
-        let alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let mut bob = DoubleRatchet::init_bob(shared_secret);
+        let alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let mut bob = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
 
         let (tx, mut rx) = mpsc::channel::<Message>(1);
         let sender = TunnelSender {
@@ -1195,8 +1199,8 @@ mod tests {
     /// decrypting whatever the tunnel sends.
     fn test_tunnel() -> (Socks5Tunnel, mpsc::Receiver<Message>, DoubleRatchet) {
         let shared_secret = [0x42u8; 32];
-        let alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
-        let bob = DoubleRatchet::init_bob(shared_secret);
+        let alice = DoubleRatchet::init_alice(shared_secret, [0u8; 32], RatchetVersion::V1);
+        let bob = DoubleRatchet::init_bob(shared_secret, RatchetVersion::V1);
         let (tx, rx) = mpsc::channel::<Message>(64);
         let ratchet = Arc::new(Mutex::new(alice));
         let tunnel = Socks5Tunnel {

@@ -145,6 +145,7 @@ impl StreamRelay {
             identity_key: Some(identity_public.to_vec()),
             session_token: None,
             connection_nonce: None,
+            capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
         };
 
         let hello_bytes =
@@ -174,6 +175,7 @@ impl StreamRelay {
                         identity_key: server_identity_key,
                         signed_prekey: server_signed_prekey,
                         prekey_signature: server_prekey_signature,
+                        capabilities: server_capabilities,
                         ..
                     } => {
                         debug!("Received ServerHello with ephemeral key");
@@ -232,6 +234,7 @@ impl StreamRelay {
                             identity_key_version: server_bundle.identity_key_version,
                             rotation_signature: server_bundle.rotation_signature,
                             identity_x25519_signature: None,
+                            capabilities: server_capabilities.unwrap_or(0),
                         };
 
                         // Verify server identity if configured
@@ -282,7 +285,7 @@ impl StreamRelay {
                         }
 
                         // Complete X3DH against the SERVER'S ACTUAL bundle
-                        let (shared_secret, _x3dh_material) = initiator
+                        let (shared_secret, _x3dh_material, ratchet_version) = initiator
                             .agree(&received_bundle)
                             .context("X3DH key agreement failed")?;
 
@@ -291,7 +294,7 @@ impl StreamRelay {
                         // Initialize Double Ratchet as Alice (initiator)
                         // In X3DH, the server (Bob) doesn't generate an ephemeral key.
                         // The server_ephemeral field is empty - init_alice doesn't use this parameter.
-                        let ratchet = DoubleRatchet::init_alice(shared_secret, [0u8; 32]);
+                        let ratchet = DoubleRatchet::init_alice(shared_secret, [0u8; 32], ratchet_version);
 
                         info!("Double Ratchet initialized as Alice (initiator)");
 
@@ -596,6 +599,7 @@ impl StreamRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rvpn_core::crypto::RatchetVersion;
 
     #[test]
     fn test_length_prefix_format() {
@@ -646,7 +650,7 @@ mod tests {
         let (ws_reader, ws_writer, ws_tasks) = split_websocket(client_ws);
 
         let secret = [7u8; 32];
-        let ratchet = DoubleRatchet::init_alice(secret, [0u8; 32]);
+        let ratchet = DoubleRatchet::init_alice(secret, [0u8; 32], RatchetVersion::V1);
         let relay = StreamRelay { ratchet };
 
         let relay_task = tokio::spawn(async move {
