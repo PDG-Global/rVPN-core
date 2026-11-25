@@ -391,6 +391,8 @@ impl Socks5Tunnel {
                 identity_key: server_identity_key,
                 signed_prekey: server_signed_prekey,
                 prekey_signature: server_prekey_signature,
+                identity_x25519_key: hello_x25519_key,
+                identity_x25519_signature: hello_x25519_signature,
                 capabilities: server_capabilities,
                 ..
             } => {
@@ -415,8 +417,15 @@ impl Socks5Tunnel {
                 vk.verify(&srv_sp, &signature)
                     .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
 
-                // Use pre-loaded bundle's identity_x25519_key for X3DH
-                let identity_x25519 = server_bundle.identity_x25519_key;
+                // Signed identity-X25519 proof: a verified wire key wins;
+                // the pre-loaded value is the legacy unsigned path.
+                let (identity_x25519, identity_x25519_sig) =
+                    crate::identity_verification::resolve_identity_x25519(
+                        &srv_id,
+                        hello_x25519_key.as_deref(),
+                        hello_x25519_signature.as_deref(),
+                        server_bundle,
+                    )?;
 
                 let bundle = X3DHPublicBundle {
                     identity_key: srv_id,
@@ -426,7 +435,7 @@ impl Socks5Tunnel {
                     one_time_prekey: None,
                     identity_key_version: server_bundle.identity_key_version,
                     rotation_signature: server_bundle.rotation_signature,
-                    identity_x25519_signature: None,
+                    identity_x25519_signature: identity_x25519_sig,
                     capabilities: server_capabilities.unwrap_or(0),
                 };
 

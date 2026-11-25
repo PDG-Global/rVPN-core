@@ -699,6 +699,8 @@ async fn dns_handshake(
                     identity_key: server_identity_key,
                     signed_prekey: server_signed_prekey,
                     prekey_signature: server_prekey_signature,
+                    identity_x25519_key: hello_x25519_key,
+                    identity_x25519_signature: hello_x25519_signature,
                     capabilities: server_capabilities,
                     ..
                 } => {
@@ -736,18 +738,25 @@ async fn dns_handshake(
                         .verify(&server_signed_prekey, &signature)
                         .map_err(|e| anyhow::anyhow!("Invalid prekey signature: {}", e))?;
 
-                    // identity_x25519_key can't be derived from the Ed25519
-                    // public alone; keep the pre-loaded value (it is
-                    // deterministic from the same identity).
+                    // Signed identity-X25519 proof: a verified wire key
+                    // wins; the pre-loaded value is the legacy unsigned
+                    // path until clients require the proof.
+                    let (identity_x25519_key, identity_x25519_signature) =
+                        crate::identity_verification::resolve_identity_x25519(
+                            &server_identity_key,
+                            hello_x25519_key.as_deref(),
+                            hello_x25519_signature.as_deref(),
+                            server_bundle,
+                        )?;
                     let received_bundle = X3DHPublicBundle {
                         identity_key: server_identity_key,
-                        identity_x25519_key: server_bundle.identity_x25519_key,
+                        identity_x25519_key,
                         signed_prekey: server_signed_prekey,
                         prekey_signature: prekey_signature_bytes,
                         one_time_prekey: None,
                         identity_key_version: server_bundle.identity_key_version,
                         rotation_signature: server_bundle.rotation_signature,
-                        identity_x25519_signature: None,
+                        identity_x25519_signature,
                         capabilities: server_capabilities.unwrap_or(0),
                     };
 
@@ -757,7 +766,11 @@ async fn dns_handshake(
 
                     // In X3DH, the server (Bob) doesn't generate an ephemeral key.
                     // We pass zeros since init_alice doesn't use this parameter.
-                    Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32], ratchet_version))
+                    Ok(DoubleRatchet::init_alice(
+                        shared_secret,
+                        [0u8; 32],
+                        ratchet_version,
+                    ))
                 }
                 _ => Err(anyhow::anyhow!("Unexpected handshake message from server")),
             }

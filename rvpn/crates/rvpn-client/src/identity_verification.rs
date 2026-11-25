@@ -20,6 +20,62 @@ use std::os::unix::fs::OpenOptionsExt;
 use rvpn_core::crypto::X3DHPublicBundle;
 use rvpn_core::identity_pin::{encode_identity_pin, pins_match, ParsedPin};
 
+/// Resolve the server's identity-X25519 key for X3DH from a ServerHello,
+/// mirroring the mobile client's rules (`rvpn-mobile/src/server_hello.rs`):
+///
+/// - wire key + wire signature: verify the signature against the wire
+///   identity key, then use the **wire** key. A verified wire key wins
+///   over the pre-loaded copy, so a server-side regeneration under the
+///   same identity cannot strand the client on a stale on-disk value.
+/// - neither: the pre-loaded bundle's key and signature — the legacy
+///   unsigned migration path, accepted until clients require the proof.
+/// - only one of the pair: refuse. A partial proof is malformed, never
+///   a reason to fall back to the unsigned path.
+///
+/// A signed proof only ever speaks for the identity the client already
+/// holds: the wire Ed25519 identity must equal the pre-loaded bundle's.
+/// Verifying a wire X25519 key against a *wire-supplied* identity would
+/// accept a proof the attacker signed themselves — the pre-loaded
+/// bundle is the binding, and a different identity is refused outright
+/// (rotation goes through the pin layer, not this path).
+///
+/// Returns the key to use for X3DH and the signature to carry in the
+/// constructed bundle.
+pub fn resolve_identity_x25519(
+    wire_identity_key: &[u8; 32],
+    hello_x25519_key: Option<&[u8]>,
+    hello_x25519_signature: Option<&[u8]>,
+    disk_bundle: &X3DHPublicBundle,
+) -> Result<([u8; 32], Option<[u8; 64]>)> {
+    if wire_identity_key != &disk_bundle.identity_key {
+        anyhow::bail!(
+            "wire identity does not match the pre-loaded bundle's identity; refusing the proof instead of binding X3DH to a new identity"
+        );
+    }
+    match (hello_x25519_key, hello_x25519_signature) {
+        (Some(key), Some(signature)) => {
+            let key: [u8; 32] = key
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Server identity X25519 key has invalid length"))?;
+            let signature: [u8; 64] = signature
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Identity X25519 signature has invalid length"))?;
+            rvpn_core::crypto::verify_identity_x25519_signature(
+                wire_identity_key,
+                &key,
+                &signature,
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid identity X25519 signature: {}", e))?;
+            Ok((key, Some(signature)))
+        }
+        (None, None) => Ok((
+            disk_bundle.identity_x25519_key,
+            disk_bundle.identity_x25519_signature,
+        )),
+        _ => anyhow::bail!("Server supplied only part of the signed identity X25519 proof"),
+    }
+}
+
 /// Known hosts storage
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KnownHosts {
@@ -360,6 +416,117 @@ mod tests {
             identity_x25519_signature: None,
            capabilities: 0,
 }
+    }
+
+    fn signed_disk_bundle() -> X3DHPublicBundle {
+        // A real responder bundle: the identity X25519 key carries a
+        // valid signature from the bundle's own Ed25519 identity key.
+        rvpn_core::crypto::X3DHResponder::new().get_public_bundle()
+    }
+
+    #[test]
+    fn resolve_prefers_a_verified_wire_key() {
+        // Same identity on both sides, but the on-disk copy carries a
+        // stale X25519 value: a valid wire proof from that identity
+        // replaces it.
+        let wire = signed_disk_bundle();
+        let mut disk = wire.clone();
+        disk.identity_x25519_key = [0xab; 32];
+        disk.identity_x25519_signature = None;
+        let sig = wire.identity_x25519_signature.unwrap();
+        let (key, carried) = resolve_identity_x25519(
+            &wire.identity_key,
+            Some(&wire.identity_x25519_key),
+            Some(&sig),
+            &disk,
+        )
+        .expect("a valid wire proof from the held identity resolves");
+        assert_eq!(key, wire.identity_x25519_key);
+        assert_eq!(carried, Some(sig));
+        assert_ne!(key, disk.identity_x25519_key);
+    }
+
+    #[test]
+    fn resolve_rejects_a_tampered_wire_signature() {
+        let disk = signed_disk_bundle();
+        let wire = signed_disk_bundle();
+        let mut sig = wire.identity_x25519_signature.unwrap();
+        sig[0] ^= 0x01;
+        let err = resolve_identity_x25519(
+            &wire.identity_key,
+            Some(&wire.identity_x25519_key),
+            Some(&sig),
+            &disk,
+        );
+        assert!(err.is_err(), "a tampered signature must not resolve");
+    }
+
+    #[test]
+    fn resolve_rejects_a_signature_over_another_key() {
+        let disk = signed_disk_bundle();
+        let wire = signed_disk_bundle();
+        let other = signed_disk_bundle();
+        let sig = other.identity_x25519_signature.unwrap();
+        let err = resolve_identity_x25519(
+            &wire.identity_key,
+            Some(&wire.identity_x25519_key),
+            Some(&sig),
+            &disk,
+        );
+        assert!(err.is_err(), "a signature over a different key must fail");
+    }
+
+    #[test]
+    fn resolve_refuses_a_partial_proof() {
+        let disk = signed_disk_bundle();
+        let sig = disk.identity_x25519_signature.unwrap();
+        assert!(
+            resolve_identity_x25519(
+                &disk.identity_key,
+                Some(&disk.identity_x25519_key),
+                None,
+                &disk
+            )
+            .is_err(),
+            "a key with no signature is a partial proof"
+        );
+        assert!(
+            resolve_identity_x25519(&disk.identity_key, None, Some(&sig), &disk).is_err(),
+            "a signature with no key is a partial proof"
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_the_disk_bundle_when_unsigned() {
+        let disk = signed_disk_bundle();
+        let (key, carried) = resolve_identity_x25519(&disk.identity_key, None, None, &disk)
+            .expect("the unsigned path resolves from the disk bundle");
+        assert_eq!(key, disk.identity_x25519_key);
+        assert_eq!(carried, disk.identity_x25519_signature);
+    }
+
+    #[test]
+    fn resolve_refuses_a_proof_from_a_different_identity() {
+        // The attack the equality guard exists for: a MITM presents their
+        // own Ed25519 identity plus an X25519 key they validly signed
+        // with it. The signature is good — and must still be refused,
+        // because the proof does not speak for the identity the client
+        // holds. The disk bundle's X25519 key is the binding.
+        let disk = signed_disk_bundle();
+        let attacker = signed_disk_bundle();
+        let sig = attacker.identity_x25519_signature.unwrap();
+        let signed = resolve_identity_x25519(
+            &attacker.identity_key,
+            Some(&attacker.identity_x25519_key),
+            Some(&sig),
+            &disk,
+        );
+        assert!(signed.is_err(), "a foreign identity's proof must fail");
+        let unsigned = resolve_identity_x25519(&attacker.identity_key, None, None, &disk);
+        assert!(
+            unsigned.is_err(),
+            "a foreign identity is refused even without a proof"
+        );
     }
 
     #[test]
