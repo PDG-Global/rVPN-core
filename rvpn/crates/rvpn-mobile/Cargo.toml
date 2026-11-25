@@ -96,7 +96,7 @@ ipnetwork = "0.20"
 dashmap = "5.5"
 
 # DNS server and client
-hickory-proto = { version = "0.24", optional = true }
+hickory-proto = { version = "0.26", optional = true }
 
 # R-VPN split tunnel — iOS disables builtin data (50MB jetsam), Android keeps it
 rvpn-split-tunnel = { path = "../rvpn-split-tunnel", default-features = false }
