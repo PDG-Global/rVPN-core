@@ -24,7 +24,9 @@ use rvpn_core::protocol::multiplex::{CreditWait, FlowSendCredits, FLOW_CREDIT_ST
 use rvpn_core::protocol::{ControlMessage, HandshakeMessage, MultiplexedFrame, PayloadType};
 
 use crate::config::ServerIdentityConfig;
-use crate::identity_verification::{verify_server_identity, KnownHosts};
+use crate::identity_verification::{
+    mismatch_is_fatal, persist_known_hosts, verify_server_identity, KnownHosts, VerificationResult,
+};
 use crate::websocket::{
     connect_websocket, split_websocket, Message, WebSocketReader, WebSocketTaskHandle,
     WebSocketWriter,
@@ -443,22 +445,47 @@ impl Socks5Tunnel {
                 // known_hosts file so a TOFU capture on first connect
                 // and a legacy-to-canonical pin migration on subsequent
                 // connects both persist without a caller-side rewrite.
+                // A corrupt or unreadable known_hosts file FAILS the
+                // connection here (A19): treating it as pin-less would
+                // TOFU-capture whatever answered and overwrite every
+                // stored pin on the save below.
                 if let Some(cfg) = server_identity_config {
                     let addr = format!("{}:{}", host, port);
-                    let mut known = KnownHosts::load(&cfg.known_hosts_file).unwrap_or_default();
-                    let (_res, ok) = verify_server_identity(
+                    let mut known = KnownHosts::load(&cfg.known_hosts_file)?;
+                    let (res, ok) = verify_server_identity(
                         &addr,
                         &bundle,
                         &mut known,
                         cfg.fingerprint.as_deref(),
                         cfg.trust_on_first_use,
-                        cfg.strict_mode,
+                        cfg.reject_new_identity,
                     );
-                    if let Err(e) = known.save(&cfg.known_hosts_file) {
-                        tracing::warn!("Failed to persist known_hosts.json: {}", e);
-                    }
-                    if !ok && cfg.strict_mode {
-                        anyhow::bail!("Server identity verification failed");
+                    // Persist TOFU captures and pin migrations. A failed save
+                    // after a fresh capture is fatal — otherwise the next
+                    // session re-captures blindly.
+                    persist_known_hosts(&known, &cfg.known_hosts_file, &res, ok)?;
+                    match &res {
+                        VerificationResult::Verified => {}
+                        VerificationResult::New => {
+                            if !ok {
+                                // verify_server_identity refused the capture:
+                                // reject_new_identity is set, or
+                                // trust_on_first_use is disabled.
+                                anyhow::bail!(
+                                    "Server identity verification failed: unknown server identity rejected"
+                                );
+                            }
+                        }
+                        VerificationResult::Mismatch { expected, got, .. } => {
+                            if mismatch_is_fatal(&res, cfg.reject_mismatch) {
+                                anyhow::bail!(
+                                    "Server identity mismatch! Expected {}, got {}. Connection rejected.",
+                                    expected, got
+                                );
+                            } else {
+                                tracing::warn!("Server identity mismatch — continuing because reject_mismatch = false: identity pinning is OFF for this connection (explicit dev opt-in, not safe for production)");
+                            }
+                        }
                     }
                 }
 

@@ -28,7 +28,7 @@ pub use rvpn_split_tunnel::DEFAULT_SERVER_NAME;
 /// A resolved server, ready to be handed to `StreamRelay::connect`.
 ///
 /// The `identity_config` is per-server so a pinned `[[server]].fingerprint`
-/// can override the top-level TOFU/strict settings.
+/// can override the top-level TOFU/reject_mismatch settings.
 #[derive(Debug, Clone)]
 pub struct ResolvedServer {
     pub name: String,
