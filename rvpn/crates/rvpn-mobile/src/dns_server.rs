@@ -287,7 +287,8 @@ impl DnsServer {
             }
             SplitTunnelRoutingDecision::Bypass => {
                 // Forward raw query bytes to upstream DNS and return raw response
-                self.forward_raw_dns(query_bytes).await
+                self.forward_raw_dns(query_bytes, request.metadata.id, queries.first().copied())
+                    .await
             }
             SplitTunnelRoutingDecision::Tunnel => {
                 // Multi-server: a router may steer this domain to a
@@ -300,9 +301,16 @@ impl DnsServer {
     }
 
     /// Forward raw DNS query to upstream nameservers and return raw response.
-    async fn forward_raw_dns(&self, query_bytes: &[u8]) -> Result<Vec<u8>> {
+    async fn forward_raw_dns(
+        &self,
+        query_bytes: &[u8],
+        expected_id: u16,
+        expected_query: Option<&Query>,
+    ) -> Result<Vec<u8>> {
         for ns in &self.nameservers {
-            match Self::query_nameserver_udp_raw(*ns, query_bytes).await {
+            match Self::query_nameserver_udp_raw(*ns, query_bytes, expected_id, expected_query)
+                .await
+            {
                 Ok(response_bytes) => return Ok(response_bytes),
                 Err(_) => continue,
             }
@@ -829,10 +837,14 @@ impl DnsServer {
     ) -> Result<Message> {
         let query_bytes = request.to_vec()
             .context("Failed to serialize DNS query for UDP forward")?;
+        let expected_id = request.metadata.id;
+        let expected_query = request.queries.first();
 
         // Try each nameserver in order
         for ns in &self.nameservers {
-            match Self::query_nameserver_udp_raw(*ns, &query_bytes).await {
+            match Self::query_nameserver_udp_raw(*ns, &query_bytes, expected_id, expected_query)
+                .await
+            {
                 Ok(response_bytes) => {
                     match Message::from_vec(&response_bytes) {
                         Ok(response) => {
@@ -856,9 +868,19 @@ impl DnsServer {
 
     /// Send a raw DNS query to a nameserver and return the raw response.
     /// Retries up to 2 times on timeout to handle brief packet loss on congested networks.
+    ///
+    /// The socket is connected() to the nameserver, so the kernel only delivers
+    /// datagrams from that address, and a reply is accepted only if it parses as
+    /// a DNS message whose transaction ID equals `expected_id` and whose first
+    /// question matches `expected_query` (name — case-insensitive, per hickory's
+    /// `Name` equality — and query type). Datagrams that fail these checks, e.g.
+    /// a racing off-path spoof, are dropped and the wait continues within the
+    /// same per-attempt timeout.
     async fn query_nameserver_udp_raw(
         nameserver: SocketAddr,
         query: &[u8],
+        expected_id: u16,
+        expected_query: Option<&Query>,
     ) -> Result<Vec<u8>> {
         const MAX_RETRIES: usize = 2;
         const TIMEOUT_SECS: u64 = 3;
@@ -873,17 +895,56 @@ impl DnsServer {
             let socket = UdpSocket::bind("0.0.0.0:0").await
                 .context("Failed to bind UDP socket for DNS forward")?;
 
-            if let Err(e) = socket.send_to(query, nameserver).await {
+            if let Err(e) = socket.connect(nameserver).await {
+                last_error = Some(format!("connect failed: {}", e));
+                continue;
+            }
+
+            if let Err(e) = socket.send(query).await {
                 last_error = Some(format!("send failed: {}", e));
                 continue;
             }
 
             let mut buf = [0u8; 4096];
-            match tokio::time::timeout(
+            let recv = tokio::time::timeout(
                 std::time::Duration::from_secs(TIMEOUT_SECS),
-                socket.recv_from(&mut buf)
-            ).await {
-                Ok(Ok((len, _))) => return Ok(buf[..len].to_vec()),
+                async {
+                    loop {
+                        let len = socket.recv(&mut buf).await?;
+                        let datagram = &buf[..len];
+                        match Message::from_vec(datagram) {
+                            Ok(response) => {
+                                if response.metadata.id != expected_id {
+                                    debug!(
+                                        "Dropping DNS reply from {} with mismatched TXID {:#06x} (expected {:#06x})",
+                                        nameserver, response.metadata.id, expected_id
+                                    );
+                                    continue;
+                                }
+                                if let Some(expected) = expected_query {
+                                    let question_matches = response.queries.first()
+                                        .map(|q| q.name() == expected.name() && q.query_type() == expected.query_type())
+                                        .unwrap_or(false);
+                                    if !question_matches {
+                                        debug!(
+                                            "Dropping DNS reply from {} with mismatched question",
+                                            nameserver
+                                        );
+                                        continue;
+                                    }
+                                }
+                                return Ok::<Vec<u8>, std::io::Error>(datagram.to_vec());
+                            }
+                            Err(e) => {
+                                debug!("Dropping unparseable DNS datagram from {}: {}", nameserver, e);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            ).await;
+            match recv {
+                Ok(Ok(bytes)) => return Ok(bytes),
                 Ok(Err(e)) => last_error = Some(format!("recv error: {}", e)),
                 Err(_) => last_error = Some(format!("timeout ({}s)", TIMEOUT_SECS)),
             }
@@ -1271,5 +1332,191 @@ mod tests {
         );
         assert_eq!(route_map.lock().unwrap().lookup(&v6), None);
         assert_eq!(prewarm_calls.lock().unwrap().as_slice(), &["sg".to_string()]);
+    }
+
+    /// Fake nameserver for the spoof test: on each query it sends, in order,
+    /// (1) a poisoned reply from a DIFFERENT socket (different source port —
+    /// with a connected socket the kernel never delivers it), (2) a reply with
+    /// the wrong TXID from the nameserver address, (3) a reply with the wrong
+    /// question from the nameserver address, and finally (4) the genuine
+    /// reply. Sends are spaced so the datagrams arrive in order.
+    async fn spawn_spoofing_nameserver(
+        genuine_ip: std::net::Ipv4Addr,
+        poison_ip: std::net::Ipv4Addr,
+        wrong_question: Name,
+    ) -> std::net::SocketAddr {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let Ok(request) = Message::from_vec(&buf[..n]) else {
+                    continue;
+                };
+                let id = request.metadata.id;
+                let Some(query) = request.queries.first().cloned() else {
+                    continue;
+                };
+
+                let make_reply = |txid: u16, q: &Query, ip: std::net::Ipv4Addr| {
+                    let mut reply = Message::new(txid, MessageType::Response, OpCode::Query);
+                    reply.metadata.recursion_available = true;
+                    reply.add_query(q.clone());
+                    reply.add_answer(Record::from_rdata(
+                        q.name().clone(),
+                        60,
+                        RData::A(rdata::A(ip)),
+                    ));
+                    reply.to_vec().unwrap()
+                };
+
+                // (1) Poisoned reply from a different source port.
+                let spoofer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let _ = spoofer
+                    .send_to(&make_reply(id, &query, poison_ip), peer)
+                    .await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // (2) Wrong TXID from the real nameserver address.
+                let _ = sock
+                    .send_to(&make_reply(id.wrapping_add(1), &query, poison_ip), peer)
+                    .await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+
+                // (3) Wrong question from the real nameserver address.
+                let wrong_query = Query::query(wrong_question.clone(), RecordType::A);
+                let _ = sock
+                    .send_to(&make_reply(id, &wrong_query, poison_ip), peer)
+                    .await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+
+                // (4) Genuine reply.
+                let _ = sock
+                    .send_to(&make_reply(id, &query, genuine_ip), peer)
+                    .await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_udp_forward_rejects_spoofed_replies() {
+        let genuine_ip: std::net::Ipv4Addr = "203.0.113.10".parse().unwrap();
+        let poison_ip: std::net::Ipv4Addr = "203.0.113.99".parse().unwrap();
+        let wrong_question = Name::from_ascii("other.example.com.").unwrap();
+        let ns = spawn_spoofing_nameserver(genuine_ip, poison_ip, wrong_question).await;
+
+        // Build the query, then re-parse the serialized bytes so the expected
+        // question has the wire (FQDN) form — exactly as in production, where
+        // the request is parsed from received bytes.
+        let name = Name::from_ascii("www.example.com.").unwrap();
+        let mut request = Message::new(0x4242, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(name, RecordType::A));
+        let query_bytes = request.to_vec().unwrap();
+        let parsed = Message::from_vec(&query_bytes).unwrap();
+        let expected_query = parsed.queries[0].clone();
+
+        let response_bytes =
+            DnsServer::query_nameserver_udp_raw(ns, &query_bytes, 0x4242, Some(&expected_query))
+                .await
+                .unwrap();
+        let response = Message::from_vec(&response_bytes).unwrap();
+
+        // The wrong-source-port, wrong-TXID, and wrong-question replies must
+        // all be rejected; only the genuine answer is accepted.
+        assert_eq!(response.metadata.id, 0x4242);
+        assert_eq!(response.answers.len(), 1);
+        match &response.answers[0].data {
+            RData::A(a) => assert_eq!(a.0, genuine_ip, "accepted a spoofed reply"),
+            other => panic!("expected A record, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_blocked_domain_returns_nxdomain() {
+        use rvpn_split_tunnel::SplitTunnelConfig;
+
+        // Custom ad-block list with one domain, so decide_by_host returns
+        // Block for it (block_ads must be on for the list to apply).
+        let block_file =
+            std::env::temp_dir().join(format!("rvpn-dns-test-block-{}.txt", std::process::id()));
+        std::fs::write(&block_file, "ads.example.com\n").unwrap();
+
+        let config = SplitTunnelConfig {
+            enabled: true,
+            block_ads: true,
+            ad_block_file: Some(block_file.clone()),
+            ..Default::default()
+        };
+        let split_tunnel = SplitTunnel::new(
+            config,
+            Arc::new(rvpn_split_tunnel::DnsResolver::new(
+                true,
+                14400,
+                1000,
+                false,
+                true,
+                vec![],
+            )),
+        )
+        .await
+        .unwrap();
+        let server = DnsServer::new(split_tunnel);
+
+        let mut request = Message::new(0x7777, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_ascii("ads.example.com").unwrap(),
+            RecordType::A,
+        ));
+        let response_bytes = server
+            .resolve_raw(&request.to_vec().unwrap())
+            .await
+            .unwrap();
+        let response = Message::from_vec(&response_bytes).unwrap();
+
+        assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(response.metadata.id, 0x7777);
+
+        let _ = std::fs::remove_file(&block_file);
+    }
+
+    #[tokio::test]
+    async fn test_doh_failure_returns_servfail() {
+        use rvpn_core::crypto::{IdentityKey, X3DHResponder};
+
+        // A DoH client whose connection task was never started: resolve()
+        // fails immediately ("DNS client not started"), exercising the
+        // DoH-failure → ServFail arm of the tunnel path.
+        let server_bundle = X3DHResponder::new().get_public_bundle();
+        let security =
+            crate::server_hello::ServerSecurity::new(None, false, &server_bundle).unwrap();
+        let flow_config = crate::flow_connector::FlowConnectorConfig {
+            server_host: "127.0.0.1".to_string(),
+            server_port: 1,
+            server_path: "/dns".to_string(),
+            tls_fingerprint: rvpn_tls::TlsFingerprint::Chrome,
+            identity_key: Arc::new(IdentityKey::generate()),
+            server_bundle,
+            security,
+            #[cfg(any(feature = "ios-direct-tun", feature = "macos-direct-tun"))]
+            resumption: None,
+        };
+        let doh_client = Arc::new(DohClient::new(flow_config, "/dns".to_string()));
+
+        let server = DnsServer::with_doh(
+            test_split_tunnel().await,
+            doh_client,
+            "127.0.0.1:0".to_string(),
+        );
+
+        let name = Name::from_ascii("www.google.com").unwrap();
+        let mut request = Message::new(0x4321, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(name.clone(), RecordType::A));
+
+        let response = server
+            .resolve_remote(&request, &name, RecordType::A, None)
+            .await;
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(response.metadata.id, 0x4321);
     }
 }
