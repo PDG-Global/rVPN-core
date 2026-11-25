@@ -40,8 +40,8 @@ futures-util = "0.3"
 
 # WebSocket
 # WebSocket (iOS uses BoringSSL for TLS, not rustls)
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
-tungstenite = "0.21"
+tokio-tungstenite = { workspace = true }
+tungstenite = "0.23"
 
 # TLS - rustls only needed for Android (iOS uses BoringSSL)
 rustls = { workspace = true, optional = true }

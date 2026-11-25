@@ -452,9 +452,15 @@ impl DohClient {
         let (ws_stream, _) = {
             let mut root_store = rustls::RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let tls_config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
+            // Explicit ring provider: rustls 0.23's builder() panics when the
+            // graph also enables aws-lc-rs (tokio-tungstenite's rustls feature).
+            let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("default protocol versions")
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
             let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
 
             let tcp_stream = timeout(

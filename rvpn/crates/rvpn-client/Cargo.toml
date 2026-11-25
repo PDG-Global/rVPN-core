@@ -80,7 +80,6 @@ base64.workspace = true
 hex.workspace = true
 sha1.workspace = true
 rand.workspace = true
-url.workspace = true
 futures-util.workspace = true
 lazy_static.workspace = true
 parking_lot.workspace = true
@@ -108,7 +107,7 @@ tokio-boring.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 rcgen = "0.13"
-tokio-tungstenite = { version = "0.21", features = [] }
+tokio-tungstenite = { workspace = true }
 # test-util: paused-clock tests for the tunnel-pool drain backstop
 tokio = { workspace = true, features = ["test-util"] }
 # Test-only: also enable rvpn-tls's rustls backend so tests can observe the

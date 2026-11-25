@@ -3,14 +3,17 @@
 # new advisories turn CI red immediately. Review by 2026-12-17.
 #
 # Groups (triage per the 2026-11-17 audit of v1.3.7, #rVPN thread 386ce86d):
-# A. rustls 0.22.4 — the 0.22 line receives no fixes; resolved by the
-#    rustls 0.22 → 0.23 workspace migration (next sprint; also unblocks
-#    rustls-acme ≥0.15.4 and retires the tolerant-challenge fork).
+# A. rustls 0.22.4 — RESOLVED by the 0.22 → 0.23 workspace migration
+#    (rustls 0.23.46 only; the fork-pinned rustls-acme is retired for
+#    rustls-acme 0.15.4). The two advisory lines are deleted in the same
+#    commit, so a future 0.23 regression on these IDs turns red.
 # B. rustls 0.23.37 / webpki 0.103.9 / webpki-roots — semver-compatible
 #    bumps; the lockfile-bump PR removes these entries and the audit job
 #    is what proves they are gone.
-# C. rustls-webpki 0.102.8 — rides with rustls 0.22; resolved by the same
-#    migration as group A.
+# C. rustls-webpki 0.102.8 — did NOT ride with rustls 0.22 as triaged: it
+#    is still in the graph via rustls-platform-verifier 0.3.4 (Android path
+#    only). Resolution is the rustls-platform-verifier 0.4+ bump (API
+#    change, rvpn-mobile only), its own PR.
 # D. hickory-proto 0.24.4 (on-device DNS proxy in rvpn-mobile) — needs the
 #    0.26 major bump; scheduled after the migration. The amplification /
 #    O(n²) / panic entries are the reachable ones for a DNS proxy; the
@@ -18,14 +21,8 @@
 
 [advisories]
 ignore = [
-    # A. rustls 0.22.4 (EOL line — migration, review 2026-12-17)
-    "RUSTSEC-2026-0346", # Debug impls expose TLS session secrets
-    "RUSTSEC-2026-0349", # unauthenticated ServerHello downgrade
-    # NOTE: ignores apply to an advisory ID, not a version — the two
-    # entries above also cover the 0.23 line. The rustls 0.23 migration
-    # PR must delete both lines in the same commit that removes the 0.22
-    # dependency, so a future 0.23 regression on these IDs turns red.
-    # C. rustls-webpki 0.102.8 (migration, review 2026-12-17)
+    # C. rustls-webpki 0.102.8 (via rustls-platform-verifier 0.3.4 on
+    # Android, not rustls 0.22 — review 2026-12-17)
     "RUSTSEC-2026-0104", # CRL parsing panic
     "RUSTSEC-2026-0098", # URI name constraints
     "RUSTSEC-2026-0099", # name constraints

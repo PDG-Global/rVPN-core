@@ -281,9 +281,15 @@ impl AndroidServerSession {
     fn tls_client_config(&self) -> Arc<rustls::ClientConfig> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let mut config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        // Explicit ring provider: rustls 0.23's builder() panics when the
+        // graph also enables aws-lc-rs (tokio-tungstenite's rustls feature).
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
         config.resumption =
             rustls::client::Resumption::store(self.resumption.rustls_session_store());
         Arc::new(config)
