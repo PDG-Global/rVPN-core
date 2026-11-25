@@ -21,14 +21,18 @@ tokio = { version = "1.35", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "net"] }
 
 # WebSocket
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
-tungstenite = "0.21"
+tokio-tungstenite = { version = "0.23", default-features = false, features = ["connect"] }
+tungstenite = "0.23"
 
 # TLS
-rustls = { version = "0.22", default-features = false, features = ["tls12", "ring"] }
-tokio-rustls = "0.25"
+rustls = { version = "0.23", default-features = false, features = ["tls12", "ring"] }
+# default-features off: tokio-rustls's default set enables aws-lc-rs, which made
+# the provider ambiguous with ring — rustls 0.22 silently picked aws-lc-rs,
+# 0.23 panics. All ClientConfig/ServerConfig builders name ring explicitly.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 rustls-pemfile = "2.0"
 rustls-platform-verifier = "0.3"
+webpki-roots = "0.26"
 boring = "5"
 tokio-boring = "5"
 
@@ -109,7 +113,6 @@ data-encoding = "2"
 hex = "0.4"
 rand = "0.8"
 regex = "1.10"
-url = "2.5"
 lazy_static = "1.4"
 parking_lot = "0.12"
 
@@ -133,16 +136,6 @@ debug = true
 # the whole order on rustls-acme 0.9's closed ChallengeType enum, and
 # dns-persist-01 also omits the `token` field. Upstream fixed both
 # (7fa79bac "Ignore unknown challenge types", released in 0.14.1; 67b5e9d0
-# / PR #93 "Fix Challenge deserialization for token-less challenge types"),
-# but every fixed release sits on rustls 0.23 while this workspace is on
-# rustls 0.22 (tokio-rustls 0.25). This pin carries a straight backport of
-# those two one-line fixes plus regression tests, on the 0.9 line.
-#
-# Drop condition (2026-11-17, Thomas's dependency audit): this pin holds
-# the workspace on rustls 0.22, a line that receives NO TLS fixes — the
-# open rustls advisories are fixed only in >= 0.23.46. The fork is a
-# stopgap by schedule, not convention: the rustls 0.23 migration (next
-# sprint, tracked as a security item) takes rustls-acme >= 0.15.4 and
-# retires this fork. Remove this pin in that migration.
-[patch.crates-io]
-rustls-acme = { git = "https://github.com/PDG-Global/rustls-acme", rev = "8c93b2e6ba4b71048cd6777e589758bea715c5b1" }
+# / PR #93 "Fix Challenge deserialization for token-less challenge types").
+# The rustls 0.23 consolidation (this PR) takes rustls-acme >= 0.15.4,
+# which carries both fixes, and the fork pin is retired.

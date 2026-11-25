@@ -534,11 +534,27 @@ async fn build_acme_acceptor(acme: &rvpn_server::config::AcmeConfig) -> Result<R
         );
     }
 
-    let mut state = RustlsAcmeConfig::new(acme.domains.clone())
-        .contact(acme.contacts.iter().cloned())
-        .cache(DirCache::new(acme.cache_dir.clone()))
-        .directory_lets_encrypt(!acme.staging)
-        .state();
+    // rustls-acme 0.15 needs an explicit client config for its ACME API
+    // calls (0.9 built one internally). Build it from the crate's own
+    // rustls re-export so the types always match its futures-rustls.
+    let acme_client_config = Arc::new(
+        rustls_acme::rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls_acme::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_root_certificates(rustls_acme::rustls::RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+        ))
+        .with_no_client_auth(),
+    );
+
+    let mut state =
+        RustlsAcmeConfig::new_with_client_config(acme.domains.clone(), acme_client_config)
+            .contact(acme.contacts.iter().cloned())
+            .cache(DirCache::new(acme.cache_dir.clone()))
+            .directory_lets_encrypt(!acme.staging)
+            .state();
 
     // rustls-acme needs TWO ServerConfigs:
     // - `challenge_rustls_config` advertises `acme-tls/1` in ALPN and is
@@ -664,11 +680,16 @@ fn load_tls_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<rustls::Se
         .context("Failed to parse private key")?
         .ok_or_else(|| anyhow::anyhow!("No private key found in {:?}", key_path))?;
 
-    // Build TLS config
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("Failed to create TLS config")?;
+    // Build TLS config — explicit ring provider: with tokio-rustls's aws-lc-rs
+    // feature also in the graph, rustls 0.23's builder() panics on the ambiguity.
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("rustls ServerConfig protocol versions")?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .context("Failed to create TLS config")?;
 
     Ok(config)
 }
