@@ -10,10 +10,12 @@
 # B. rustls 0.23.37 / webpki 0.103.9 / webpki-roots — semver-compatible
 #    bumps; the lockfile-bump PR removes these entries and the audit job
 #    is what proves they are gone.
-# C. rustls-webpki 0.102.8 — did NOT ride with rustls 0.22 as triaged: it
-#    is still in the graph via rustls-platform-verifier 0.3.4 (Android path
-#    only). Resolution is the rustls-platform-verifier 0.4+ bump (API
-#    change, rvpn-mobile only), its own PR.
+# C. rustls-webpki 0.102.8 — RESOLVED by removing rustls-platform-verifier
+#    from rvpn-mobile (unused optional dep; the Android TLS path bundles
+#    webpki-roots instead). The verifier was what pulled 0.102.8 into the
+#    graph, so the duplicated line left the lock entirely. The five
+#    advisory lines are deleted in the same commit, so a future 0.103
+#    regression on these IDs turns red.
 # D. hickory-proto 0.24.4 (on-device DNS proxy in rvpn-mobile) — needs the
 #    0.26 major bump; scheduled after the migration. The amplification /
 #    O(n²) / panic entries are the reachable ones for a DNS proxy; the
@@ -21,13 +23,6 @@
 
 [advisories]
 ignore = [
-    # C. rustls-webpki 0.102.8 (via rustls-platform-verifier 0.3.4 on
-    # Android, not rustls 0.22 — review 2026-12-17)
-    "RUSTSEC-2026-0104", # CRL parsing panic
-    "RUSTSEC-2026-0098", # URI name constraints
-    "RUSTSEC-2026-0099", # name constraints
-    "RUSTSEC-2026-0049", # CRL distribution-point authority
-    "RUSTSEC-2026-0382", # distrusted intermediates accepted
     # D. hickory-proto 0.24.4 (0.26 bump after the migration, review 2026-12-17)
     "RUSTSEC-2026-0119", # O(n²) CPU on name compression
     "RUSTSEC-2026-0487", # panic on malformed alpn in SVCB/HTTPS
