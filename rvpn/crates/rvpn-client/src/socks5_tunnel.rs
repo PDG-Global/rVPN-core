@@ -1337,4 +1337,68 @@ use rvpn_core::crypto::RatchetVersion;
         }
         assert!(rx.try_recv().is_err(), "only one frame must be sent");
     }
+
+    /// Caller-level pin for A19: when `verify_server_identity` refuses a TOFU
+    /// capture (`VerificationResult::New` with `should_proceed == false` —
+    /// here `reject_new_identity = true`), the handshake must fail and the
+    /// tunnel must never come up. Drives the real `perform_handshake` over
+    /// in-memory channels standing in for the WebSocket; the mock "server"
+    /// is an in-process `X3DHResponder` whose identity is unknown to the
+    /// client's known_hosts.
+    #[tokio::test]
+    async fn refused_tofu_capture_fails_handshake() {
+        use rvpn_core::crypto::X3DHResponder;
+
+        let responder = X3DHResponder::new();
+        let server_bundle = responder.get_public_bundle();
+        let server_hello = HandshakeMessage::ServerHello {
+            ephemeral_key: vec![0u8; 32],
+            signed_prekey: server_bundle.signed_prekey.to_vec(),
+            prekey_signature: server_bundle.prekey_signature.to_vec(),
+            identity_key: server_bundle.identity_key.to_vec(),
+            identity_x25519_key: None,
+            identity_x25519_signature: None,
+            capabilities: Some(server_bundle.capabilities),
+        };
+
+        let (reader_tx, mut ws_reader) = mpsc::channel::<Message>(4);
+        let (writer_tx, _writer_rx) = mpsc::channel::<Message>(4);
+        let ws_writer = WebSocketWriter::from_sender(writer_tx);
+        reader_tx
+            .send(Message::Binary(serde_json::to_vec(&server_hello).unwrap()))
+            .await
+            .unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = ServerIdentityConfig {
+            known_hosts_file: dir.path().join("known_hosts.json"),
+            reject_new_identity: true,
+            ..Default::default()
+        };
+        let identity_key = Arc::new(IdentityKey::generate());
+
+        let result = Socks5Tunnel::perform_handshake(
+            &mut ws_reader,
+            &ws_writer,
+            &identity_key,
+            &server_bundle,
+            "127.0.0.1",
+            443,
+            Some(&config),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("refused TOFU capture must fail the handshake"),
+        };
+        assert!(
+            err.to_string().contains("unknown server identity rejected"),
+            "expected the refusal error, got: {err:#}"
+        );
+
+        // The refused capture must not have been pinned either.
+        let hosts = KnownHosts::load(&config.known_hosts_file).unwrap();
+        assert!(hosts.get_fingerprint("127.0.0.1:443").is_none());
+    }
 }
