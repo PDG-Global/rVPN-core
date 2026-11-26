@@ -24,7 +24,9 @@ use rvpn_core::protocol::multiplex::{CreditWait, FlowSendCredits, FLOW_CREDIT_ST
 use rvpn_core::protocol::{ControlMessage, HandshakeMessage, MultiplexedFrame, PayloadType};
 
 use crate::config::ServerIdentityConfig;
-use crate::identity_verification::{verify_server_identity, KnownHosts};
+use crate::identity_verification::{
+    mismatch_is_fatal, persist_known_hosts, verify_server_identity, KnownHosts, VerificationResult,
+};
 use crate::websocket::{
     connect_websocket, split_websocket, Message, WebSocketReader, WebSocketTaskHandle,
     WebSocketWriter,
@@ -443,22 +445,47 @@ impl Socks5Tunnel {
                 // known_hosts file so a TOFU capture on first connect
                 // and a legacy-to-canonical pin migration on subsequent
                 // connects both persist without a caller-side rewrite.
+                // A corrupt or unreadable known_hosts file FAILS the
+                // connection here (A19): treating it as pin-less would
+                // TOFU-capture whatever answered and overwrite every
+                // stored pin on the save below.
                 if let Some(cfg) = server_identity_config {
                     let addr = format!("{}:{}", host, port);
-                    let mut known = KnownHosts::load(&cfg.known_hosts_file).unwrap_or_default();
-                    let (_res, ok) = verify_server_identity(
+                    let mut known = KnownHosts::load(&cfg.known_hosts_file)?;
+                    let (res, ok) = verify_server_identity(
                         &addr,
                         &bundle,
                         &mut known,
                         cfg.fingerprint.as_deref(),
                         cfg.trust_on_first_use,
-                        cfg.strict_mode,
+                        cfg.reject_new_identity,
                     );
-                    if let Err(e) = known.save(&cfg.known_hosts_file) {
-                        tracing::warn!("Failed to persist known_hosts.json: {}", e);
-                    }
-                    if !ok && cfg.strict_mode {
-                        anyhow::bail!("Server identity verification failed");
+                    // Persist TOFU captures and pin migrations. A failed save
+                    // after a fresh capture is fatal — otherwise the next
+                    // session re-captures blindly.
+                    persist_known_hosts(&known, &cfg.known_hosts_file, &res, ok)?;
+                    match &res {
+                        VerificationResult::Verified => {}
+                        VerificationResult::New => {
+                            if !ok {
+                                // verify_server_identity refused the capture:
+                                // reject_new_identity is set, or
+                                // trust_on_first_use is disabled.
+                                anyhow::bail!(
+                                    "Server identity verification failed: unknown server identity rejected"
+                                );
+                            }
+                        }
+                        VerificationResult::Mismatch { expected, got, .. } => {
+                            if mismatch_is_fatal(&res, cfg.reject_mismatch) {
+                                anyhow::bail!(
+                                    "Server identity mismatch! Expected {}, got {}. Connection rejected.",
+                                    expected, got
+                                );
+                            } else {
+                                tracing::warn!("Server identity mismatch — continuing because reject_mismatch = false: identity pinning is OFF for this connection (explicit dev opt-in, not safe for production)");
+                            }
+                        }
                     }
                 }
 
@@ -1309,5 +1336,69 @@ use rvpn_core::crypto::RatchetVersion;
             other => panic!("expected CloseFlow, got {:?}", other),
         }
         assert!(rx.try_recv().is_err(), "only one frame must be sent");
+    }
+
+    /// Caller-level pin for A19: when `verify_server_identity` refuses a TOFU
+    /// capture (`VerificationResult::New` with `should_proceed == false` —
+    /// here `reject_new_identity = true`), the handshake must fail and the
+    /// tunnel must never come up. Drives the real `perform_handshake` over
+    /// in-memory channels standing in for the WebSocket; the mock "server"
+    /// is an in-process `X3DHResponder` whose identity is unknown to the
+    /// client's known_hosts.
+    #[tokio::test]
+    async fn refused_tofu_capture_fails_handshake() {
+        use rvpn_core::crypto::X3DHResponder;
+
+        let responder = X3DHResponder::new();
+        let server_bundle = responder.get_public_bundle();
+        let server_hello = HandshakeMessage::ServerHello {
+            ephemeral_key: vec![0u8; 32],
+            signed_prekey: server_bundle.signed_prekey.to_vec(),
+            prekey_signature: server_bundle.prekey_signature.to_vec(),
+            identity_key: server_bundle.identity_key.to_vec(),
+            identity_x25519_key: None,
+            identity_x25519_signature: None,
+            capabilities: Some(server_bundle.capabilities),
+        };
+
+        let (reader_tx, mut ws_reader) = mpsc::channel::<Message>(4);
+        let (writer_tx, _writer_rx) = mpsc::channel::<Message>(4);
+        let ws_writer = WebSocketWriter::from_sender(writer_tx);
+        reader_tx
+            .send(Message::Binary(serde_json::to_vec(&server_hello).unwrap()))
+            .await
+            .unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = ServerIdentityConfig {
+            known_hosts_file: dir.path().join("known_hosts.json"),
+            reject_new_identity: true,
+            ..Default::default()
+        };
+        let identity_key = Arc::new(IdentityKey::generate());
+
+        let result = Socks5Tunnel::perform_handshake(
+            &mut ws_reader,
+            &ws_writer,
+            &identity_key,
+            &server_bundle,
+            "127.0.0.1",
+            443,
+            Some(&config),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("refused TOFU capture must fail the handshake"),
+        };
+        assert!(
+            err.to_string().contains("unknown server identity rejected"),
+            "expected the refusal error, got: {err:#}"
+        );
+
+        // The refused capture must not have been pinned either.
+        let hosts = KnownHosts::load(&config.known_hosts_file).unwrap();
+        assert!(hosts.get_fingerprint("127.0.0.1:443").is_none());
     }
 }

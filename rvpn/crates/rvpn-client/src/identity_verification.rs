@@ -112,21 +112,37 @@ pub enum VerificationResult {
         expected: String,
         /// The pin derived from this connection (canonical form).
         got: String,
+        /// True when `expected` came from the client's config file rather
+        /// than the known_hosts store. A config pin is the operator's
+        /// explicit choice and is ALWAYS enforced: `reject_mismatch = false`
+        /// only relaxes mismatches against known_hosts-stored pins — see
+        /// [`mismatch_is_fatal`].
+        against_config_pin: bool,
     },
 }
 
 impl KnownHosts {
-    /// Load known hosts from file
+    /// Load known hosts from file.
+    ///
+    /// A missing file is an empty store (first run). A file that EXISTS
+    /// but cannot be read or parsed is an ERROR, not an empty store:
+    /// callers that proceeded anyway would TOFU-capture whatever answers
+    /// and overwrite every stored pin on the next save — an identity-swap
+    /// window that also destroys the pins. The distinction is made on the
+    /// read error kind, not a prior `exists()` probe, so a permission
+    /// error is never mistaken for "no file".
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        if !path.as_ref().exists() {
-            return Ok(Self::default());
-        }
-
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read known hosts file: {:?}", path.as_ref()))?;
+        let path = path.as_ref();
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => {
+                return Err(e).context(format!("Failed to read known hosts file: {:?}", path))
+            }
+        };
 
         let hosts: KnownHosts = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse known hosts file: {:?}", path.as_ref()))?;
+            .with_context(|| format!("Failed to parse known hosts file: {:?}", path))?;
 
         Ok(hosts)
     }
@@ -239,13 +255,16 @@ pub fn verify_server_identity(
     known_hosts: &mut KnownHosts,
     config_fingerprint: Option<&str>,
     trust_on_first_use: bool,
-    strict_mode: bool,
+    reject_new_identity: bool,
 ) -> (VerificationResult, bool) {
     let canonical_actual = compute_fingerprint(bundle);
 
     // 1. Config-supplied pin wins over everything else. If the operator
     //    pasted a fingerprint into their client config, they want that
-    //    exact server no matter what known_hosts says.
+    //    exact server no matter what known_hosts says — and a mismatch
+    //    against it is ALWAYS fatal (against_config_pin = true): the
+    //    reject_mismatch dev opt-in only relaxes known_hosts-stored pins
+    //    (see mismatch_is_fatal).
     if let Some(expected) = config_fingerprint {
         let matched = match pins_match(expected, &bundle.identity_key) {
             Ok(v) => v,
@@ -255,6 +274,7 @@ pub fn verify_server_identity(
                     VerificationResult::Mismatch {
                         expected: expected.to_string(),
                         got: canonical_actual,
+                        against_config_pin: true,
                     },
                     false,
                 );
@@ -269,6 +289,7 @@ pub fn verify_server_identity(
                 VerificationResult::Mismatch {
                     expected: canonicalise_for_display(expected),
                     got: canonical_actual,
+                    against_config_pin: true,
                 },
                 false,
             );
@@ -315,6 +336,7 @@ pub fn verify_server_identity(
                 VerificationResult::Mismatch {
                     expected: canonicalise_for_display(&stored),
                     got: canonical_actual,
+                    against_config_pin: false,
                 },
                 false,
             );
@@ -339,9 +361,9 @@ pub fn verify_server_identity(
 
     // 3. New server → TOFU capture.
     if trust_on_first_use {
-        if strict_mode {
+        if reject_new_identity {
             warn!(
-                "New server identity detected for {} (strict mode enabled, rejecting)",
+                "New server identity detected for {} (reject_new_identity enabled, rejecting)",
                 server_address
             );
             return (VerificationResult::New, false);
@@ -364,6 +386,50 @@ pub fn verify_server_identity(
     error!("  Add the fingerprint to your config or enable trust_on_first_use.");
 
     (VerificationResult::New, false)
+}
+
+/// Persist `known_hosts` after a verification, failing hard when a fresh
+/// TOFU pin can't be saved.
+///
+/// A TOFU capture (`VerificationResult::New` with `should_proceed`) that
+/// never reaches disk means the next session re-captures blindly — a fresh
+/// identity-swap window — so a save failure there must fail the connection.
+/// For `Verified` and `Mismatch` no new pin was at stake; a save failure
+/// stays warn-only.
+pub fn persist_known_hosts<P: AsRef<Path>>(
+    known_hosts: &KnownHosts,
+    path: P,
+    result: &VerificationResult,
+    should_proceed: bool,
+) -> Result<()> {
+    match known_hosts.save(path) {
+        Ok(()) => Ok(()),
+        Err(e) if matches!(result, VerificationResult::New) && should_proceed => {
+            Err(e.context("Failed to persist new server identity pin"))
+        }
+        Err(e) => {
+            warn!("Failed to persist known_hosts.json: {}", e);
+            Ok(())
+        }
+    }
+}
+
+/// Whether a [`VerificationResult::Mismatch`] must reject the connection.
+///
+/// A mismatch against a config-pinned fingerprint is ALWAYS fatal — the
+/// operator pinned that exact identity, so the `reject_mismatch = false`
+/// dev opt-in must not relax it. The opt-in only relaxes mismatches
+/// against known_hosts-stored pins. Centralized here so every caller of
+/// [`verify_server_identity`] inherits the rule; call this instead of
+/// reading `reject_mismatch` directly at the mismatch site.
+pub fn mismatch_is_fatal(result: &VerificationResult, reject_mismatch: bool) -> bool {
+    matches!(
+        result,
+        VerificationResult::Mismatch {
+            against_config_pin: true,
+            ..
+        }
+    ) || reject_mismatch
 }
 
 /// Format a pin for display.
@@ -612,9 +678,11 @@ mod tests {
             VerificationResult::Mismatch {
                 expected: e,
                 got: g,
+                against_config_pin,
             } => {
                 assert!(e.starts_with("ik:1:"));
                 assert!(g.starts_with("ik:1:"));
+                assert!(against_config_pin, "mismatch is against the config pin");
             }
             other => panic!("unexpected result: {other:?}"),
         }
@@ -680,9 +748,14 @@ mod tests {
             verify_server_identity("host.example", &bundle, &mut hosts, None, true, false);
         assert!(!ok);
         match result {
-            VerificationResult::Mismatch { expected, got } => {
+            VerificationResult::Mismatch {
+                expected,
+                got,
+                against_config_pin,
+            } => {
                 assert_eq!(expected, stored_pin);
                 assert_eq!(got, compute_fingerprint(&bundle));
+                assert!(!against_config_pin, "mismatch is against a known_hosts pin");
             }
             other => panic!("unexpected result: {other:?}"),
         }
@@ -701,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_rejects_new_server_without_saving() {
+    fn reject_new_identity_rejects_new_server_without_saving() {
         let bundle = make_bundle(0xEF);
         let mut hosts = KnownHosts::default();
 
@@ -710,5 +783,153 @@ mod tests {
         assert_eq!(result, VerificationResult::New);
         assert!(!ok);
         assert!(hosts.get_fingerprint("strict.example").is_none());
+    }
+
+    #[test]
+    fn tofu_capture_with_failed_save_is_fatal() {
+        // A TOFU capture whose pin can't be persisted reopens the
+        // identity-swap window on the next session — the connection must
+        // fail, not warn-and-continue.
+        let bundle = make_bundle(0xF0);
+        let mut hosts = KnownHosts::default();
+
+        let (result, ok) =
+            verify_server_identity("new.example", &bundle, &mut hosts, None, true, false);
+        assert_eq!(result, VerificationResult::New);
+        assert!(ok, "capture happened");
+        assert!(hosts.get_fingerprint("new.example").is_some());
+
+        // A path inside a nonexistent directory makes save() fail (ENOENT).
+        let bad_path = Path::new("/nonexistent-rvpn-test-dir")
+            .join(format!("{}/known_hosts.json", std::process::id()));
+        let err = persist_known_hosts(&hosts, &bad_path, &result, ok)
+            .expect_err("save failure after a TOFU capture must be fatal");
+        assert!(
+            err.to_string()
+                .contains("Failed to persist new server identity pin"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn save_failure_is_warn_only_when_no_new_pin_at_stake() {
+        let bundle = make_bundle(0xF1);
+        let mut hosts = KnownHosts::default();
+        hosts.add_server("known.example".to_string(), compute_fingerprint(&bundle));
+
+        let (result, ok) =
+            verify_server_identity("known.example", &bundle, &mut hosts, None, true, false);
+        assert_eq!(result, VerificationResult::Verified);
+        assert!(ok);
+
+        let bad_path = Path::new("/nonexistent-rvpn-test-dir")
+            .join(format!("{}/known_hosts.json", std::process::id()));
+        persist_known_hosts(&hosts, &bad_path, &result, ok)
+            .expect("Verified result: save failure stays warn-only");
+
+        // A rejected TOFU capture (reject_new_identity) never reaches the
+        // persist call in a caller that honors should_proceed, but even if
+        // it did, no new pin was at stake.
+        let (result, ok) =
+            verify_server_identity("strict.example", &bundle, &mut hosts, None, true, true);
+        assert_eq!(result, VerificationResult::New);
+        assert!(!ok);
+        persist_known_hosts(&hosts, &bad_path, &result, ok)
+            .expect("rejected capture: save failure stays warn-only");
+    }
+
+    #[test]
+    fn missing_known_hosts_file_loads_as_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("known_hosts.json");
+        let hosts = KnownHosts::load(&missing).expect("a missing file loads as an empty store");
+        assert!(hosts.servers.is_empty());
+    }
+
+    #[test]
+    fn corrupt_known_hosts_file_fails_closed_and_stays_byte_identical() {
+        // A19 review: a present-but-unparseable known_hosts must NOT be
+        // treated as pin-less — the old `unwrap_or_default()` callers would
+        // TOFU-capture whatever answered and overwrite every stored pin on
+        // save. Tested at the load level: the full connect path needs a
+        // live server handshake and is not unit-harnessable, but every
+        // caller now propagates this Err with `?` BEFORE verify/save, so
+        // the file must survive untouched.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("known_hosts.json");
+        let garbage = b"{\"servers\": {\"host.example\": {\"fingerprint\": \"ik:1:AAAA";
+        std::fs::write(&path, garbage).unwrap();
+
+        let err = KnownHosts::load(&path).expect_err("a corrupt file must not load as empty");
+        assert!(
+            err.to_string().contains("Failed to parse known hosts file"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            garbage,
+            "the corrupt file must be left byte-identical (no clobbering save)"
+        );
+    }
+
+    #[test]
+    fn config_pin_mismatch_is_fatal_even_with_reject_mismatch_relaxed() {
+        // A19 review: reject_mismatch = false is a dev opt-in that relaxes
+        // known_hosts mismatches ONLY. A mismatch against the fingerprint
+        // the operator pasted into the config is refused regardless.
+        let bundle = make_bundle(0x12);
+        let other = make_bundle(0x34);
+        let config_pin = compute_fingerprint(&other);
+        let mut hosts = KnownHosts::default();
+
+        let (result, should_proceed) = verify_server_identity(
+            "example.com",
+            &bundle,
+            &mut hosts,
+            Some(&config_pin),
+            false,
+            false,
+        );
+        assert!(!should_proceed);
+        match &result {
+            VerificationResult::Mismatch {
+                against_config_pin, ..
+            } => assert!(against_config_pin),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        // The caller-side decision rule every connect path inherits:
+        assert!(
+            mismatch_is_fatal(&result, false),
+            "config pin is always enforced"
+        );
+        assert!(mismatch_is_fatal(&result, true));
+    }
+
+    #[test]
+    fn known_hosts_mismatch_remains_relaxed_only_by_explicit_opt_in() {
+        // The opt-in still works where it is meant to: a mismatch against
+        // a known_hosts-stored pin with reject_mismatch = false warns and
+        // continues; with the default true it rejects.
+        let bundle = make_bundle(0x56);
+        let stored_pin = compute_fingerprint(&make_bundle(0x78));
+        let mut hosts = KnownHosts::default();
+        hosts.add_server("host.example".to_string(), stored_pin);
+
+        let (result, should_proceed) =
+            verify_server_identity("host.example", &bundle, &mut hosts, None, true, false);
+        assert!(!should_proceed);
+        match &result {
+            VerificationResult::Mismatch {
+                against_config_pin, ..
+            } => assert!(!against_config_pin),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert!(
+            !mismatch_is_fatal(&result, false),
+            "the dev opt-in relaxes known_hosts mismatches"
+        );
+        assert!(mismatch_is_fatal(&result, true));
     }
 }

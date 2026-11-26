@@ -22,7 +22,9 @@ use rvpn_core::crypto::{DoubleRatchet, IdentityKey, X3DHPublicBundle};
 use rvpn_core::protocol::{HandshakeMessage, MultiplexedFrame};
 
 use crate::config::ServerIdentityConfig;
-use crate::identity_verification::{verify_server_identity, KnownHosts, VerificationResult};
+use crate::identity_verification::{
+    mismatch_is_fatal, persist_known_hosts, verify_server_identity, KnownHosts, VerificationResult,
+};
 use crate::websocket::{
     connect_websocket, split_websocket, Message, WebSocketReader, WebSocketTaskHandle,
     WebSocketWriter,
@@ -323,10 +325,13 @@ impl VpnTunnel {
 
                         // Load known hosts (mut — verify_server_identity
                         // now writes canonical pins on TOFU capture and
-                        // migrates legacy hex entries in-place).
+                        // migrates legacy hex entries in-place). A corrupt
+                        // or unreadable file FAILS the connection here
+                        // (A19): treating it as pin-less would TOFU-capture
+                        // whatever answered and overwrite every stored pin
+                        // on the save below.
                         let mut known_hosts =
-                            KnownHosts::load(&server_identity_config.known_hosts_file)
-                                .unwrap_or_default();
+                            KnownHosts::load(&server_identity_config.known_hosts_file)?;
 
                         // Bundle for identity verification — uses the Ed25519 key from ServerHello
                         // so the fingerprint matches what the operator sees
@@ -349,36 +354,48 @@ impl VpnTunnel {
                             &mut known_hosts,
                             server_identity_config.fingerprint.as_deref(),
                             server_identity_config.trust_on_first_use,
-                            server_identity_config.strict_mode,
+                            server_identity_config.reject_new_identity,
                         );
 
                         // Persist any mutations (TOFU capture, legacy
-                        // pin migration, last_verified bump).
-                        if let Err(e) = known_hosts.save(&server_identity_config.known_hosts_file) {
-                            warn!("Failed to persist known_hosts.json: {}", e);
-                        }
+                        // pin migration, last_verified bump). A failed save
+                        // after a fresh capture is fatal — otherwise the
+                        // next session re-captures blindly.
+                        persist_known_hosts(
+                            &known_hosts,
+                            &server_identity_config.known_hosts_file,
+                            &result,
+                            should_proceed,
+                        )?;
 
-                        match result {
+                        match &result {
                             VerificationResult::Verified => {
                                 info!("Server identity verified");
                             }
                             VerificationResult::New => {
+                                if !should_proceed {
+                                    // verify_server_identity refused the
+                                    // capture: reject_new_identity is set,
+                                    // or trust_on_first_use is disabled.
+                                    return Err(anyhow::anyhow!(
+                                        "Server identity verification failed: unknown server identity rejected"
+                                    ));
+                                }
                                 info!("New server identity, accepting (TOFU mode)");
                             }
-                            VerificationResult::Mismatch { expected, got } => {
-                                if server_identity_config.strict {
+                            VerificationResult::Mismatch { expected, got, .. } => {
+                                if mismatch_is_fatal(
+                                    &result,
+                                    server_identity_config.reject_mismatch,
+                                ) {
                                     return Err(anyhow::anyhow!(
                                         "Server identity mismatch! Expected {}, got {}. Connection rejected.",
                                         expected, got
                                     ));
                                 } else {
-                                    warn!("Server identity mismatch, but continuing (non-strict mode)");
+                                    warn!("Server identity mismatch — continuing because reject_mismatch = false: identity pinning is OFF for this connection (explicit dev opt-in, not safe for production)");
                                 }
                             }
-                        }
-
-                        if !should_proceed && server_identity_config.strict {
-                            return Err(anyhow::anyhow!("Server identity verification failed"));
                         }
 
                         // Complete X3DH agreement using the SERVER'S ACTUAL bundle
@@ -654,9 +671,69 @@ impl VpnTunnel {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_vpn_tunnel_creation() {
-        // This is a placeholder test
-        // Real tests would require a mock server
+    use super::*;
+
+    /// Caller-level pin for A19: when `verify_server_identity` refuses a TOFU
+    /// capture (`VerificationResult::New` with `should_proceed == false` —
+    /// here `reject_new_identity = true`), the handshake must fail and the
+    /// tunnel must never come up. Drives the real `perform_handshake` over
+    /// in-memory channels standing in for the WebSocket; the mock "server"
+    /// is an in-process `X3DHResponder` whose identity is unknown to the
+    /// client's known_hosts.
+    #[tokio::test]
+    async fn refused_tofu_capture_fails_handshake() {
+        use rvpn_core::crypto::X3DHResponder;
+
+        let responder = X3DHResponder::new();
+        let server_bundle = responder.get_public_bundle();
+        let server_hello = HandshakeMessage::ServerHello {
+            ephemeral_key: vec![0u8; 32],
+            signed_prekey: server_bundle.signed_prekey.to_vec(),
+            prekey_signature: server_bundle.prekey_signature.to_vec(),
+            identity_key: server_bundle.identity_key.to_vec(),
+            identity_x25519_key: None,
+            identity_x25519_signature: None,
+            capabilities: Some(server_bundle.capabilities),
+        };
+
+        let (reader_tx, mut ws_reader) = mpsc::channel::<Message>(4);
+        let (writer_tx, _writer_rx) = mpsc::channel::<Message>(4);
+        let ws_writer = WebSocketWriter::from_sender(writer_tx);
+        reader_tx
+            .send(Message::Binary(serde_json::to_vec(&server_hello).unwrap()))
+            .await
+            .unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = ServerIdentityConfig {
+            known_hosts_file: dir.path().join("known_hosts.json"),
+            reject_new_identity: true,
+            ..Default::default()
+        };
+        let identity_key = Arc::new(IdentityKey::generate());
+
+        let result = VpnTunnel::perform_handshake(
+            &mut ws_reader,
+            &ws_writer,
+            &identity_key,
+            &server_bundle,
+            "127.0.0.1",
+            443,
+            &config,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("refused TOFU capture must fail the handshake"),
+        };
+        assert!(
+            err.to_string().contains("unknown server identity rejected"),
+            "expected the refusal error, got: {err:#}"
+        );
+
+        // The refused capture must not have been pinned either.
+        let hosts = KnownHosts::load(&config.known_hosts_file).unwrap();
+        assert!(hosts.get_fingerprint("127.0.0.1:443").is_none());
     }
 }

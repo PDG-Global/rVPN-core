@@ -640,15 +640,32 @@ pub struct ServerIdentityConfig {
     #[serde(default = "default_known_hosts_path")]
     pub known_hosts_file: PathBuf,
 
-    /// Strict mode - if true, connection fails on fingerprint mismatch
-    /// If false, only a warning is logged
-    #[serde(default = "default_true")]
-    pub strict: bool,
+    /// Reject the connection when the server's identity does not match the
+    /// stored or configured pin. Default true — a mismatch fails closed.
+    /// Set to false ONLY as an explicit dev opt-in: the mismatch is logged
+    /// and the connection proceeds with identity pinning OFF for it.
+    /// The opt-in relaxes only known_hosts-stored pins — a mismatch against
+    /// a config-pinned `fingerprint` is always rejected.
+    ///
+    /// Deprecated config-file alias: `strict`. serde's `alias` parses the
+    /// old name silently — it exposes no hook to detect which name was
+    /// used, so the deprecation cannot be logged at load time and is
+    /// documented here instead. The alias will be removed in a future
+    /// release; use `reject_mismatch`.
+    #[serde(default = "default_true", alias = "strict")]
+    pub reject_mismatch: bool,
 
-    /// Strict TOFU mode - if true, reject unknown server identities on first use
-    /// If false (default), accept unknown servers on first connection (standard TOFU)
-    #[serde(default)]
-    pub strict_mode: bool,
+    /// Reject unknown server identities on first use (no TOFU capture).
+    /// If false (default), accept unknown servers on first connection
+    /// (standard TOFU).
+    ///
+    /// Deprecated config-file alias: `strict_mode`. serde's `alias` parses
+    /// the old name silently — it exposes no hook to detect which name was
+    /// used, so the deprecation cannot be logged at load time and is
+    /// documented here instead. The alias will be removed in a future
+    /// release; use `reject_new_identity`.
+    #[serde(default, alias = "strict_mode")]
+    pub reject_new_identity: bool,
 }
 
 impl Default for ServerIdentityConfig {
@@ -657,8 +674,8 @@ impl Default for ServerIdentityConfig {
             fingerprint: None,
             trust_on_first_use: true,
             known_hosts_file: default_known_hosts_path(),
-            strict: true,
-            strict_mode: false,
+            reject_mismatch: true,
+            reject_new_identity: false,
         }
     }
 }
@@ -798,6 +815,26 @@ listen_address = "127.0.0.1:9801"
             cfg3.dashboard.listen_address,
             DashboardConfig::default().listen_address
         );
+    }
+
+    #[test]
+    fn server_identity_legacy_flag_names_parse_as_aliases() {
+        // Old config files keep parsing: `strict` gates mismatch rejection,
+        // `strict_mode` gates TOFU new-identity rejection.
+        let cfg: ServerIdentityConfig =
+            toml::from_str("strict = false\nstrict_mode = true").expect("parse legacy names");
+        assert!(!cfg.reject_mismatch);
+        assert!(cfg.reject_new_identity);
+
+        let cfg: ServerIdentityConfig =
+            toml::from_str("reject_mismatch = false\nreject_new_identity = true")
+                .expect("parse new names");
+        assert!(!cfg.reject_mismatch);
+        assert!(cfg.reject_new_identity);
+
+        let cfg = ServerIdentityConfig::default();
+        assert!(cfg.reject_mismatch);
+        assert!(!cfg.reject_new_identity);
     }
 
     #[test]

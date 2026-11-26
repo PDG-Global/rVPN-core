@@ -68,7 +68,7 @@ fn tofu_captures_pin_on_first_connect_and_rejects_redirect() {
     );
     assert!(!ok);
     match result {
-        VerificationResult::Mismatch { expected, got } => {
+        VerificationResult::Mismatch { expected, got, .. } => {
             assert_eq!(expected, pin_a);
             assert_eq!(got, encode_identity_pin(&bundle_b.identity_key).unwrap());
         }
@@ -112,8 +112,8 @@ fn config_supplied_pin_still_verifies_after_a_reboot() {
 }
 
 #[test]
-fn strict_mode_refuses_new_server_without_state_change() {
-    // A profile with trust_on_first_use = true AND strict_mode = true
+fn reject_new_identity_refuses_new_server_without_state_change() {
+    // A profile with trust_on_first_use = true AND reject_new_identity = true
     // means "I want to pin only what I set in config; refuse unknowns".
     // The verify call must fail and NOT stamp a new entry.
     let server_a = X3DHResponder::new();
@@ -128,7 +128,7 @@ fn strict_mode_refuses_new_server_without_state_change() {
         &mut hosts,
         None,
         true, // trust_on_first_use
-        true, // strict_mode
+        true, // reject_new_identity
     );
     assert!(!ok);
     assert_eq!(result, VerificationResult::New);
