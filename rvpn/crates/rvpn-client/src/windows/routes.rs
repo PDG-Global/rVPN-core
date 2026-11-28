@@ -36,12 +36,12 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::NetworkManagement::IpHelper::{
     ConvertInterfaceIndexToLuid, CreateIpForwardEntry2, DNS_INTERFACE_SETTINGS,
-    DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2,
+    DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, FreeMibTable,
     GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
     GAA_FLAG_SKIP_UNICAST, GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses, GetBestRoute2,
-    GetIfEntry2, GetIpInterfaceEntry, IP_ADAPTER_ADDRESSES_LH, IP_ADDRESS_PREFIX,
-    InitializeIpInterfaceEntry, MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW,
-    SetInterfaceDnsSettings, SetIpInterfaceEntry,
+    GetIfEntry2, GetIpForwardTable2, GetIpInterfaceEntry, IP_ADAPTER_ADDRESSES_LH,
+    IP_ADDRESS_PREFIX, InitializeIpInterfaceEntry, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
+    MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW, SetInterfaceDnsSettings, SetIpInterfaceEntry,
 };
 use windows::Win32::NetworkManagement::Ndis::{IfOperStatusUp, NET_LUID_LH};
 use windows::Win32::Networking::WinSock::{
@@ -76,6 +76,12 @@ pub(crate) const V6_COVERING: [&str; 2] = ["::/1", "8000::/1"];
 /// dumps the Get-filled row and probes which row variants this interface
 /// accepts before the error is reported. See diagnose_set_failure.
 const IFMETRIC_DEBUG_ENV: &str = "RVPN_IFMETRIC_DEBUG";
+
+/// Gate for the route-leak diagnostics dump: when set, a failed
+/// route-resolution check dumps the winning route, the adapter state, and
+/// the longest-prefix candidates from the forward table. See
+/// diagnose_route_leak. Read-only; never changes the fail-closed behavior.
+const ROUTE_DEBUG_ENV: &str = "RVPN_ROUTE_DEBUG";
 
 /// Representative probe addresses for the post-install leak check
 /// (verify_routes_resolve_via_adapter). GetBestRoute2 is a pure route-table
@@ -699,6 +705,7 @@ fn verify_routes_resolve_via_adapter(luid: NET_LUID_LH) -> Result<()> {
         let best =
             best_route_luid(dest).with_context(|| format!("route lookup for {dest} failed"))?;
         if !luid_matches(best, luid) {
+            dump_route_leak(dest, luid);
             bail!(
                 "route lookup for {dest} does not resolve via the tunnel adapter; \
                  refusing to connect with a leaking route table"
@@ -734,6 +741,7 @@ fn watchdog_check(luid: NET_LUID_LH, ops: &WatchdogOps) -> Result<()> {
         let best =
             (ops.best_route)(dest).with_context(|| format!("route lookup for {dest} failed"))?;
         if !luid_matches(best, luid) {
+            dump_route_leak(dest, luid);
             bail!("route lookup for {dest} no longer resolves via the tunnel adapter");
         }
     }
@@ -757,6 +765,208 @@ pub async fn watchdog(luid: NET_LUID_LH, ops: WatchdogOps) -> Result<()> {
     }
 }
 
+/// Dump route-leak diagnostics when RVPN_ROUTE_DEBUG=1; a no-op otherwise.
+/// Called on the fail-closed verification path and the watchdog's
+/// route-leak path; the callers still bail and roll back, so the dump only
+/// explains the failure.
+fn dump_route_leak(dest: IpAddr, expected_luid: NET_LUID_LH) {
+    if std::env::var_os(ROUTE_DEBUG_ENV).is_some() {
+        diagnose_route_leak(dest, expected_luid);
+    }
+}
+
+/// Read-only diagnostics for a route leak: why the lookup for `dest` did
+/// not resolve via the tunnel adapter. Dumps the winning route, the
+/// adapter's interface state and per-family metrics, and every
+/// forward-table row whose prefix contains the destination (the
+/// longest-prefix candidates), which shows whether our /1 rows are present
+/// and how they differ from what wins. Never mutates state.
+fn diagnose_route_leak(dest: IpAddr, expected_luid: NET_LUID_LH) {
+    let family = match dest {
+        IpAddr::V4(_) => AF_INET,
+        IpAddr::V6(_) => AF_INET6,
+    };
+
+    // The route Windows will actually use for the destination.
+    let dest_sa = sockaddr_inet(dest);
+    let mut best = MIB_IPFORWARD_ROW2::default();
+    let mut source = SOCKADDR_INET::default();
+    let err = unsafe { GetBestRoute2(None, 0, None, &dest_sa, 0, &mut best, &mut source) };
+    if err == ERROR_SUCCESS {
+        // The row carries the LUID; resolve the index's LUID too, to catch
+        // an index/LUID mismatch on a recycled interface.
+        let mut index_luid = NET_LUID_LH::default();
+        let luid_err = unsafe { ConvertInterfaceIndexToLuid(best.InterfaceIndex, &mut index_luid) };
+        warn!(
+            "route debug: best route for {dest}: if_index={} luid={:#x} (index->luid {}{:#x}) \
+             next_hop={} metric={} protocol={} valid_lifetime={} age={}",
+            best.InterfaceIndex,
+            unsafe { best.InterfaceLuid.Value },
+            if luid_err == ERROR_SUCCESS {
+                ""
+            } else {
+                "(failed) "
+            },
+            unsafe { index_luid.Value },
+            sockaddr_display(&best.NextHop),
+            best.Metric,
+            best.Protocol.0,
+            best.ValidLifetime,
+            best.Age,
+        );
+    } else {
+        warn!(
+            "route debug: GetBestRoute2 for {dest} failed: Win32 error {}",
+            err.0
+        );
+    }
+
+    // Adapter state: up/down, type, media connection.
+    let mut if_row = MIB_IF_ROW2 {
+        InterfaceLuid: expected_luid,
+        ..Default::default()
+    };
+    let err = unsafe { GetIfEntry2(&mut if_row) };
+    if err == ERROR_SUCCESS {
+        warn!(
+            "route debug: adapter state: oper_status={} if_type={} media_connect_state={}",
+            if_row.OperStatus.0, if_row.Type, if_row.MediaConnectState.0,
+        );
+    } else {
+        warn!(
+            "route debug: GetIfEntry2 for the adapter failed: Win32 error {}",
+            err.0
+        );
+    }
+    for fam in [AF_INET, AF_INET6] {
+        match get_ip_interface(expected_luid, fam) {
+            Ok(Some(row)) => warn!(
+                "route debug: adapter ip-interface (family {}): metric={} automatic_metric={}",
+                fam.0, row.Metric, row.UseAutomaticMetric
+            ),
+            Ok(None) => warn!(
+                "route debug: adapter has no ip-interface row for family {}",
+                fam.0
+            ),
+            Err(e) => warn!(
+                "route debug: GetIpInterfaceEntry for family {} failed: {e:#}",
+                fam.0
+            ),
+        }
+    }
+
+    dump_covering_rows(dest, family, expected_luid);
+}
+
+/// All forward-table rows whose destination prefix contains `dest` (the
+/// longest-prefix candidates for it), longest first. Read-only.
+fn dump_covering_rows(dest: IpAddr, family: ADDRESS_FAMILY, expected_luid: NET_LUID_LH) {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    let err = unsafe { GetIpForwardTable2(family, &mut table) };
+    if err != ERROR_SUCCESS {
+        warn!(
+            "route debug: GetIpForwardTable2 failed: Win32 error {}",
+            err.0
+        );
+        return;
+    }
+    // Frees the table on every exit path.
+    let _guard = MibTableGuard(table);
+    // SAFETY: GetIpForwardTable2 returned a valid table of NumEntries
+    // contiguous rows starting at Table.
+    let rows = unsafe {
+        let num = (*table).NumEntries as usize;
+        std::slice::from_raw_parts((*table).Table.as_ptr(), num)
+    };
+    let mut candidates: Vec<&MIB_IPFORWARD_ROW2> = rows
+        .iter()
+        .filter(|row| prefix_contains(&row.DestinationPrefix, dest))
+        .collect();
+    candidates.sort_by_key(|row| std::cmp::Reverse(row.DestinationPrefix.PrefixLength));
+    warn!(
+        "route debug: {} forward-table row(s) contain {dest} (expected adapter luid {:#x}):",
+        candidates.len(),
+        unsafe { expected_luid.Value },
+    );
+    for row in candidates {
+        warn!(
+            "route debug:   {}/{} via {} luid={:#x} if_index={} metric={} protocol={} \
+             valid_lifetime={} preferred_lifetime={} age={} loopback={} publish={} immortal={}",
+            sockaddr_display(&row.DestinationPrefix.Prefix),
+            row.DestinationPrefix.PrefixLength,
+            sockaddr_display(&row.NextHop),
+            unsafe { row.InterfaceLuid.Value },
+            row.InterfaceIndex,
+            row.Metric,
+            row.Protocol.0,
+            row.ValidLifetime,
+            row.PreferredLifetime,
+            row.Age,
+            row.Loopback,
+            row.Publish,
+            row.Immortal,
+        );
+    }
+}
+
+/// Frees a MIB table allocated by GetIpForwardTable2 on every exit path.
+struct MibTableGuard(*mut MIB_IPFORWARD_TABLE2);
+
+impl Drop for MibTableGuard {
+    fn drop(&mut self) {
+        unsafe { FreeMibTable(self.0 as *const std::ffi::c_void) };
+    }
+}
+
+/// Human-readable rendering of a SOCKADDR_INET for diagnostics.
+fn sockaddr_display(sa: &SOCKADDR_INET) -> String {
+    // SAFETY: the family field selects the initialized union member.
+    let family = unsafe { sa.si_family };
+    if family == AF_INET {
+        // SAFETY: the family is IPv4, so the Ipv4 member is initialized.
+        unsafe { Ipv4Addr::from(u32::from_be(sa.Ipv4.sin_addr.S_un.S_addr)).to_string() }
+    } else if family == AF_INET6 {
+        // SAFETY: the family is IPv6, so the Ipv6 member is initialized.
+        unsafe { Ipv6Addr::from(sa.Ipv6.sin6_addr.u.Byte).to_string() }
+    } else {
+        format!("(family {})", family.0)
+    }
+}
+
+/// Whether the forward-row prefix contains `dest` (making the row a
+/// longest-prefix candidate for the destination).
+fn prefix_contains(prefix: &IP_ADDRESS_PREFIX, dest: IpAddr) -> bool {
+    let len = prefix.PrefixLength as u32;
+    // SAFETY: the family field selects the initialized union member; the
+    // matching union member is read in each branch.
+    let family = unsafe { prefix.Prefix.si_family };
+    match (family, dest) {
+        (AF_INET, IpAddr::V4(dest_v4)) => {
+            if len > 32 {
+                return false;
+            }
+            let prefix_bits = u32::from_be(unsafe { prefix.Prefix.Ipv4.sin_addr.S_un.S_addr });
+            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+            (u32::from(dest_v4) & mask) == (prefix_bits & mask)
+        }
+        (AF_INET6, IpAddr::V6(dest_v6)) => {
+            if len > 128 {
+                return false;
+            }
+            let prefix_bytes = unsafe { prefix.Prefix.Ipv6.sin6_addr.u.Byte };
+            let dest_bytes = dest_v6.octets();
+            let full_bytes = (len / 8) as usize;
+            if prefix_bytes[..full_bytes] != dest_bytes[..full_bytes] {
+                return false;
+            }
+            let rem = len % 8;
+            rem == 0
+                || (prefix_bytes[full_bytes] >> (8 - rem)) == (dest_bytes[full_bytes] >> (8 - rem))
+        }
+        _ => false,
+    }
+}
+
 /// Build the forward row identifying one of our routes. The interface LUID
 /// is always set: creates AND deletes are scoped to the adapter we own, so a
 /// rollback can never remove another VPN's covering routes.
@@ -774,6 +984,12 @@ fn forward_row(
         },
         Metric: 1,
         Protocol: MIB_IPPROTO_NETMGMT,
+        // Default::default() zeroes the lifetimes; a zero ValidLifetime
+        // makes the route expire immediately, so lookups skip it and fall
+        // through to the physical default route. netsh-created routes use
+        // 0xffffffff = infinite.
+        ValidLifetime: u32::MAX,
+        PreferredLifetime: u32::MAX,
         ..Default::default()
     };
     match next_hop {
@@ -1172,6 +1388,70 @@ mod tests {
         let v6 = forward_row(luid, IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1, None);
         assert_eq!(unsafe { v6.NextHop.Ipv6.sin6_family }, AF_INET6);
         assert_eq!(unsafe { v6.NextHop.Ipv6.sin6_addr.u.Byte }, [0u8; 16]);
+    }
+
+    /// Routes must carry infinite lifetimes: a zero ValidLifetime makes the
+    /// route expire immediately, so lookups skip it and fall through to the
+    /// physical default route (netsh uses 0xffffffff).
+    #[test]
+    fn forward_row_has_infinite_lifetimes() {
+        let row = forward_row(
+            NET_LUID_LH::default(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            1,
+            None,
+        );
+        assert_eq!(row.ValidLifetime, u32::MAX);
+        assert_eq!(row.PreferredLifetime, u32::MAX);
+    }
+
+    /// prefix_contains selects exactly the forward-table rows whose prefix
+    /// covers the destination: both /1 halves, the /0 default, and never the
+    /// other half or the other family.
+    #[test]
+    fn prefix_contains_selects_covering_rows() {
+        let prefix = |addr: IpAddr, len: u8| IP_ADDRESS_PREFIX {
+            Prefix: sockaddr_inet(addr),
+            PrefixLength: len,
+        };
+        let v4 = |a: u8, b: u8, c: u8, d: u8| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+        let probe_v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+        assert!(prefix_contains(&prefix(v4(0, 0, 0, 0), 1), v4(1, 1, 1, 1)));
+        assert!(!prefix_contains(
+            &prefix(v4(0, 0, 0, 0), 1),
+            v4(200, 1, 1, 1)
+        ));
+        assert!(prefix_contains(
+            &prefix(v4(128, 0, 0, 0), 1),
+            v4(200, 1, 1, 1)
+        ));
+        assert!(!prefix_contains(
+            &prefix(v4(128, 0, 0, 0), 1),
+            v4(1, 1, 1, 1)
+        ));
+        // The default route covers everything; an unaligned prefix boundary
+        // (a /10) is masked per byte.
+        assert!(prefix_contains(&prefix(v4(0, 0, 0, 0), 0), v4(1, 1, 1, 1)));
+        assert!(prefix_contains(
+            &prefix(v4(10, 64, 0, 0), 10),
+            v4(10, 100, 0, 1)
+        ));
+        assert!(!prefix_contains(
+            &prefix(v4(10, 64, 0, 0), 10),
+            v4(10, 200, 0, 1)
+        ));
+        // 2606:... starts with 0b0010_0110, so the ::/1 covering route
+        // contains it; the other half (8000::/1) does not.
+        assert!(prefix_contains(
+            &prefix(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1),
+            probe_v6
+        ));
+        assert!(!prefix_contains(
+            &prefix("8000::".parse().unwrap(), 1),
+            probe_v6
+        ));
+        // A family mismatch never matches.
+        assert!(!prefix_contains(&prefix(v4(0, 0, 0, 0), 1), probe_v6));
     }
 
     /// Crash recovery replays exactly what the state file recorded: the
