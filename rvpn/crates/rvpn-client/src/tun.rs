@@ -140,26 +140,6 @@ impl TunDevice {
             .map_err(|e| anyhow::anyhow!("Failed to get adapter name: {}", e))
     }
 
-    /// Windows: first IPv4 address configured on the wintun adapter
-    /// (used as the on-link gateway for the covering routes).
-    #[cfg(windows)]
-    pub fn adapter_ipv4(&self) -> Result<std::net::Ipv4Addr> {
-        let device = self
-            .device
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("TUN device not initialized"))?;
-        let addrs = device
-            .addresses()
-            .map_err(|e| anyhow::anyhow!("Failed to get adapter addresses: {}", e))?;
-        addrs
-            .into_iter()
-            .find_map(|a| match a {
-                std::net::IpAddr::V4(v4) => Some(v4),
-                _ => None,
-            })
-            .ok_or_else(|| anyhow::anyhow!("Adapter has no IPv4 address"))
-    }
-
     /// Run the TUN device with graceful shutdown support.
     ///
     /// Splits into independent uplink (TUN → tunnel) and downlink

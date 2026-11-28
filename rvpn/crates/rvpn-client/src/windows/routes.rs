@@ -85,8 +85,6 @@ pub struct RouteConfig {
     pub adapter_name: String,
     /// wintun adapter interface index.
     pub adapter_index: u32,
-    /// IPv4 address assigned to the adapter (used as the on-link gateway).
-    pub adapter_ipv4: Ipv4Addr,
     /// DNS servers to set on the adapter (queried through the tunnel).
     pub dns_servers: Vec<IpAddr>,
 }
@@ -136,8 +134,10 @@ struct ServerRoute {
 struct CoveringRoute {
     prefix: IpAddr,
     prefix_len: u8,
-    /// Next hop for IPv4 routes (the adapter address). IPv6 routes are
-    /// on-link and record no next hop.
+    /// On-link routes record no next hop: the interface itself is the next
+    /// hop. `Some` only appears in state files written before the on-link
+    /// change (IPv4 routes used the adapter address as gateway); the
+    /// recorded row is replayed verbatim, so rollback still deletes them.
     next_hop: Option<IpAddr>,
 }
 
@@ -291,12 +291,16 @@ impl RouteGuard {
         }
 
         // 2. IPv4: 0.0.0.0/1 + 128.0.0.0/1 via the adapter (covers the whole
-        //    space without touching the physical default route).
+        //    space without touching the physical default route). On-link like
+        //    IPv6: a route whose gateway is the adapter's own address passes
+        //    CreateIpForwardEntry2 but fails next-hop resolution on the
+        //    no-ARP point-to-point wintun interface, so lookups skip it and
+        //    fall through to the physical default route.
         for (net, mask) in V4_COVERING {
             let record = CoveringRoute {
                 prefix: net.into(),
                 prefix_len: u32::from(mask).count_ones() as u8,
-                next_hop: Some(self.cfg.adapter_ipv4.into()),
+                next_hop: None,
             };
             self.state.routes.push(record.clone());
             self.persist()?;
@@ -983,6 +987,22 @@ mod tests {
         assert_eq!(parse_prefix6("8000::/1").unwrap().1, 1);
     }
 
+    /// Covering routes are on-link: the next hop is the unspecified address
+    /// of the route's own family, meaning "the interface itself". A gateway
+    /// address (even the adapter's own IP) fails next-hop resolution on the
+    /// no-ARP point-to-point wintun interface, and lookups fall through to
+    /// the physical default route.
+    #[test]
+    fn forward_row_on_link_has_unspecified_next_hop() {
+        let luid = NET_LUID_LH::default();
+        let v4 = forward_row(luid, IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1, None);
+        assert_eq!(unsafe { v4.NextHop.Ipv4.sin_family }, AF_INET);
+        assert_eq!(unsafe { v4.NextHop.Ipv4.sin_addr.S_un.S_addr }, 0);
+        let v6 = forward_row(luid, IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1, None);
+        assert_eq!(unsafe { v6.NextHop.Ipv6.sin6_family }, AF_INET6);
+        assert_eq!(unsafe { v6.NextHop.Ipv6.sin6_addr.u.Byte }, [0u8; 16]);
+    }
+
     /// Crash recovery replays exactly what the state file recorded: the
     /// schema must round-trip every field (adapter identity, per-route
     /// entries, DNS, metric rows) through JSON unchanged.
@@ -997,6 +1017,10 @@ mod tests {
                 interface_luid: 42,
             }),
             routes: vec![
+                // Legacy shape: state files written before the on-link
+                // change recorded the adapter address as the IPv4 next hop;
+                // the schema must keep round-tripping it so crash recovery
+                // can still delete those routes.
                 CoveringRoute {
                     prefix: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
                     prefix_len: 1,

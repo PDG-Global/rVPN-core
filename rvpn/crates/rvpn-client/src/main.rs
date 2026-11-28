@@ -645,7 +645,6 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
                 server_ip,
                 adapter_name: tun_device.adapter_name()?,
                 adapter_index: tun_device.adapter_index()?,
-                adapter_ipv4: tun_device.adapter_ipv4()?,
                 dns_servers,
             };
             match crate::windows::routes::apply(route_cfg, &route_state_path) {
