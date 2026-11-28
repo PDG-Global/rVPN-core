@@ -50,6 +50,17 @@ const INITIAL_RECONNECT_DELAY_MS: u64 = 1000;
 /// Maximum delay between reconnection attempts (ms)
 const MAX_RECONNECT_DELAY_MS: u64 = 30000;
 
+/// Retry delay for reconnect attempt `attempt` (1-based): capped
+/// exponential backoff (1s, 2s, 4s, ... capped at MAX_RECONNECT_DELAY_MS)
+/// with ±20% jitter — the same backoff/jitter pattern tunnel_pool uses —
+/// so deterministic failures never hot-loop and concurrent clients do not
+/// resynchronize their retries.
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    let base_ms = (INITIAL_RECONNECT_DELAY_MS << shift).min(MAX_RECONNECT_DELAY_MS);
+    std::time::Duration::from_millis(tunnel_pool::jittered(base_ms as f64, 0.2) as u64)
+}
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::id as process_id;
@@ -505,6 +516,16 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
             .ip()
     };
 
+    // Windows: verify wintun.dll once, before the reconnect loop. The hash
+    // pin, Authenticode signature and directory-trust checks are
+    // deterministic: retrying them through the loop below could never
+    // succeed and would only hot-loop on a permanent configuration error.
+    // The returned guard pins the verified bytes (deny-write handle plus
+    // loaded module) for the whole TUN-mode run; per-attempt device
+    // creation re-verifies cheaply against the same pinned bytes.
+    #[cfg(windows)]
+    let _wintun = crate::windows::wintun::resolve_and_verify()?;
+
     // Initialize stats manager for historical tracking
     metrics::init_global_metrics();
     let stats_manager = stats::init_global_stats_manager_with_dir(config.data_dir.clone()).await;
@@ -571,12 +592,9 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
                     error!("Max connection attempts ({}) reached, giving up", MAX_RECONNECT_ATTEMPTS);
                     return Err(anyhow::anyhow!("Failed to connect after {} attempts: {}", MAX_RECONNECT_ATTEMPTS, e));
                 }
-                let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
-                    MAX_RECONNECT_DELAY_MS,
-                );
-                warn!("Retrying in {} ms (attempt {}/{})", delay_ms, reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                let delay = retry_delay(reconnect_attempts);
+                warn!("Retrying in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
@@ -595,6 +613,9 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
             None => {
                 error!("No IP address assigned by server - TUN mode requires server-assigned IP");
                 reconnect_attempts += 1;
+                let delay = retry_delay(reconnect_attempts);
+                warn!("Retrying in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
@@ -614,12 +635,9 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
             Err(e) => {
                 error!("Failed to create TUN device: {:#}", e);
                 reconnect_attempts += 1;
-                let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
-                    MAX_RECONNECT_DELAY_MS,
-                );
-                warn!("Retrying TUN device creation in {} ms", delay_ms);
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                let delay = retry_delay(reconnect_attempts);
+                warn!("Retrying TUN device creation in {} ms", delay.as_millis());
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
@@ -652,6 +670,9 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
                 Err(e) => {
                     error!("Failed to set up tunnel routes: {:#}", e);
                     reconnect_attempts += 1;
+                    let delay = retry_delay(reconnect_attempts);
+                    warn!("Retrying route setup in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
             }
@@ -727,14 +748,11 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
                     return Err(anyhow::anyhow!("Tunnel disconnected after {} reconnection attempts: {}", MAX_RECONNECT_ATTEMPTS, e));
                 }
 
-                let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
-                    MAX_RECONNECT_DELAY_MS,
-                );
-                warn!("Tunnel disconnected, reconnecting in {} ms (attempt {}/{})", delay_ms, reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                let delay = retry_delay(reconnect_attempts);
+                warn!("Tunnel disconnected, reconnecting in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
 
                 // Brief pause before reconnect
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                tokio::time::sleep(delay).await;
             }
             None => {
                 // Shutdown was triggered
@@ -1044,4 +1062,26 @@ fn format_bytes(bytes: u64) -> String {
         unit_idx += 1;
     }
     format!("{:.2} {}", size, UNITS[unit_idx])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Retry delays must grow exponentially up to the cap, with jitter
+    /// staying within ±20% and never collapsing to zero, so a deterministic
+    /// failure can never hot-loop.
+    #[test]
+    fn retry_delay_is_backoff_capped_and_jittered() {
+        let first = retry_delay(1);
+        let second = retry_delay(2);
+        let capped = retry_delay(100);
+        assert!(first >= std::time::Duration::from_millis(800));
+        assert!(first <= std::time::Duration::from_millis(1200));
+        assert!(second >= std::time::Duration::from_millis(1600));
+        assert!(second <= std::time::Duration::from_millis(2400));
+        // 30s base capped, jittered to [24s, 36s].
+        assert!(capped >= std::time::Duration::from_millis(24000));
+        assert!(capped <= std::time::Duration::from_millis(36000));
+    }
 }

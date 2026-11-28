@@ -165,7 +165,7 @@ type Connector<T> =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Arc<T>>> + Send>> + Send + Sync>;
 
 /// Apply ±jitter to a base value: result in `[base*(1-j), base*(1+j)]`.
-fn jittered(base: f64, jitter: f64) -> f64 {
+pub(crate) fn jittered(base: f64, jitter: f64) -> f64 {
     if jitter <= 0.0 {
         return base;
     }
