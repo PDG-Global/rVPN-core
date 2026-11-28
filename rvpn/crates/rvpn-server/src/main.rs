@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
                     args.from_version,
                 )
             }
+            "clients" => return clients_command(&config, args.clients_args, args.label),
             _ => {}
         }
     }
@@ -1048,12 +1049,53 @@ struct Args {
     /// `--rotate-from` is set. See dev_docs/specs/TOFU_FINGERPRINT.md §6.
     from_version: Option<u32>,
     verbose: u8,
+    /// `clients ...` subcommand tail: action + positional value.
+    clients_args: Vec<String>,
+    /// `clients approve --label "..."`: operator label for the key.
+    label: Option<String>,
 }
 
 /// Parse the process arguments. `--help` and `--version` print and exit
 /// here, before any startup work; an unknown argument or a missing value
 /// exits non-zero. A mistyped flag must never fall through to starting a
 /// second server (found on a production box, 18 Nov 2026).
+/// `rvpn-server clients ...` — local-only admission admin (#32). Operates
+/// directly on the allow-list / pending-list files; the running server
+/// picks changes up on its next handshake's reload. No network admin API.
+fn clients_command(config: &ServerConfig, tail: Vec<String>, label: Option<String>) -> Result<()> {
+    use rvpn_server::admission::{
+        cmd_approve, cmd_list, cmd_pending, cmd_revoke, cmd_set_mode, parse_admission_mode,
+    };
+
+    let allow = &config.admission.allow_file;
+    let pending = &config.admission.pending_file;
+    let audit = &config.admission.audit_file;
+
+    let code = match tail.first().map(String::as_str) {
+        Some("pending") if tail.len() == 1 => cmd_pending(pending),
+        Some("list") if tail.len() == 1 => cmd_list(allow),
+        Some("approve") if tail.len() == 2 => {
+            cmd_approve(allow, pending, audit, &tail[1], label.as_deref())
+        }
+        Some("revoke") if tail.len() == 2 => cmd_revoke(allow, pending, audit, &tail[1]),
+        Some("mode") if tail.len() == 2 && (tail[1] == "learn" || tail[1] == "enforce") => {
+            cmd_set_mode(allow, audit, parse_admission_mode(&tail[1]))
+        }
+        _ => {
+            eprintln!("rvpn-server: usage:");
+            eprintln!(
+                "  clients pending              list refused keys (fingerprint + times only)"
+            );
+            eprintln!("  clients list                 list approved keys with labels");
+            eprintln!("  clients approve <fingerprint> [--label \"name\"]");
+            eprintln!("  clients revoke <fingerprint> drop live sessions on the next reload");
+            eprintln!("  clients mode learn|enforce   flip rollout mode (no restart)");
+            2
+        }
+    };
+    std::process::exit(code);
+}
+
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match parse_argv(&argv) {
@@ -1102,6 +1144,8 @@ fn parse_argv(argv: &[String]) -> Result<ParseOutcome, String> {
         rotate_from: None,
         from_version: None,
         verbose: 0,
+        clients_args: Vec::new(),
+        label: None,
     };
 
     let mut it = argv.iter();
@@ -1129,7 +1173,7 @@ fn parse_argv(argv: &[String]) -> Result<ParseOutcome, String> {
                         "--from-version expects a non-negative integer".to_string()
                     })?);
             }
-            "keygen" | "prekey-bundle" => {
+            "keygen" | "prekey-bundle" | "clients" => {
                 if let Some(prev) = &args.command {
                     return Err(format!(
                         "only one command allowed (got '{prev}' and '{arg}')"
@@ -1137,7 +1181,17 @@ fn parse_argv(argv: &[String]) -> Result<ParseOutcome, String> {
                 }
                 args.command = Some(arg.clone());
             }
-            other => return Err(format!("unrecognised argument '{other}'")),
+            "--label" => {
+                args.label = Some(value("--label")?);
+            }
+            other => {
+                // Positional tail for `clients` (action, fingerprint/mode).
+                if args.command.as_deref() == Some("clients") && !other.starts_with('-') {
+                    args.clients_args.push(other.to_string());
+                } else {
+                    return Err(format!("unrecognised argument '{other}'"));
+                }
+            }
         }
     }
 

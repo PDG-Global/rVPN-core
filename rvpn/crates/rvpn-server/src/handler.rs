@@ -2,6 +2,9 @@
 //! One WebSocket = One SOCKS5 connection (1:1 mapping)
 //! Uses X3DH handshake + Double Ratchet encryption
 
+use crate::admission::{
+    parse_admission_mode, AdmissionDecision, ADMISSION_REFUSAL_CODE, ADMISSION_REFUSAL_MESSAGE,
+};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -156,6 +159,15 @@ fn prune_dns_cache(cache: &mut std::collections::HashMap<String, DnsEntry>) {
     }
 }
 
+/// What a completed handshake yields: the ratchet plus the client's proven
+/// identity and the revocation channel (fires when a later allow-list reload
+/// revokes the key — the session must then be dropped).
+pub(crate) struct HandshakeResult {
+    ratchet: DoubleRatchet,
+    identity_key: [u8; 32],
+    revocation_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
 /// Simplified VPN handler - Brook-style architecture with X3DH + Double Ratchet
 pub struct VpnHandler {
     #[allow(dead_code)]
@@ -163,6 +175,7 @@ pub struct VpnHandler {
     rate_limiter: RwLock<RateLimiter>,
     dns_cache: DnsCache,
     x3dh_responder: Option<X3DHResponder>,
+    admission: crate::admission::Admission,
 }
 
 impl VpnHandler {
@@ -172,6 +185,13 @@ impl VpnHandler {
         // Read rate limit values before moving config into the struct
         let max_connections_per_ip = config.rate_limit.max_connections_per_ip;
         let max_handshakes_per_minute = config.rate_limit.max_handshakes_per_minute;
+        let admission = crate::admission::Admission::new(
+            config.admission.enabled,
+            parse_admission_mode(&config.admission.mode),
+            config.admission.allow_file.clone(),
+            config.admission.pending_file.clone(),
+            config.admission.audit_file.clone(),
+        );
 
         Ok(Self {
             config,
@@ -183,6 +203,7 @@ impl VpnHandler {
                 std::collections::HashMap::new(),
             )),
             x3dh_responder,
+            admission,
         })
     }
 
@@ -243,75 +264,99 @@ impl VpnHandler {
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
         // 1. Perform X3DH handshake
-        let mut ratchet = match self
+        let hs = match self
             .perform_handshake(&mut ws_write, &mut ws_read, peer_addr)
             .await?
         {
             Some(r) => r,
             None => return Ok(()), // Handshake failed or rejected
         };
+        let HandshakeResult {
+            mut ratchet,
+            identity_key,
+            mut revocation_rx,
+        } = hs;
 
-        // 2. Read first encrypted frame (contains target address)
-        let target_addr = match self.read_target_address(&mut ws_read, &mut ratchet).await? {
-            Some(addr) => addr,
-            None => {
-                debug!("No target address received from {}", peer_addr);
-                return Ok(());
+        // The session body, revocation-aware: when a reload revokes this
+        // client key the receiver fires and the session is dropped (#32).
+        let session = async {
+            // 2. Read first encrypted frame (contains target address)
+            let target_addr = match self.read_target_address(&mut ws_read, &mut ratchet).await? {
+                Some(addr) => addr,
+                None => {
+                    debug!("No target address received from {}", peer_addr);
+                    return Ok(());
+                }
+            };
+
+            debug!(
+                "Connecting to target {}:{} ({:?}) for {}",
+                target_addr.host, target_addr.port, target_addr.protocol, peer_addr
+            );
+
+            // 3. Connect to target based on protocol
+            match target_addr.protocol {
+                ProtocolType::Tcp => {
+                    let target = match self.connect_to_target(&target_addr).await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            debug!(
+                                "Failed to connect to {}:{}: {}",
+                                target_addr.host, target_addr.port, e
+                            );
+                            return Ok(());
+                        }
+                    };
+
+                    debug!(
+                        "Connected to {}:{} for {}",
+                        target_addr.host, target_addr.port, peer_addr
+                    );
+
+                    // 4. Relay bidirectionally for TCP
+                    match self
+                        .relay_tcp(
+                            ws_write,
+                            ws_read,
+                            target,
+                            ratchet,
+                            Self::LEGACY_TCP_IDLE_TIMEOUT,
+                        )
+                        .await
+                    {
+                        Ok(_) => debug!("Relay completed for {}", peer_addr),
+                        Err(e) => debug!("Relay ended for {}: {}", peer_addr, e),
+                    }
+                }
+                ProtocolType::Udp => {
+                    // For UDP, use UDP relay
+                    match self
+                        .relay_udp(ws_write, ws_read, &target_addr, ratchet)
+                        .await
+                    {
+                        Ok(_) => debug!("UDP Relay completed for {}", peer_addr),
+                        Err(e) => debug!("UDP Relay ended for {}: {}", peer_addr, e),
+                    }
+                }
             }
+
+            Ok(())
         };
 
-        debug!(
-            "Connecting to target {}:{} ({:?}) for {}",
-            target_addr.host, target_addr.port, target_addr.protocol, peer_addr
-        );
-
-        // 3. Connect to target based on protocol
-        match target_addr.protocol {
-            ProtocolType::Tcp => {
-                let target = match self.connect_to_target(&target_addr).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        debug!(
-                            "Failed to connect to {}:{}: {}",
-                            target_addr.host, target_addr.port, e
-                        );
-                        return Ok(());
+        let outcome: Result<()> = match revocation_rx.as_mut() {
+            Some(rx) => {
+                tokio::select! {
+                    _ = rx => {
+                        debug!("session dropped: client key revoked (admission) for {}", peer_addr);
+                        Ok(())
                     }
-                };
-
-                debug!(
-                    "Connected to {}:{} for {}",
-                    target_addr.host, target_addr.port, peer_addr
-                );
-
-                // 4. Relay bidirectionally for TCP
-                match self
-                    .relay_tcp(
-                        ws_write,
-                        ws_read,
-                        target,
-                        ratchet,
-                        Self::LEGACY_TCP_IDLE_TIMEOUT,
-                    )
-                    .await
-                {
-                    Ok(_) => debug!("Relay completed for {}", peer_addr),
-                    Err(e) => debug!("Relay ended for {}: {}", peer_addr, e),
+                    res = session => res,
                 }
             }
-            ProtocolType::Udp => {
-                // For UDP, use UDP relay
-                match self
-                    .relay_udp(ws_write, ws_read, &target_addr, ratchet)
-                    .await
-                {
-                    Ok(_) => debug!("UDP Relay completed for {}", peer_addr),
-                    Err(e) => debug!("UDP Relay ended for {}: {}", peer_addr, e),
-                }
-            }
-        }
-
-        Ok(())
+            None => session.await,
+        };
+        self.admission.unregister(&identity_key).await;
+        outcome
     }
 
     /// Perform X3DH handshake with client
@@ -320,7 +365,7 @@ impl VpnHandler {
         ws_write: &mut W,
         ws_read: &mut R,
         peer_addr: SocketAddr,
-    ) -> Result<Option<DoubleRatchet>>
+    ) -> Result<Option<HandshakeResult>>
     where
         W: SinkExt<Message, Error = E> + Unpin,
         R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
@@ -466,13 +511,29 @@ impl VpnHandler {
                     capabilities.unwrap_or(0),
                 ) {
                     Ok(pair) => pair,
-                        Err(e) => {
-                            debug!("X3DH agreement failed from {}: {}", peer_addr, e);
-                            return Ok(None);
-                        }
-                    };
+                    Err(e) => {
+                        debug!("X3DH agreement failed from {}: {}", peer_addr, e);
+                        return Ok(None);
+                    }
+                };
 
                 debug!("X3DH handshake successful from {}", peer_addr);
+
+                // Client admission: checked only AFTER the X3DH agreement
+                // succeeded, so only a client that holds its identity key is
+                // answered. Unknown and revoked keys get ONE identical refusal
+                // (#32): an outsider learns nothing about which keys exist.
+                let (decision, revocation_rx) = self.admission.check(&client_identity).await;
+                if decision == AdmissionDecision::Refuse {
+                    let refusal = HandshakeMessage::Error {
+                        code: ADMISSION_REFUSAL_CODE,
+                        message: ADMISSION_REFUSAL_MESSAGE.to_string(),
+                    };
+                    let _ = ws_write
+                        .send(Message::Binary(serde_json::to_vec(&refusal)?))
+                        .await;
+                    return Ok(None);
+                }
 
                 // Initialize Double Ratchet as Bob (responder)
                 let ratchet = DoubleRatchet::init_bob(shared_secret, ratchet_version);
@@ -490,7 +551,11 @@ impl VpnHandler {
 
                 debug!("X3DH handshake completed with {}", peer_addr);
 
-                Ok(Some(ratchet))
+                Ok(Some(HandshakeResult {
+                    ratchet,
+                    identity_key: client_identity,
+                    revocation_rx,
+                }))
             }
             _ => {
                 debug!(
@@ -1280,16 +1345,26 @@ pub struct MultiplexerHandler {
     config: ServerConfig,
     x3dh_responder: Option<Arc<X3DHResponder>>,
     dns_cache: DnsCache,
+    admission: crate::admission::Admission,
 }
 
 impl MultiplexerHandler {
     pub fn new(config: ServerConfig) -> Result<Self> {
         let x3dh_responder = Some(Arc::new(crate::private_files::load_responder(&config)?));
 
+        let admission = crate::admission::Admission::new(
+            config.admission.enabled,
+            parse_admission_mode(&config.admission.mode),
+            config.admission.allow_file.clone(),
+            config.admission.pending_file.clone(),
+            config.admission.audit_file.clone(),
+        );
+
         Ok(Self {
             config,
             x3dh_responder,
             dns_cache: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            admission,
         })
     }
 
@@ -1314,6 +1389,7 @@ impl MultiplexerHandler {
             peer_addr,
             tun_server,
             tun_config,
+            self.admission.clone(),
         );
 
         session.run().await
@@ -1477,6 +1553,10 @@ pub struct MultiplexerSession<S> {
     /// previous tunnel IP (its utun interface keeps that address across a
     /// lightweight reconnect).
     client_identity: Option<[u8; 32]>,
+    /// Client admission controller (#32).
+    admission: crate::admission::Admission,
+    /// Fires when a later allow-list reload revokes this client's key.
+    revocation_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl<S> MultiplexerSession<S>
@@ -1490,6 +1570,7 @@ where
         peer_addr: SocketAddr,
         tun_server: Option<Arc<dyn TunWriter>>,
         tun_config: TunNetworkConfig,
+        admission: crate::admission::Admission,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2000);
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(CONTROL_CHANNEL_CAP);
@@ -1512,6 +1593,8 @@ where
             tun_config,
             tcp_pool: Arc::new(Mutex::new(HashMap::new())),
             client_identity: None,
+            admission,
+            revocation_rx: None,
         }
     }
 
@@ -1922,6 +2005,17 @@ where
             }
         };
 
+        // Revocation watcher (#32): fires when a reload revokes this key.
+        let revocation_rx = self.revocation_rx.take();
+        let revocation = async move {
+            match revocation_rx {
+                Some(mut rx) => {
+                    let _ = (&mut rx).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         // Run all tasks concurrently
         tokio::select! {
             _ = ws_sender => {
@@ -1938,6 +2032,12 @@ where
             }
             _ = ping_task => {
                 debug!("Ping task ended for {}", peer_addr);
+            }
+            _ = revocation => {
+                debug!(
+                    "Session dropped: client key revoked (admission) for {}",
+                    peer_addr
+                );
             }
         }
 
@@ -1957,6 +2057,11 @@ where
 
         // Clean up connection pool
         self.tcp_pool.lock().await.clear();
+
+        // Drop the admission session registration (#32).
+        if let Some(id) = self.client_identity {
+            self.admission.unregister(&id).await;
+        }
 
         // Unregister client from TUN server. The lease itself is kept
         // (sticky per client identity) so a fast reconnect reclaims the same
@@ -2973,13 +3078,31 @@ where
                     capabilities.unwrap_or(0),
                 ) {
                     Ok(pair) => pair,
-                        Err(e) => {
-                            debug!("X3DH agreement failed from {}: {}", self.peer_addr, e);
-                            return Ok(None);
-                        }
-                    };
+                    Err(e) => {
+                        debug!("X3DH agreement failed from {}: {}", self.peer_addr, e);
+                        return Ok(None);
+                    }
+                };
 
                 debug!("X3DH handshake successful from {}", self.peer_addr);
+
+                // Client admission: checked only AFTER the X3DH agreement
+                // succeeded, so only a client that holds its identity key is
+                // answered. Unknown and revoked keys get ONE identical refusal
+                // (#32): an outsider learns nothing about which keys exist.
+                let (decision, revocation_rx) = self.admission.check(&client_identity).await;
+                if decision == AdmissionDecision::Refuse {
+                    let refusal = HandshakeMessage::Error {
+                        code: ADMISSION_REFUSAL_CODE,
+                        message: ADMISSION_REFUSAL_MESSAGE.to_string(),
+                    };
+                    let _ = self
+                        .ws
+                        .send(Message::Binary(serde_json::to_vec(&refusal)?))
+                        .await;
+                    return Ok(None);
+                }
+                self.revocation_rx = revocation_rx;
 
                 // Initialize Double Ratchet as Bob (responder)
                 debug!("Initializing DoubleRatchet as Bob for {}", self.peer_addr);
@@ -3831,11 +3954,20 @@ use rvpn_core::protocol::message::{DnsQuery as ProtoDnsQuery, DnsResponse as Pro
 pub struct DnsHandler {
     x3dh_responder: Option<X3DHResponder>,
     rate_limiter: RwLock<RateLimiter>,
+    admission: crate::admission::Admission,
 }
 
 impl DnsHandler {
     pub fn new(config: ServerConfig) -> Result<Self> {
         let x3dh_responder = Some(crate::private_files::load_responder(&config)?);
+
+        let admission = crate::admission::Admission::new(
+            config.admission.enabled,
+            parse_admission_mode(&config.admission.mode),
+            config.admission.allow_file.clone(),
+            config.admission.pending_file.clone(),
+            config.admission.audit_file.clone(),
+        );
 
         Ok(Self {
             x3dh_responder,
@@ -3843,6 +3975,7 @@ impl DnsHandler {
                 config.rate_limit.max_connections_per_ip,
                 config.rate_limit.max_handshakes_per_minute,
             )),
+            admission,
         })
     }
 
@@ -3868,173 +4001,200 @@ impl DnsHandler {
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
         // Perform X3DH handshake (same as VpnHandler)
-        let ratchet = match self
+        let hs = match self
             .perform_handshake(&mut ws_write, &mut ws_read, peer_addr)
             .await?
         {
             Some(r) => r,
             None => return Ok(()),
         };
+        let HandshakeResult {
+            ratchet,
+            identity_key,
+            mut revocation_rx,
+        } = hs;
 
         debug!("DNS handler: handshake complete for {}", peer_addr);
 
-        // DNS query/response loop.
-        //
-        // Queries are resolved CONCURRENTLY. The previous implementation
-        // resolved inline in the read loop: one stalled system-DNS lookup
-        // (no timeout was possible to hang indefinitely) head-of-line blocked
-        // every other query on the connection, and from the client's side the
-        // server simply stopped answering — a silent DNS blackhole until the
-        // client's 60s watchdog forced a reconnect. Now:
-        //   - decryption stays sequential on the read side (ratchet order);
-        //   - each query resolves in its own task bounded by a 5s timeout;
-        //   - encryption is serialized through a mutex (ratchet send chain);
-        //   - outbound frames funnel through a single writer task;
-        //   - in-flight tasks are capped by a semaphore (flood protection).
-        const MAX_IN_FLIGHT_DNS_QUERIES: usize = 64;
-        let ratchet = Arc::new(Mutex::new(ratchet));
-        let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_DNS_QUERIES));
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(256);
+        // The DNS loop runs revocation-aware: a reload that revokes this key
+        // drops the session (#32), the same as the VpnHandler path.
+        let session = async {
+            // DNS query/response loop.
+            //
+            // Queries are resolved CONCURRENTLY. The previous implementation
+            // resolved inline in the read loop: one stalled system-DNS lookup
+            // (no timeout was possible to hang indefinitely) head-of-line blocked
+            // every other query on the connection, and from the client's side the
+            // server simply stopped answering — a silent DNS blackhole until the
+            // client's 60s watchdog forced a reconnect. Now:
+            //   - decryption stays sequential on the read side (ratchet order);
+            //   - each query resolves in its own task bounded by a 5s timeout;
+            //   - encryption is serialized through a mutex (ratchet send chain);
+            //   - outbound frames funnel through a single writer task;
+            //   - in-flight tasks are capped by a semaphore (flood protection).
+            const MAX_IN_FLIGHT_DNS_QUERIES: usize = 64;
+            let ratchet = Arc::new(Mutex::new(ratchet));
+            let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_DNS_QUERIES));
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(256);
 
-        // Serialize encrypt→enqueue across the per-query tasks: the ratchet
-        // assigns message numbers at encrypt time, so wire order MUST match
-        // encrypt order — a response encrypted later that overtakes an
-        // earlier one into `out_tx` is dropped by the client's ratchet
-        // ("Message too old"), which then stalls until its 10s pending-query
-        // watchdog tears down the connection.
-        let send_lock = Arc::new(Mutex::new(()));
+            // Serialize encrypt→enqueue across the per-query tasks: the ratchet
+            // assigns message numbers at encrypt time, so wire order MUST match
+            // encrypt order — a response encrypted later that overtakes an
+            // earlier one into `out_tx` is dropped by the client's ratchet
+            // ("Message too old"), which then stalls until its 10s pending-query
+            // watchdog tears down the connection.
+            let send_lock = Arc::new(Mutex::new(()));
 
-        let writer_task = tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                if let Err(e) = ws_write.send(msg).await {
-                    debug!("DNS handler: writer send error: {}", e);
-                    break;
-                }
-            }
-        });
-
-        while let Some(msg) = ws_read.next().await {
-            match msg {
-                Ok(Message::Binary(data)) => {
-                    // Decrypt the DNS query
-                    let ratchet_msg =
-                        match rvpn_core::crypto::ratchet::RatchetMessage::from_bytes(&data) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                warn!("DNS handler: failed to parse ratchet message: {}", e);
-                                continue;
-                            }
-                        };
-
-                    let plaintext = {
-                        let mut guard = ratchet.lock().await;
-                        match guard.decrypt(&ratchet_msg, &[0x08]) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                warn!("DNS handler: decryption failed: {}", e);
-                                continue;
-                            }
-                        }
-                    };
-
-                    let query: ProtoDnsQuery = match serde_json::from_slice(&plaintext) {
-                        Ok(q) => q,
-                        Err(e) => {
-                            warn!("DNS handler: failed to parse DnsQuery: {}", e);
-                            continue;
-                        }
-                    };
-
-                    debug!(
-                        "DNS query from {}: {} (type={})",
-                        peer_addr, query.domain, query.query_type
-                    );
-
-                    // Bound concurrency; if saturated, answer with a fast
-                    // failure rather than dropping the query silently — a
-                    // dropped query sits in the client's pending map until
-                    // its watchdog tears down the whole connection.
-                    let permit = in_flight.clone().try_acquire_owned().ok();
-                    if permit.is_none() {
-                        debug!(
-                            "DNS handler: too many in-flight queries, failing fast: {}",
-                            query.domain
-                        );
-                    }
-
-                    let ratchet_clone = Arc::clone(&ratchet);
-                    let out_tx_clone = out_tx.clone();
-                    let send_lock_clone = Arc::clone(&send_lock);
-                    tokio::spawn(async move {
-                        let permit = permit; // held until the response is sent
-
-                        let response = if permit.is_some() {
-                            match timeout(Duration::from_secs(5), Self::resolve_domain(&query))
-                                .await
-                            {
-                                Ok(r) => r,
-                                Err(_) => {
-                                    debug!("DNS handler: resolution timeout for {}", query.domain);
-                                    ProtoDnsResponse {
-                                        query_id: query.query_id,
-                                        success: false,
-                                        ipv4_addrs: vec![],
-                                        ipv6_addrs: vec![],
-                                        ttl: 0,
-                                        error: Some("resolution timeout".to_string()),
-                                    }
-                                }
-                            }
-                        } else {
-                            ProtoDnsResponse {
-                                query_id: query.query_id,
-                                success: false,
-                                ipv4_addrs: vec![],
-                                ipv6_addrs: vec![],
-                                ttl: 0,
-                                error: Some("server busy".to_string()),
-                            }
-                        };
-
-                        // Encrypt and send response
-                        let response_bytes = match serde_json::to_vec(&response) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                error!("DNS handler: failed to serialize response: {}", e);
-                                return;
-                            }
-                        };
-
-                        if let Err(e) = Self::send_encrypted_response(
-                            &ratchet_clone,
-                            &send_lock_clone,
-                            &out_tx_clone,
-                            &response_bytes,
-                        )
-                        .await
-                        {
-                            debug!(
-                                "DNS handler: failed to send response for {}: {}",
-                                query.domain, e
-                            );
-                        }
-                    });
-                }
-                Ok(Message::Ping(payload)) => {
-                    // Explicit pong so an idle connection still answers client
-                    // keepalives even when no DNS responses are flowing.
-                    if out_tx.send(Message::Pong(payload)).await.is_err() {
+            let writer_task = tokio::spawn(async move {
+                while let Some(msg) = out_rx.recv().await {
+                    if let Err(e) = ws_write.send(msg).await {
+                        debug!("DNS handler: writer send error: {}", e);
                         break;
                     }
                 }
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => {}
-            }
-        }
+            });
 
-        writer_task.abort();
-        debug!("DNS handler: connection closed for {}", peer_addr);
-        Ok(())
+            while let Some(msg) = ws_read.next().await {
+                match msg {
+                    Ok(Message::Binary(data)) => {
+                        // Decrypt the DNS query
+                        let ratchet_msg =
+                            match rvpn_core::crypto::ratchet::RatchetMessage::from_bytes(&data) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    warn!("DNS handler: failed to parse ratchet message: {}", e);
+                                    continue;
+                                }
+                            };
+
+                        let plaintext = {
+                            let mut guard = ratchet.lock().await;
+                            match guard.decrypt(&ratchet_msg, &[0x08]) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    warn!("DNS handler: decryption failed: {}", e);
+                                    continue;
+                                }
+                            }
+                        };
+
+                        let query: ProtoDnsQuery = match serde_json::from_slice(&plaintext) {
+                            Ok(q) => q,
+                            Err(e) => {
+                                warn!("DNS handler: failed to parse DnsQuery: {}", e);
+                                continue;
+                            }
+                        };
+
+                        debug!(
+                            "DNS query from {}: {} (type={})",
+                            peer_addr, query.domain, query.query_type
+                        );
+
+                        // Bound concurrency; if saturated, answer with a fast
+                        // failure rather than dropping the query silently — a
+                        // dropped query sits in the client's pending map until
+                        // its watchdog tears down the whole connection.
+                        let permit = in_flight.clone().try_acquire_owned().ok();
+                        if permit.is_none() {
+                            debug!(
+                                "DNS handler: too many in-flight queries, failing fast: {}",
+                                query.domain
+                            );
+                        }
+
+                        let ratchet_clone = Arc::clone(&ratchet);
+                        let out_tx_clone = out_tx.clone();
+                        let send_lock_clone = Arc::clone(&send_lock);
+                        tokio::spawn(async move {
+                            let permit = permit; // held until the response is sent
+
+                            let response = if permit.is_some() {
+                                match timeout(Duration::from_secs(5), Self::resolve_domain(&query))
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(_) => {
+                                        debug!(
+                                            "DNS handler: resolution timeout for {}",
+                                            query.domain
+                                        );
+                                        ProtoDnsResponse {
+                                            query_id: query.query_id,
+                                            success: false,
+                                            ipv4_addrs: vec![],
+                                            ipv6_addrs: vec![],
+                                            ttl: 0,
+                                            error: Some("resolution timeout".to_string()),
+                                        }
+                                    }
+                                }
+                            } else {
+                                ProtoDnsResponse {
+                                    query_id: query.query_id,
+                                    success: false,
+                                    ipv4_addrs: vec![],
+                                    ipv6_addrs: vec![],
+                                    ttl: 0,
+                                    error: Some("server busy".to_string()),
+                                }
+                            };
+
+                            // Encrypt and send response
+                            let response_bytes = match serde_json::to_vec(&response) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    error!("DNS handler: failed to serialize response: {}", e);
+                                    return;
+                                }
+                            };
+
+                            if let Err(e) = Self::send_encrypted_response(
+                                &ratchet_clone,
+                                &send_lock_clone,
+                                &out_tx_clone,
+                                &response_bytes,
+                            )
+                            .await
+                            {
+                                debug!(
+                                    "DNS handler: failed to send response for {}: {}",
+                                    query.domain, e
+                                );
+                            }
+                        });
+                    }
+                    Ok(Message::Ping(payload)) => {
+                        // Explicit pong so an idle connection still answers client
+                        // keepalives even when no DNS responses are flowing.
+                        if out_tx.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+
+            writer_task.abort();
+            debug!("DNS handler: connection closed for {}", peer_addr);
+            Ok(())
+        };
+
+        let outcome: Result<()> = match revocation_rx.as_mut() {
+            Some(rx) => {
+                tokio::select! {
+                    _ = rx => {
+                        debug!("DNS handler: session dropped: client key revoked (admission) for {}", peer_addr);
+                        Ok(())
+                    }
+                    res = session => res,
+                }
+            }
+            None => session.await,
+        };
+        self.admission.unregister(&identity_key).await;
+        outcome
     }
 
     /// Encrypt a DNS response and enqueue it on the outbound writer channel.
@@ -4132,7 +4292,7 @@ impl DnsHandler {
         ws_write: &mut W,
         ws_read: &mut R,
         peer_addr: SocketAddr,
-    ) -> Result<Option<DoubleRatchet>>
+    ) -> Result<Option<HandshakeResult>>
     where
         W: SinkExt<Message, Error = E> + Unpin,
         R: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
@@ -4228,14 +4388,30 @@ impl DnsHandler {
                     capabilities.unwrap_or(0),
                 ) {
                     Ok(pair) => pair,
-                        Err(e) => {
-                            debug!(
-                                "DNS handler: X3DH agreement failed for {}: {}",
-                                peer_addr, e
-                            );
-                            return Ok(None);
-                        }
+                    Err(e) => {
+                        debug!(
+                            "DNS handler: X3DH agreement failed for {}: {}",
+                            peer_addr, e
+                        );
+                        return Ok(None);
+                    }
+                };
+
+                // Client admission: checked only AFTER the X3DH agreement
+                // succeeded, so only a client that holds its identity key is
+                // answered. Unknown and revoked keys get ONE identical refusal
+                // (#32): an outsider learns nothing about which keys exist.
+                let (decision, revocation_rx) = self.admission.check(&client_identity).await;
+                if decision == AdmissionDecision::Refuse {
+                    let refusal = HandshakeMessage::Error {
+                        code: ADMISSION_REFUSAL_CODE,
+                        message: ADMISSION_REFUSAL_MESSAGE.to_string(),
                     };
+                    let _ = ws_write
+                        .send(Message::Binary(serde_json::to_vec(&refusal)?))
+                        .await;
+                    return Ok(None);
+                }
 
                 let ratchet = DoubleRatchet::init_bob(shared_secret, ratchet_version);
 
@@ -4253,7 +4429,11 @@ impl DnsHandler {
                     })?;
 
                 debug!("DNS handler: X3DH handshake complete for {}", peer_addr);
-                Ok(Some(ratchet))
+                Ok(Some(HandshakeResult {
+                    ratchet,
+                    identity_key: client_identity,
+                    revocation_rx,
+                }))
             }
             _ => {
                 debug!("DNS handler: unexpected message type from {}", peer_addr);
