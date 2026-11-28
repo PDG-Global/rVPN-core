@@ -2507,6 +2507,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "socket2 0.5.10",
  "subtle",
  "tempfile",
@@ -2521,6 +2522,7 @@ dependencies = [
  "tun-rs",
  "tungstenite",
  "uuid",
+ "windows",
  "x25519-dalek",
 ]
 
@@ -2641,6 +2643,18 @@ dependencies = [
  "tun-rs",
  "uuid",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "rvpn-service"
+version = "1.3.9"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

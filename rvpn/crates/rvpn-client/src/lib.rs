@@ -33,6 +33,8 @@ pub mod tunnel;
 pub mod websocket;
 #[cfg(not(target_os = "android"))]
 pub mod proxy_common;
+#[cfg(windows)]
+pub mod windows;
 #[cfg(not(target_os = "android"))]
 pub mod http_proxy;
 #[cfg(not(target_os = "android"))]

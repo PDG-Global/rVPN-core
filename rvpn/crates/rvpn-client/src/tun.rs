@@ -50,6 +50,11 @@ impl TunDevice {
             // Use specified interface name
             info!("Creating TUN device '{}' with IP {}", name, ip_cidr);
             {
+                // Windows: resolve + verify wintun.dll first; the guard holds
+                // the deny-write handle and the loaded module until after
+                // build_sync, which is when tun-rs opens the DLL itself.
+                #[cfg(windows)]
+                let wintun = crate::windows::wintun::resolve_and_verify()?;
                 let builder = tun_rs::DeviceBuilder::new()
                     .name(name)
                     .mtu(config.mtu)
@@ -57,20 +62,28 @@ impl TunDevice {
                     .ipv4(ip_addr, prefix_len, None);
                 #[cfg(not(windows))]
                 let builder = builder.packet_information(false);
-                builder.build_sync()
+                #[cfg(windows)]
+                let builder = builder.wintun_file(wintun.path().to_string_lossy().into_owned());
+                builder
+                    .build_sync()
                     .with_context(|| format!("Failed to create TUN device '{}'", name))?
             }
         } else {
             // Auto-assign interface name
             info!("Creating TUN device with auto-assigned name");
             {
+                #[cfg(windows)]
+                let wintun = crate::windows::wintun::resolve_and_verify()?;
                 let builder = tun_rs::DeviceBuilder::new()
                     .mtu(config.mtu)
                     .layer(tun_rs::Layer::L3)
                     .ipv4(ip_addr, prefix_len, None);
                 #[cfg(not(windows))]
                 let builder = builder.packet_information(false);
-                builder.build_sync()
+                #[cfg(windows)]
+                let builder = builder.wintun_file(wintun.path().to_string_lossy().into_owned());
+                builder
+                    .build_sync()
                     .with_context(|| "Failed to create TUN device (auto-name)")?
             }
         };
@@ -101,6 +114,30 @@ impl TunDevice {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No IP address configured and no server-assigned IP provided. Use create_with_ip() with server-assigned IP."))?;
         Self::create_with_ip(config, ip_cidr)
+    }
+
+    /// Windows: interface index of the wintun adapter (for routes/DNS setup).
+    #[cfg(windows)]
+    pub fn adapter_index(&self) -> Result<u32> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TUN device not initialized"))?;
+        device
+            .if_index()
+            .map_err(|e| anyhow::anyhow!("Failed to get adapter index: {}", e))
+    }
+
+    /// Windows: name of the wintun adapter (for DNS setup via netsh).
+    #[cfg(windows)]
+    pub fn adapter_name(&self) -> Result<String> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TUN device not initialized"))?;
+        device
+            .name()
+            .map_err(|e| anyhow::anyhow!("Failed to get adapter name: {}", e))
     }
 
     /// Run the TUN device with graceful shutdown support.

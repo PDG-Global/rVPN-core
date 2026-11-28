@@ -79,6 +79,7 @@ uuid.workspace = true
 base64.workspace = true
 hex.workspace = true
 sha1.workspace = true
+sha2.workspace = true
 rand.workspace = true
 futures-util.workspace = true
 lazy_static.workspace = true
@@ -103,6 +104,25 @@ security-framework = "2"
 [target.'cfg(not(target_os = "android"))'.dependencies]
 boring.workspace = true
 tokio-boring.workspace = true
+
+# Windows FFI for the wintun.dll Authenticode check (WinVerifyTrust + crypt32).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Rpc",
+    "Win32_UI_Shell",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

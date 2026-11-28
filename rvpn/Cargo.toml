@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rvpn-core", "crates/rvpn-tls", "crates/rvpn-split-tunnel", "crates/rvpn-client", "crates/rvpn-server", "crates/rvpn-mobile"]
+members = ["crates/rvpn-core", "crates/rvpn-tls", "crates/rvpn-split-tunnel", "crates/rvpn-client", "crates/rvpn-server", "crates/rvpn-mobile", "crates/rvpn-service"]
 # rvpn-mobile only compiles with a platform feature (`ios-direct-tun`,
 # `macos-direct-tun`, or `android-direct-tun`); leave it out of the default
 # set so bare `cargo build` at the workspace root skips it. The platform

@@ -31,6 +31,8 @@ mod tun;
 mod tunnel;
 mod tunnel_pool;
 mod websocket;
+#[cfg(windows)]
+mod windows;
 
 // Use mimalloc as the global allocator: glibc malloc arenas retain memory
 // indefinitely under this client's allocation churn (a long-running Linux
@@ -47,6 +49,17 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 const INITIAL_RECONNECT_DELAY_MS: u64 = 1000;
 /// Maximum delay between reconnection attempts (ms)
 const MAX_RECONNECT_DELAY_MS: u64 = 30000;
+
+/// Retry delay for reconnect attempt `attempt` (1-based): capped
+/// exponential backoff (1s, 2s, 4s, ... capped at MAX_RECONNECT_DELAY_MS)
+/// with ±20% jitter — the same backoff/jitter pattern tunnel_pool uses —
+/// so deterministic failures never hot-loop and concurrent clients do not
+/// resynchronize their retries.
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    let base_ms = (INITIAL_RECONNECT_DELAY_MS << shift).min(MAX_RECONNECT_DELAY_MS);
+    std::time::Duration::from_millis(tunnel_pool::jittered(base_ms as f64, 0.2) as u64)
+}
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -464,6 +477,55 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
     // Parse server URL
     let (host, port, path) = parse_server_url(&config.server_address);
 
+    // Windows: first undo any leftover route/DNS state from a crashed run,
+    // then resolve the server IP while the network is still untouched so the
+    // covering routes can pin a host route to it. The state file lives under
+    // %ProgramData%\rvpn (created with a SYSTEM+Administrators-only ACL, so
+    // the elevated restore can trust it). The pre-hardening location in the
+    // user-writable data dir must NOT be parsed: a user could plant a crafted
+    // file there and the elevated restore would act on it. Delete it
+    // unopened; live changes it may describe are torn down by the admin
+    // cleanup procedure instead.
+    #[cfg(windows)]
+    let route_state_path = crate::windows::routes::state_path()
+        .context("Failed to prepare the route state directory")?;
+    #[cfg(windows)]
+    crate::windows::routes::restore_from_state_file(&route_state_path);
+    #[cfg(windows)]
+    {
+        let legacy = config.data_dir.join("route_state.json");
+        if legacy.exists() {
+            warn!(
+                "ignoring legacy route state file at {} (user-writable location); deleting it without trusting its contents",
+                legacy.display()
+            );
+            let _ = std::fs::remove_file(&legacy);
+        }
+    }
+    #[cfg(windows)]
+    let server_ip = {
+        use std::net::ToSocketAddrs;
+        let mut addrs = format!("{}:{}", host, port)
+            .to_socket_addrs()
+            .with_context(|| format!("Failed to resolve VPN server '{}'", host))?;
+        // The host route pin is IPv4-only for now, so prefer an IPv4
+        // address (localhost may resolve to ::1 first).
+        addrs
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| anyhow::anyhow!("DNS returned no IPv4 address for '{}'", host))?
+            .ip()
+    };
+
+    // Windows: verify wintun.dll once, before the reconnect loop. The hash
+    // pin, Authenticode signature and directory-trust checks are
+    // deterministic: retrying them through the loop below could never
+    // succeed and would only hot-loop on a permanent configuration error.
+    // The returned guard pins the verified bytes (deny-write handle plus
+    // loaded module) for the whole TUN-mode run; per-attempt device
+    // creation re-verifies cheaply against the same pinned bytes.
+    #[cfg(windows)]
+    let _wintun = crate::windows::wintun::resolve_and_verify()?;
+
     // Initialize stats manager for historical tracking
     metrics::init_global_metrics();
     let stats_manager = stats::init_global_stats_manager_with_dir(config.data_dir.clone()).await;
@@ -530,12 +592,9 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
                     error!("Max connection attempts ({}) reached, giving up", MAX_RECONNECT_ATTEMPTS);
                     return Err(anyhow::anyhow!("Failed to connect after {} attempts: {}", MAX_RECONNECT_ATTEMPTS, e));
                 }
-                let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
-                    MAX_RECONNECT_DELAY_MS,
-                );
-                warn!("Retrying in {} ms (attempt {}/{})", delay_ms, reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                let delay = retry_delay(reconnect_attempts);
+                warn!("Retrying in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
@@ -554,6 +613,9 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
             None => {
                 error!("No IP address assigned by server - TUN mode requires server-assigned IP");
                 reconnect_attempts += 1;
+                let delay = retry_delay(reconnect_attempts);
+                warn!("Retrying in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
@@ -571,23 +633,124 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
         {
             Ok(d) => d,
             Err(e) => {
-                error!("Failed to create TUN device: {}", e);
+                error!("Failed to create TUN device: {:#}", e);
                 reconnect_attempts += 1;
-                let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
-                    MAX_RECONNECT_DELAY_MS,
-                );
-                warn!("Retrying TUN device creation in {} ms", delay_ms);
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                let delay = retry_delay(reconnect_attempts);
+                warn!("Retrying TUN device creation in {} ms", delay.as_millis());
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
 
         info!("TUN device ready");
 
+        // Windows: tun-rs assigns the tunnel address via netsh, and netsh
+        // returns before the unicast row is reliably queryable — checks
+        // right after adapter creation can see ERROR_FILE_NOT_FOUND, and
+        // each retry creates a NEW adapter that restarts the delay, so it
+        // must be waited out on THIS adapter. The row can then still be
+        // DAD-Tentative, which breaks source address selection (route
+        // lookups error with ERROR_NETWORK_UNREACHABLE); DAD is meaningless
+        // on a point-to-point tunnel interface, so force the address to
+        // Preferred before route setup. Both failures retry like a
+        // route-setup failure; a DAD Duplicate report is a real address
+        // conflict and fails the attempt.
+        #[cfg(windows)]
+        {
+            if let Some(assigned_ip) = virtual_ip {
+                let if_index = tun_device.adapter_index()?;
+                if let Err(e) = crate::windows::routes::wait_for_unicast_address(
+                    if_index,
+                    assigned_ip,
+                    std::time::Duration::from_secs(10),
+                ) {
+                    error!("Tunnel address did not materialize: {:#}", e);
+                    reconnect_attempts += 1;
+                    let delay = retry_delay(reconnect_attempts);
+                    warn!("Retrying in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                if let Err(e) = crate::windows::routes::force_dad_preferred(if_index, assigned_ip) {
+                    error!("Failed to finalize tunnel address DAD state: {:#}", e);
+                    reconnect_attempts += 1;
+                    let delay = retry_delay(reconnect_attempts);
+                    warn!("Retrying in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+        }
+
+        // Windows: pin the server host route, cover IPv4 (two /1s) and IPv6
+        // (::/1 + 8000::/1) via the adapter, and set adapter DNS with a
+        // winning interface metric. Every change is persisted to the state
+        // file before it is applied; when this guard drops (disconnect,
+        // reconnect, shutdown) everything is restored.
+        #[cfg(windows)]
+        let _route_guard = {
+            let dns_servers: Vec<std::net::IpAddr> = tun_config
+                .dns_servers
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if dns_servers.is_empty() {
+                warn!("no usable DNS servers in [tun] config; adapter DNS left unchanged");
+            }
+            let route_cfg = crate::windows::routes::RouteConfig {
+                server_ip,
+                adapter_name: tun_device.adapter_name()?,
+                adapter_index: tun_device.adapter_index()?,
+                dns_servers,
+            };
+            match crate::windows::routes::apply(route_cfg, &route_state_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    error!("Failed to set up tunnel routes: {:#}", e);
+                    reconnect_attempts += 1;
+                    let delay = retry_delay(reconnect_attempts);
+                    warn!("Retrying route setup in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+        };
+
+        // IPv6 fail-closed: the covering ::/1 + 8000::/1 routes blackhole v6
+        // into the tunnel, but the server has no v6 lease, so it is dropped
+        // there (fail-closed, but slow timeouts). WFP block filters make
+        // apps fail fast instead. Filters are non-persistent: they vanish
+        // when this process exits or crashes. The covering routes are the
+        // leak protection; if the WFP add fails, v6 is still blackholed.
+        #[cfg(windows)]
+        let _v6_block_guard = match crate::windows::wfp::block_ipv6() {
+            Ok(g) => {
+                info!("IPv6 blocked while connected (server has no IPv6 lease)");
+                Some(g)
+            }
+            Err(e) => {
+                warn!("WFP IPv6 block failed ({:#}); v6 still blackholed by covering routes", e);
+                None
+            }
+        };
+
         // Run TUN device until tunnel disconnects OR shutdown signal received
         // Use tokio::select! to wait on both simultaneously
         let (local_shutdown_tx, local_shutdown_rx) = tokio::sync::watch::channel(false);
+        // Windows: connection watchdog. While connected it re-verifies every
+        // 2s that the wintun adapter is still up and the covering routes
+        // still resolve via it; a vanished adapter or leaked route means the
+        // session can no longer be trusted, so it reports loudly and surfaces
+        // as a disconnect (never self-healing). The select! cancels it during
+        // intentional teardown, before the route guard rolls anything back,
+        // so it never reports spuriously.
+        #[cfg(windows)]
+        let watchdog = crate::windows::routes::watchdog(
+            _route_guard.watchdog_luid(),
+            crate::windows::routes::WIN32_WATCHDOG_OPS,
+        );
+        #[cfg(not(windows))]
+        let watchdog = std::future::pending::<anyhow::Result<()>>();
         let run_result = tokio::select! {
             result = tun_device.run(tunnel, local_shutdown_rx) => {
                 Some(result)
@@ -596,6 +759,9 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
                 info!("Shutdown signal received during tunnel run");
                 let _ = local_shutdown_tx.send(true);
                 None
+            }
+            result = watchdog => {
+                Some(result)
             }
         };
 
@@ -620,14 +786,11 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
                     return Err(anyhow::anyhow!("Tunnel disconnected after {} reconnection attempts: {}", MAX_RECONNECT_ATTEMPTS, e));
                 }
 
-                let delay_ms = std::cmp::min(
-                    INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
-                    MAX_RECONNECT_DELAY_MS,
-                );
-                warn!("Tunnel disconnected, reconnecting in {} ms (attempt {}/{})", delay_ms, reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                let delay = retry_delay(reconnect_attempts);
+                warn!("Tunnel disconnected, reconnecting in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
 
                 // Brief pause before reconnect
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                tokio::time::sleep(delay).await;
             }
             None => {
                 // Shutdown was triggered
@@ -937,4 +1100,26 @@ fn format_bytes(bytes: u64) -> String {
         unit_idx += 1;
     }
     format!("{:.2} {}", size, UNITS[unit_idx])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Retry delays must grow exponentially up to the cap, with jitter
+    /// staying within ±20% and never collapsing to zero, so a deterministic
+    /// failure can never hot-loop.
+    #[test]
+    fn retry_delay_is_backoff_capped_and_jittered() {
+        let first = retry_delay(1);
+        let second = retry_delay(2);
+        let capped = retry_delay(100);
+        assert!(first >= std::time::Duration::from_millis(800));
+        assert!(first <= std::time::Duration::from_millis(1200));
+        assert!(second >= std::time::Duration::from_millis(1600));
+        assert!(second <= std::time::Duration::from_millis(2400));
+        // 30s base capped, jittered to [24s, 36s].
+        assert!(capped >= std::time::Duration::from_millis(24000));
+        assert!(capped <= std::time::Duration::from_millis(36000));
+    }
 }
