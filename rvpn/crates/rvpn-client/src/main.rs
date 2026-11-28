@@ -678,6 +678,20 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
         // Run TUN device until tunnel disconnects OR shutdown signal received
         // Use tokio::select! to wait on both simultaneously
         let (local_shutdown_tx, local_shutdown_rx) = tokio::sync::watch::channel(false);
+        // Windows: connection watchdog. While connected it re-verifies every
+        // 2s that the wintun adapter is still up and the covering routes
+        // still resolve via it; a vanished adapter or leaked route means the
+        // session can no longer be trusted, so it reports loudly and surfaces
+        // as a disconnect (never self-healing). The select! cancels it during
+        // intentional teardown, before the route guard rolls anything back,
+        // so it never reports spuriously.
+        #[cfg(windows)]
+        let watchdog = crate::windows::routes::watchdog(
+            _route_guard.watchdog_luid(),
+            crate::windows::routes::WIN32_WATCHDOG_OPS,
+        );
+        #[cfg(not(windows))]
+        let watchdog = std::future::pending::<anyhow::Result<()>>();
         let run_result = tokio::select! {
             result = tun_device.run(tunnel, local_shutdown_rx) => {
                 Some(result)
@@ -686,6 +700,9 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
                 info!("Shutdown signal received during tunnel run");
                 let _ = local_shutdown_tx.send(true);
                 None
+            }
+            result = watchdog => {
+                Some(result)
             }
         };
 

@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_BUFFER_OVERFLOW, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS,
     ERROR_SUCCESS, WIN32_ERROR,
@@ -39,10 +39,11 @@ use windows::Win32::NetworkManagement::IpHelper::{
     DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2,
     GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
     GAA_FLAG_SKIP_UNICAST, GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses, GetBestRoute2,
-    GetIpInterfaceEntry, IP_ADAPTER_ADDRESSES_LH, IP_ADDRESS_PREFIX, InitializeIpInterfaceEntry,
-    MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, SetInterfaceDnsSettings, SetIpInterfaceEntry,
+    GetIfEntry2, GetIpInterfaceEntry, IP_ADAPTER_ADDRESSES_LH, IP_ADDRESS_PREFIX,
+    InitializeIpInterfaceEntry, MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW,
+    SetInterfaceDnsSettings, SetIpInterfaceEntry,
 };
-use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+use windows::Win32::NetworkManagement::Ndis::{IfOperStatusUp, NET_LUID_LH};
 use windows::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0,
     MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
@@ -82,6 +83,11 @@ const IFMETRIC_DEBUG_ENV: &str = "RVPN_IFMETRIC_DEBUG";
 /// safe targets that never touch the network.
 const VERIFY_V4: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
 const VERIFY_V6: Ipv6Addr = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+
+/// How often the connection watchdog re-verifies the adapter and routes
+/// while connected. GetIfEntry2/GetBestRoute2 are cheap route-table reads,
+/// so two seconds is responsive without churn.
+const WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Everything needed to set up tunnel routing.
 pub struct RouteConfig {
@@ -169,6 +175,23 @@ struct CoveringRouteOps {
 const WIN32_OPS: CoveringRouteOps = CoveringRouteOps {
     add: route_add,
     delete: delete_covering_route,
+};
+
+/// Operations the connection watchdog uses to verify the connection while
+/// it is up. The Win32 wrappers are used in production; tests substitute
+/// stubs to simulate a vanished adapter or a leaked route without touching
+/// the system.
+#[derive(Clone, Copy)]
+pub struct WatchdogOps {
+    /// Ok when the adapter exists and is up; Err when it is gone or down.
+    adapter_up: fn(NET_LUID_LH) -> Result<()>,
+    /// Interface the stack would pick for a destination, as an LUID.
+    best_route: fn(IpAddr) -> Result<NET_LUID_LH>,
+}
+
+pub const WIN32_WATCHDOG_OPS: WatchdogOps = WatchdogOps {
+    adapter_up: adapter_is_up,
+    best_route: best_route_luid,
 };
 
 /// Handle returned by [`apply`]; dropping it reverses everything, using the
@@ -305,6 +328,12 @@ impl RouteGuard {
             .as_deref()
             .context("adapter GUID missing")?;
         parse_adapter_guid(name)
+    }
+
+    /// LUID the connection watchdog monitors: the adapter every route, DNS
+    /// and metric change (and its rollback) is scoped to.
+    pub fn watchdog_luid(&self) -> NET_LUID_LH {
+        self.adapter_luid()
     }
 
     fn apply_all(&mut self) -> Result<()> {
@@ -677,6 +706,55 @@ fn verify_routes_resolve_via_adapter(luid: NET_LUID_LH) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The adapter exists and is operationally up, checked by LUID
+/// (GetIfEntry2), never by name — names can be reused by a replacement
+/// adapter. A lookup failure means the adapter is gone.
+fn adapter_is_up(luid: NET_LUID_LH) -> Result<()> {
+    let mut row = MIB_IF_ROW2 {
+        InterfaceLuid: luid,
+        ..Default::default()
+    };
+    let err = unsafe { GetIfEntry2(&mut row) };
+    check(err, "GetIfEntry2")?;
+    if row.OperStatus != IfOperStatusUp {
+        bail!("adapter is not up (OperStatus {})", row.OperStatus.0);
+    }
+    Ok(())
+}
+
+/// One watchdog iteration: the adapter must still be up and both route
+/// lookups must still resolve via it. The error names exactly which check
+/// failed (adapter gone or down / route leaked), so the caller can report
+/// loudly.
+fn watchdog_check(luid: NET_LUID_LH, ops: &WatchdogOps) -> Result<()> {
+    (ops.adapter_up)(luid).context("wintun adapter check failed")?;
+    for dest in [IpAddr::V4(VERIFY_V4), IpAddr::V6(VERIFY_V6)] {
+        let best =
+            (ops.best_route)(dest).with_context(|| format!("route lookup for {dest} failed"))?;
+        if !luid_matches(best, luid) {
+            bail!("route lookup for {dest} no longer resolves via the tunnel adapter");
+        }
+    }
+    Ok(())
+}
+
+/// Connection watchdog: every WATCHDOG_INTERVAL re-verify the adapter and
+/// covering routes while connected. Never completes while the checks pass —
+/// the caller cancels it during teardown, before the route guard rolls
+/// anything back, so it cannot report spuriously. The first failed check is
+/// logged and returned, never self-healed: the caller tears the session
+/// down.
+pub async fn watchdog(luid: NET_LUID_LH, ops: WatchdogOps) -> Result<()> {
+    let mut interval = tokio::time::interval(WATCHDOG_INTERVAL);
+    loop {
+        interval.tick().await;
+        if let Err(e) = watchdog_check(luid, &ops) {
+            error!("connection watchdog: {e:#}; treating the connection as lost");
+            return Err(e.context("connection watchdog"));
+        }
+    }
 }
 
 /// Build the forward row identifying one of our routes. The interface LUID
@@ -1229,5 +1307,61 @@ mod tests {
         );
         // Nothing remains, so the state file was removed.
         assert!(!state_path.exists());
+    }
+
+    const TEST_ADAPTER_LUID: u64 = 0xaaaa_aaaa;
+    const TEST_PHYSICAL_LUID: u64 = 0xdead_dead;
+
+    fn stub_adapter_ok(_luid: NET_LUID_LH) -> Result<()> {
+        Ok(())
+    }
+
+    fn stub_adapter_gone(_luid: NET_LUID_LH) -> Result<()> {
+        bail!("adapter gone")
+    }
+
+    fn stub_best_route_adapter(_dest: IpAddr) -> Result<NET_LUID_LH> {
+        Ok(luid_from_value(TEST_ADAPTER_LUID))
+    }
+
+    fn stub_best_route_physical(_dest: IpAddr) -> Result<NET_LUID_LH> {
+        Ok(luid_from_value(TEST_PHYSICAL_LUID))
+    }
+
+    /// Happy path: the adapter is up and both route lookups resolve via it,
+    /// so the watchdog check passes and reports nothing.
+    #[test]
+    fn watchdog_check_passes_when_healthy() {
+        let ops = WatchdogOps {
+            adapter_up: stub_adapter_ok,
+            best_route: stub_best_route_adapter,
+        };
+        assert!(watchdog_check(luid_from_value(TEST_ADAPTER_LUID), &ops).is_ok());
+    }
+
+    /// An adapter vanishing mid-connection must fail the watchdog check,
+    /// naming the adapter as the failed check.
+    #[test]
+    fn watchdog_check_fails_when_adapter_disappears() {
+        let ops = WatchdogOps {
+            adapter_up: stub_adapter_gone,
+            best_route: stub_best_route_adapter,
+        };
+        let e = watchdog_check(luid_from_value(TEST_ADAPTER_LUID), &ops).unwrap_err();
+        assert!(format!("{e:#}").contains("adapter check failed"));
+    }
+
+    /// A route lookup resolving via the physical NIC instead of the adapter
+    /// must fail the watchdog check, naming the leaked route.
+    #[test]
+    fn watchdog_check_fails_when_route_leaks() {
+        let ops = WatchdogOps {
+            adapter_up: stub_adapter_ok,
+            best_route: stub_best_route_physical,
+        };
+        let e = watchdog_check(luid_from_value(TEST_ADAPTER_LUID), &ops).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("route lookup"));
+        assert!(msg.contains("1.1.1.1"));
     }
 }
