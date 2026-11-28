@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use tracing::info;
-use windows_sys::Win32::Foundation::NO_ERROR;
+use tracing::{error, info};
+use windows_sys::Win32::Foundation::{ERROR_SERVICE_SPECIFIC_ERROR, NO_ERROR};
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE,
     SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
@@ -69,6 +69,23 @@ fn set_status(handle: SERVICE_STATUS_HANDLE, state: u32) {
     }
 }
 
+/// Report a terminal failure to the SCM: a service-specific exit code so
+/// `sc query` and the event log show the pipe could not be created.
+fn set_status_failed(handle: SERVICE_STATUS_HANDLE, state: u32, specific: u32) {
+    let status = SERVICE_STATUS {
+        dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+        dwCurrentState: state,
+        dwControlsAccepted: 0,
+        dwWin32ExitCode: ERROR_SERVICE_SPECIFIC_ERROR,
+        dwServiceSpecificExitCode: specific,
+        dwCheckPoint: 0,
+        dwWaitHint: 0,
+    };
+    unsafe {
+        SetServiceStatus(handle, &status);
+    }
+}
+
 extern "system" fn service_main(_num_args: u32, _args: *mut windows_sys::core::PWSTR) {
     let name = to_wide(SERVICE_NAME);
     let handle = unsafe {
@@ -78,13 +95,26 @@ extern "system" fn service_main(_num_args: u32, _args: *mut windows_sys::core::P
         return;
     }
     STATUS_HANDLE.store(handle, Ordering::SeqCst);
+
+    // Create the control pipe BEFORE reporting SERVICE_RUNNING: if someone
+    // is squatting on the pipe name or creation otherwise fails, the
+    // service must stop with an error instead of staying RUNNING with no
+    // pipe.
+    let pipe_handle = match crate::pipe::create_pipe() {
+        Ok(h) => h,
+        Err(e) => {
+            error!("control pipe creation failed, stopping service: {e:#}");
+            set_status_failed(handle, SERVICE_STOPPED, 1);
+            return;
+        }
+    };
     set_status(handle, SERVICE_RUNNING);
     info!("service running");
 
     // The pipe server runs on its own thread; ConnectNamedPipe blocks, so
     // the STOP flag cannot interrupt it — acceptable for the skeleton, the
     // process exits when the SCM stops us here.
-    std::thread::spawn(|| crate::pipe::serve_logged("running"));
+    std::thread::spawn(move || crate::pipe::serve_loop_logged(pipe_handle, "running"));
 
     while !STOP_REQUESTED.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(100));

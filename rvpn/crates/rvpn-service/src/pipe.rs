@@ -4,19 +4,23 @@
 //! security descriptor is the access-control boundary of the whole
 //! privileged surface:
 //!
-//!   D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)
+//!   D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)
 //!
 //!   - `SY` (LocalSystem): the service itself, so it can always reach its
 //!     own pipe even if other ACEs change later.
 //!   - `BA` (built-in Administrators): admin troubleshooting / management.
-//!   - `IU` (INTERACTIVE): the signed-in desktop user's access token
-//!     contains the INTERACTIVE SID (S-1-5-4), so the unelevated client
-//!     process can connect — while service accounts, network logons and
-//!     other accounts on the machine cannot. This is Thomas's
-//!     "only the signed-in user drives the service" requirement.
+//!   - `IU` (INTERACTIVE), read/write only (`GRGW`): the signed-in desktop
+//!     user's access token contains the INTERACTIVE SID (S-1-5-4), so the
+//!     unelevated client process can connect — while service accounts,
+//!     network logons and other accounts on the machine cannot. No GA:
+//!     interactive users must not be able to create extra pipe instances or
+//!     rewrite the descriptor. This is Thomas's "only the signed-in user
+//!     drives the service" requirement.
 //!
-//! The descriptor is applied at pipe creation; a future config-folder
-//! ACL (user + SYSTEM) is a separate mechanism and not handled here.
+//! The descriptor is applied at pipe creation, and the pipe is created with
+//! FILE_FLAG_FIRST_PIPE_INSTANCE so a squatting user pipe can never
+//! pre-empt the service's name. A future config-folder ACL (user + SYSTEM)
+//! is a separate mechanism and not handled here.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -31,7 +35,7 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows_sys::Win32::System::Memory::LocalFree;
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
@@ -43,7 +47,7 @@ use crate::protocol::{MAX_FRAME_LEN, Reply, Request};
 pub const PIPE_NAME: &str = r"\\.\pipe\rvpn-service";
 
 /// See the module docs for the access-control rationale.
-const SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)";
+const SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
 
 const BUFFER_SIZE: u32 = 4096;
 
@@ -52,7 +56,7 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 /// Create the server end of the named pipe with the ACL above.
-fn create_pipe() -> Result<HANDLE> {
+pub(crate) fn create_pipe() -> Result<HANDLE> {
     let name = to_wide(PIPE_NAME);
     let sddl = to_wide(SDDL);
     unsafe {
@@ -76,7 +80,10 @@ fn create_pipe() -> Result<HANDLE> {
         };
         let handle = CreateNamedPipeW(
             name.as_ptr(),
-            PIPE_ACCESS_DUPLEX,
+            // First-instance: fail if another process is squatting on our
+            // pipe name instead of becoming an instance of the attacker's
+            // pipe.
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
             BUFFER_SIZE,
@@ -100,6 +107,12 @@ fn create_pipe() -> Result<HANDLE> {
 /// the client ever needs more than one outstanding connection.
 pub fn serve(service_state: &str) -> Result<()> {
     let handle = create_pipe()?;
+    serve_loop(handle, service_state)
+}
+
+/// Serve on an already-created pipe handle. Kept separate from create_pipe
+/// so the SCM path can fail the service start when creation fails.
+pub(crate) fn serve_loop(handle: HANDLE, service_state: &str) -> Result<()> {
     info!(pipe = PIPE_NAME, "control pipe listening");
     loop {
         let connected = unsafe { ConnectNamedPipe(handle, ptr::null_mut()) };
@@ -158,10 +171,12 @@ fn serve_client_io(file: &mut File, service_state: &str) -> Result<()> {
     }
 }
 
-/// Best-effort shutdown helper: on fatal error, log instead of panicking so
-/// the SCM path can still report SERVICE_STOPPED cleanly.
-pub fn serve_logged(service_state: &str) {
-    if let Err(e) = serve(service_state) {
+/// Best-effort shutdown helper for the SCM pipe thread: on fatal error,
+/// log instead of panicking so the SCM path can still report
+/// SERVICE_STOPPED cleanly. Pipe creation itself is validated before
+/// SERVICE_RUNNING is reported, so a failure here is mid-run only.
+pub(crate) fn serve_loop_logged(handle: HANDLE, service_state: &str) {
+    if let Err(e) = serve_loop(handle, service_state) {
         error!("control pipe server failed: {e:#}");
     }
 }
