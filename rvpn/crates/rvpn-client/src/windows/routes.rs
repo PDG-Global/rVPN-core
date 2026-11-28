@@ -76,6 +76,13 @@ pub(crate) const V6_COVERING: [&str; 2] = ["::/1", "8000::/1"];
 /// accepts before the error is reported. See diagnose_set_failure.
 const IFMETRIC_DEBUG_ENV: &str = "RVPN_IFMETRIC_DEBUG";
 
+/// Representative probe addresses for the post-install leak check
+/// (verify_routes_resolve_via_adapter). GetBestRoute2 is a pure route-table
+/// lookup and sends no traffic, so well-known public resolver addresses are
+/// safe targets that never touch the network.
+const VERIFY_V4: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+const VERIFY_V6: Ipv6Addr = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+
 /// Everything needed to set up tunnel routing.
 pub struct RouteConfig {
     /// IP of the VPN server we connect to (must stay routed via the
@@ -149,6 +156,21 @@ struct InterfaceMetricState {
     metric: u32,
 }
 
+/// Route-table operations for the covering routes. Production uses the
+/// Win32 wrappers; tests substitute stubs so install-failure injection and
+/// rollback can be exercised in-process without touching the real route
+/// table.
+#[derive(Clone, Copy)]
+struct CoveringRouteOps {
+    add: fn(&CoveringRoute, NET_LUID_LH) -> Result<()>,
+    delete: fn(NET_LUID_LH, &CoveringRoute) -> Result<()>,
+}
+
+const WIN32_OPS: CoveringRouteOps = CoveringRouteOps {
+    add: route_add,
+    delete: delete_covering_route,
+};
+
 /// Handle returned by [`apply`]; dropping it reverses everything, using the
 /// state file as the source of truth. A process that dies without dropping
 /// leaves the state file behind, so the next start restores from it.
@@ -156,6 +178,7 @@ pub struct RouteGuard {
     state_path: PathBuf,
     cfg: RouteConfig,
     state: AppliedState,
+    ops: CoveringRouteOps,
 }
 
 /// Apply the full routing setup. Every change is persisted to the state
@@ -166,9 +189,22 @@ pub fn apply(cfg: RouteConfig, state_path: &PathBuf) -> Result<RouteGuard> {
     // DNS and metric change (and its rollback) to this adapter.
     let adapter_luid = interface_luid(cfg.adapter_index)?;
     let adapter_guid = adapter_guid_string(cfg.adapter_index)?;
+    apply_with_ops(cfg, state_path, adapter_luid, adapter_guid, WIN32_OPS)
+}
+
+/// apply() with the covering-route operations injectable, so tests can
+/// force install failures without touching the real route table.
+fn apply_with_ops(
+    cfg: RouteConfig,
+    state_path: &PathBuf,
+    adapter_luid: NET_LUID_LH,
+    adapter_guid: String,
+    ops: CoveringRouteOps,
+) -> Result<RouteGuard> {
     let mut guard = RouteGuard {
         state_path: state_path.clone(),
         cfg,
+        ops,
         state: AppliedState {
             adapter_luid: Some(luid_value(adapter_luid)),
             adapter_guid: Some(adapter_guid),
@@ -226,7 +262,7 @@ pub fn restore_from_state_file(state_path: &Path) {
             return;
         }
     };
-    finish_restore(state_path, rollback_state(&state));
+    finish_restore(state_path, rollback_state(&state, &WIN32_OPS));
 }
 
 impl RouteGuard {
@@ -239,7 +275,8 @@ impl RouteGuard {
     /// recorded so the next start can finish the job; a fully rolled-back
     /// state deletes the file.
     fn rollback_and_update_file(&mut self) {
-        self.state = rollback_state(&self.state);
+        let ops = self.ops;
+        self.state = rollback_state(&self.state, &ops);
         if self.state.is_empty() {
             let _ = std::fs::remove_file(&self.state_path);
         } else {
@@ -304,7 +341,7 @@ impl RouteGuard {
             };
             self.state.routes.push(record.clone());
             self.persist()?;
-            route_add(&record, luid)?;
+            (self.ops.add)(&record, luid)?;
         }
 
         // 3. IPv6: ::/1 + 8000::/1 via the adapter (on-link: the tunnel
@@ -321,7 +358,7 @@ impl RouteGuard {
             };
             self.state.routes.push(record.clone());
             self.persist()?;
-            route_add(&record, luid)?;
+            (self.ops.add)(&record, luid)?;
         }
 
         // 4. DNS on the adapter, then force a winning interface metric so
@@ -346,6 +383,12 @@ impl RouteGuard {
             self.persist()?;
             force_interface_metric(row)?;
         }
+
+        // 6. Leak check (fail closed): the route lookups a host will do must
+        //    resolve via this adapter for both families. If they do not,
+        //    traffic would escape via the physical interface — tear down
+        //    rather than stay up with a silent leak.
+        verify_routes_resolve_via_adapter(luid)?;
 
         info!(
             "tunnel routes active: {} covering routes via adapter '{}' (if {}), server {} {}",
@@ -485,7 +528,7 @@ fn validate_state_file(path: &Path) -> Result<()> {
 /// application. Logs and continues on individual failures so one bad entry
 /// cannot block the rest; returns the entries that could NOT be reversed
 /// (an empty state means the system is fully restored).
-fn rollback_state(state: &AppliedState) -> AppliedState {
+fn rollback_state(state: &AppliedState, ops: &CoveringRouteOps) -> AppliedState {
     let mut remaining = AppliedState::default();
     let luid = state.adapter_luid.map(luid_from_value);
 
@@ -525,8 +568,7 @@ fn rollback_state(state: &AppliedState) -> AppliedState {
 
     if let Some(luid) = luid {
         for record in state.routes.iter().rev() {
-            let row = forward_row(luid, record.prefix, record.prefix_len, record.next_hop);
-            if let Err(e) = delete_route(&row) {
+            if let Err(e) = (ops.delete)(luid, record) {
                 warn!(
                     "failed to delete route {}/{}: {e:#}",
                     record.prefix, record.prefix_len
@@ -600,6 +642,43 @@ fn physical_gateway() -> Result<(Ipv4Addr, NET_LUID_LH)> {
     Ok((gateway, route.InterfaceLuid))
 }
 
+/// Interface the stack would pick for `dest`, as an LUID. GetBestRoute2 is
+/// a pure route-table lookup: nothing is sent to the address.
+fn best_route_luid(dest: IpAddr) -> Result<NET_LUID_LH> {
+    let dest_sa = sockaddr_inet(dest);
+    let mut route = MIB_IPFORWARD_ROW2::default();
+    let mut source = SOCKADDR_INET::default();
+    let err = unsafe { GetBestRoute2(None, 0, None, &dest_sa, 0, &mut route, &mut source) };
+    check(err, "GetBestRoute2")?;
+    Ok(route.InterfaceLuid)
+}
+
+/// Whether a best-route lookup returned the adapter interface, compared by
+/// LUID: GetBestRoute2 output rows carry InterfaceLuid, and unlike the
+/// interface index it is never reused for a different adapter.
+fn luid_matches(best: NET_LUID_LH, expected: NET_LUID_LH) -> bool {
+    luid_value(best) == luid_value(expected)
+}
+
+/// Fail-closed leak check run after the covering routes are installed: the
+/// route lookup for one representative address per family must resolve via
+/// the wintun adapter. If Windows would actually use any other interface,
+/// traffic escapes via the physical NIC — tear down and report not
+/// connected instead of staying up with a silent leak.
+fn verify_routes_resolve_via_adapter(luid: NET_LUID_LH) -> Result<()> {
+    for dest in [IpAddr::V4(VERIFY_V4), IpAddr::V6(VERIFY_V6)] {
+        let best =
+            best_route_luid(dest).with_context(|| format!("route lookup for {dest} failed"))?;
+        if !luid_matches(best, luid) {
+            bail!(
+                "route lookup for {dest} does not resolve via the tunnel adapter; \
+                 refusing to connect with a leaking route table"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Build the forward row identifying one of our routes. The interface LUID
 /// is always set: creates AND deletes are scoped to the adapter we own, so a
 /// rollback can never remove another VPN's covering routes.
@@ -645,6 +724,18 @@ fn route_add_host(record: &ServerRoute) -> Result<()> {
 
 fn route_add(record: &CoveringRoute, luid: NET_LUID_LH) -> Result<()> {
     create_route(&forward_row(
+        luid,
+        record.prefix,
+        record.prefix_len,
+        record.next_hop,
+    ))
+}
+
+/// Delete one recorded covering route. The recorded next hop is replayed
+/// verbatim: legacy state files (pre on-link change) recorded the adapter
+/// address, and the delete must match the row that was created.
+fn delete_covering_route(luid: NET_LUID_LH, record: &CoveringRoute) -> Result<()> {
+    delete_route(&forward_row(
         luid,
         record.prefix,
         record.prefix_len,
@@ -959,6 +1050,8 @@ fn wide(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Pin the fail-closed contract: both families are covered by exactly
     /// the two /1 routes, so no traffic — IPv6 included, lease or not — can
@@ -1054,5 +1147,87 @@ mod tests {
         assert_eq!(restored, state);
         assert!(!restored.is_empty());
         assert!(AppliedState::default().is_empty());
+    }
+
+    /// The leak check accepts exactly the adapter's own LUID and rejects
+    /// every other interface, so a lookup that would escape via the physical
+    /// NIC fails verification.
+    #[test]
+    fn luid_matches_only_the_adapter() {
+        let adapter = luid_from_value(0x1111_2222_3333_4444);
+        let physical = luid_from_value(0x5555_6666_7777_8888);
+        assert!(luid_matches(adapter, adapter));
+        assert!(!luid_matches(physical, adapter));
+    }
+
+    // fn-pointer stubs cannot capture state, so the call log lives in
+    // statics. Only apply_failure_rolls_back_partial_routes touches them.
+    static STUB_ADD_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static STUB_DELETED: Mutex<Vec<(IpAddr, u8)>> = Mutex::new(Vec::new());
+
+    /// Second install fails, as if the route table refused the route.
+    fn stub_fail_on_second(_record: &CoveringRoute, _luid: NET_LUID_LH) -> Result<()> {
+        if STUB_ADD_CALLS.fetch_add(1, Ordering::SeqCst) == 1 {
+            bail!("injected install failure");
+        }
+        Ok(())
+    }
+
+    fn stub_record_delete(_luid: NET_LUID_LH, record: &CoveringRoute) -> Result<()> {
+        STUB_DELETED
+            .lock()
+            .unwrap()
+            .push((record.prefix, record.prefix_len));
+        Ok(())
+    }
+
+    /// Fail closed: when a covering-route install fails mid-apply, apply must
+    /// fail and roll back the route that did install — the client must never
+    /// stay up with partial routing.
+    #[test]
+    fn apply_failure_rolls_back_partial_routes() {
+        STUB_ADD_CALLS.store(0, Ordering::SeqCst);
+        STUB_DELETED.lock().unwrap().clear();
+        let ops = CoveringRouteOps {
+            add: stub_fail_on_second,
+            delete: stub_record_delete,
+        };
+        let cfg = RouteConfig {
+            // Loopback skips the server pin and empty DNS skips the DNS
+            // step, so the injected failure on the second covering route is
+            // the only failure point reached.
+            server_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            adapter_name: "test".to_string(),
+            adapter_index: 0,
+            dns_servers: vec![],
+        };
+        let state_path = std::env::temp_dir().join(format!(
+            "rvpn-route-state-failclosed-test-{}.json",
+            std::process::id()
+        ));
+        let result = apply_with_ops(
+            cfg,
+            &state_path,
+            luid_from_value(0xbeef_beef),
+            "{11111111-1111-1111-1111-111111111111}".to_string(),
+            ops,
+        );
+        assert!(result.is_err());
+        // Two installs were attempted; the second failed.
+        assert_eq!(STUB_ADD_CALLS.load(Ordering::SeqCst), 2);
+        // Intent is recorded before each install, so rollback removes every
+        // recorded route in reverse order — including the one whose install
+        // failed (deleting a never-installed route is a harmless no-op
+        // against the real route table, so nothing partial is left behind).
+        let deleted = STUB_DELETED.lock().unwrap();
+        assert_eq!(
+            deleted.as_slice(),
+            [
+                (IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1),
+                (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1)
+            ]
+        );
+        // Nothing remains, so the state file was removed.
+        assert!(!state_path.exists());
     }
 }

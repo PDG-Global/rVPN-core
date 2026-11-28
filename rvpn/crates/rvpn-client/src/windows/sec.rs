@@ -7,7 +7,6 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use tracing::warn;
 use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree, WIN32_ERROR};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
@@ -277,7 +276,8 @@ fn is_volume_root(path: &Path) -> bool {
 /// reparse point. `std::fs::canonicalize` already resolves reparse points
 /// once; this re-checks the resolved path at use time, so a junction
 /// planted between resolution and use is still caught. Volume roots are
-/// exempt (see is_volume_root).
+/// exempt (see is_volume_root). Fail closed: a component that cannot be
+/// inspected is untrusted and the path is refused, never walked past.
 pub(crate) fn check_no_reparse_points(path: &Path) -> Result<()> {
     let mut prefix = std::path::PathBuf::new();
     for component in path.components() {
@@ -289,9 +289,9 @@ pub(crate) fn check_no_reparse_points(path: &Path) -> Result<()> {
             Ok(false) => {}
             Ok(true) => bail!("{} is a reparse point/junction", prefix.display()),
             Err(e) => {
-                // Components that cannot be queried are unusual but not
-                // proof of a redirect; log and keep checking deeper ones.
-                warn!(
+                // A component that cannot be inspected is untrusted: refuse
+                // rather than proceed past a possible redirect (fail closed).
+                bail!(
                     "could not check {} for reparse points: {e:#}",
                     prefix.display()
                 );
