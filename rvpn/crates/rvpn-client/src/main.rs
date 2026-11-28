@@ -31,6 +31,8 @@ mod tun;
 mod tunnel;
 mod tunnel_pool;
 mod websocket;
+#[cfg(windows)]
+mod windows;
 
 // Use mimalloc as the global allocator: glibc malloc arenas retain memory
 // indefinitely under this client's allocation churn (a long-running Linux
@@ -464,6 +466,27 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
     // Parse server URL
     let (host, port, path) = parse_server_url(&config.server_address);
 
+    // Windows: first undo any leftover route/DNS state from a crashed run,
+    // then resolve the server IP while the network is still untouched so the
+    // covering routes can pin a host route to it.
+    #[cfg(windows)]
+    let route_state_path = config.data_dir.join("route_state.json");
+    #[cfg(windows)]
+    crate::windows::routes::restore_from_state_file(&route_state_path);
+    #[cfg(windows)]
+    let server_ip = {
+        use std::net::ToSocketAddrs;
+        let mut addrs = format!("{}:{}", host, port)
+            .to_socket_addrs()
+            .with_context(|| format!("Failed to resolve VPN server '{}'", host))?;
+        // The host route pin is IPv4-only for now, so prefer an IPv4
+        // address (localhost may resolve to ::1 first).
+        addrs
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| anyhow::anyhow!("DNS returned no IPv4 address for '{}'", host))?
+            .ip()
+    };
+
     // Initialize stats manager for historical tracking
     metrics::init_global_metrics();
     let stats_manager = stats::init_global_stats_manager_with_dir(config.data_dir.clone()).await;
@@ -571,7 +594,7 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
         {
             Ok(d) => d,
             Err(e) => {
-                error!("Failed to create TUN device: {}", e);
+                error!("Failed to create TUN device: {:#}", e);
                 reconnect_attempts += 1;
                 let delay_ms = std::cmp::min(
                     INITIAL_RECONNECT_DELAY_MS * (2_u64.pow(reconnect_attempts.min(5))),
@@ -584,6 +607,38 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
         };
 
         info!("TUN device ready");
+
+        // Windows: pin the server host route, cover IPv4 (two /1s) and IPv6
+        // (::/1 + 8000::/1) via the adapter, and set adapter DNS with a
+        // winning interface metric. Every change is persisted to the state
+        // file before it is applied; when this guard drops (disconnect,
+        // reconnect, shutdown) everything is restored.
+        #[cfg(windows)]
+        let _route_guard = {
+            let dns_servers: Vec<std::net::IpAddr> = tun_config
+                .dns_servers
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if dns_servers.is_empty() {
+                warn!("no usable DNS servers in [tun] config; adapter DNS left unchanged");
+            }
+            let route_cfg = crate::windows::routes::RouteConfig {
+                server_ip,
+                adapter_name: tun_device.adapter_name()?,
+                adapter_index: tun_device.adapter_index()?,
+                adapter_ipv4: tun_device.adapter_ipv4()?,
+                dns_servers,
+            };
+            match crate::windows::routes::apply(route_cfg, &route_state_path) {
+                Ok(g) => g,
+                Err(e) => {
+                    error!("Failed to set up tunnel routes: {:#}", e);
+                    reconnect_attempts += 1;
+                    continue;
+                }
+            }
+        };
 
         // Run TUN device until tunnel disconnects OR shutdown signal received
         // Use tokio::select! to wait on both simultaneously

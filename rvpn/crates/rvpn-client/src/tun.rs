@@ -57,7 +57,14 @@ impl TunDevice {
                     .ipv4(ip_addr, prefix_len, None);
                 #[cfg(not(windows))]
                 let builder = builder.packet_information(false);
-                builder.build_sync()
+                #[cfg(windows)]
+                let builder = builder.wintun_file(
+                    crate::windows::wintun::resolve_and_verify()?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                builder
+                    .build_sync()
                     .with_context(|| format!("Failed to create TUN device '{}'", name))?
             }
         } else {
@@ -70,7 +77,14 @@ impl TunDevice {
                     .ipv4(ip_addr, prefix_len, None);
                 #[cfg(not(windows))]
                 let builder = builder.packet_information(false);
-                builder.build_sync()
+                #[cfg(windows)]
+                let builder = builder.wintun_file(
+                    crate::windows::wintun::resolve_and_verify()?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                builder
+                    .build_sync()
                     .with_context(|| "Failed to create TUN device (auto-name)")?
             }
         };
@@ -101,6 +115,50 @@ impl TunDevice {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No IP address configured and no server-assigned IP provided. Use create_with_ip() with server-assigned IP."))?;
         Self::create_with_ip(config, ip_cidr)
+    }
+
+    /// Windows: interface index of the wintun adapter (for routes/DNS setup).
+    #[cfg(windows)]
+    pub fn adapter_index(&self) -> Result<u32> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TUN device not initialized"))?;
+        device
+            .if_index()
+            .map_err(|e| anyhow::anyhow!("Failed to get adapter index: {}", e))
+    }
+
+    /// Windows: name of the wintun adapter (for DNS setup via netsh).
+    #[cfg(windows)]
+    pub fn adapter_name(&self) -> Result<String> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TUN device not initialized"))?;
+        device
+            .name()
+            .map_err(|e| anyhow::anyhow!("Failed to get adapter name: {}", e))
+    }
+
+    /// Windows: first IPv4 address configured on the wintun adapter
+    /// (used as the on-link gateway for the covering routes).
+    #[cfg(windows)]
+    pub fn adapter_ipv4(&self) -> Result<std::net::Ipv4Addr> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TUN device not initialized"))?;
+        let addrs = device
+            .addresses()
+            .map_err(|e| anyhow::anyhow!("Failed to get adapter addresses: {}", e))?;
+        addrs
+            .into_iter()
+            .find_map(|a| match a {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("Adapter has no IPv4 address"))
     }
 
     /// Run the TUN device with graceful shutdown support.
