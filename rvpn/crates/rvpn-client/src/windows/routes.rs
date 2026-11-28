@@ -39,8 +39,8 @@ use windows::Win32::NetworkManagement::IpHelper::{
     DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2,
     GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
     GAA_FLAG_SKIP_UNICAST, GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses, GetBestRoute2,
-    GetIpInterfaceEntry, IP_ADAPTER_ADDRESSES_LH, IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2,
-    MIB_IPINTERFACE_ROW, SetInterfaceDnsSettings, SetIpInterfaceEntry,
+    GetIpInterfaceEntry, IP_ADAPTER_ADDRESSES_LH, IP_ADDRESS_PREFIX, InitializeIpInterfaceEntry,
+    MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, SetInterfaceDnsSettings, SetIpInterfaceEntry,
 };
 use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows::Win32::Networking::WinSock::{
@@ -70,6 +70,11 @@ pub(crate) const V4_COVERING: [(Ipv4Addr, Ipv4Addr); 2] = [
     (Ipv4Addr::new(128, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)),
 ];
 pub(crate) const V6_COVERING: [&str; 2] = ["::/1", "8000::/1"];
+
+/// Gate for the SetIpInterfaceEntry failure probe: when set, a failed Set
+/// dumps the Get-filled row and probes which row variants this interface
+/// accepts before the error is reported. See diagnose_set_failure.
+const IFMETRIC_DEBUG_ENV: &str = "RVPN_IFMETRIC_DEBUG";
 
 /// Everything needed to set up tunnel routing.
 pub struct RouteConfig {
@@ -769,29 +774,135 @@ fn get_ip_interface(
 
 /// Force metric 1 on the adapter row so wintun wins DNS. The row's previous
 /// state must already have been recorded by the caller.
-fn force_interface_metric(mut row: MIB_IPINTERFACE_ROW) -> Result<()> {
+fn force_interface_metric(row: MIB_IPINTERFACE_ROW) -> Result<()> {
     // Only rewrite the row when it actually differs: fewer changes to roll
     // back, and no churn on adapters already configured this way.
     if !row.UseAutomaticMetric && row.Metric == 1 {
         return Ok(());
     }
-    row.UseAutomaticMetric = false;
-    row.Metric = 1;
-    let err = unsafe { SetIpInterfaceEntry(&mut row) };
-    check(err, "SetIpInterfaceEntry")
+    let mut set_row = row;
+    // Get-filled NlMtu/SitePrefixLength read as change requests to
+    // SetIpInterfaceEntry, and the wintun virtual NIC (IfType 53) rejects the
+    // implied MTU update with ERROR_INVALID_PARAMETER. Zeroing both asks for
+    // no change — wireguard-nt's example.c zeroes/controls the same fields.
+    set_row.NlMtu = 0;
+    set_row.SitePrefixLength = 0;
+    set_row.UseAutomaticMetric = false;
+    set_row.Metric = 1;
+    set_ip_interface(set_row, &row)
 }
 
 /// Restore the recorded per-family metric state on exactly the recorded
 /// interface (by LUID). Every other interface is left untouched.
 fn restore_interface_metric(luid: NET_LUID_LH, record: &InterfaceMetricState) -> Result<()> {
-    let Some(mut row) = get_ip_interface(luid, ADDRESS_FAMILY(record.family))? else {
+    let Some(row) = get_ip_interface(luid, ADDRESS_FAMILY(record.family))? else {
         // The adapter (or the family on it) is gone; its metric died with it.
         return Ok(());
     };
-    row.UseAutomaticMetric = record.use_automatic_metric;
-    row.Metric = record.metric;
-    let err = unsafe { SetIpInterfaceEntry(&mut row) };
+    let mut set_row = row;
+    // Same treatment as force_interface_metric: leave NlMtu/SitePrefixLength
+    // alone or Set fails with ERROR_INVALID_PARAMETER on wintun.
+    set_row.NlMtu = 0;
+    set_row.SitePrefixLength = 0;
+    set_row.UseAutomaticMetric = record.use_automatic_metric;
+    set_row.Metric = record.metric;
+    set_ip_interface(set_row, &row)
+}
+
+/// SetIpInterfaceEntry with failure diagnostics: when RVPN_IFMETRIC_DEBUG
+/// is set, a failure dumps the Get-filled row and probes which row variants
+/// this interface accepts before the error is reported.
+fn set_ip_interface(mut set_row: MIB_IPINTERFACE_ROW, get_row: &MIB_IPINTERFACE_ROW) -> Result<()> {
+    let err = unsafe { SetIpInterfaceEntry(&mut set_row) };
+    if err != ERROR_SUCCESS && std::env::var_os(IFMETRIC_DEBUG_ENV).is_some() {
+        diagnose_set_failure(get_row);
+    }
     check(err, "SetIpInterfaceEntry")
+}
+
+/// Diagnostic probe for SetIpInterfaceEntry failures (RVPN_IFMETRIC_DEBUG):
+/// dump every field of the Get-filled row, then probe which row variants
+/// SetIpInterfaceEntry accepts for this interface. Smoke-run evidence: even
+/// the unmodified Get row fails with ERROR_INVALID_PARAMETER on wintun.
+fn diagnose_set_failure(get_row: &MIB_IPINTERFACE_ROW) {
+    warn!(
+        "ifmetric debug: Get-filled MIB_IPINTERFACE_ROW fields: \
+         Family={} InterfaceLuid={:#x} InterfaceIndex={} MaxReassemblySize={} \
+         InterfaceIdentifier={} MinRouterAdvertisementInterval={} \
+         MaxRouterAdvertisementInterval={} AdvertisingEnabled={} ForwardingEnabled={} \
+         WeakHostSend={} WeakHostReceive={} UseAutomaticMetric={} \
+         UseNeighborUnreachabilityDetection={} ManagedAddressConfigurationSupported={} \
+         OtherStatefulConfigurationSupported={} AdvertiseDefaultRoute={} \
+         RouterDiscoveryBehavior={} DadTransmits={} BaseReachableTime={} RetransmitTime={} \
+         PathMtuDiscoveryTimeout={} LinkLocalAddressBehavior={} LinkLocalAddressTimeout={} \
+         ZoneIndices={:?} SitePrefixLength={} Metric={} NlMtu={} Connected={} \
+         SupportsWakeUpPatterns={} SupportsNeighborDiscovery={} SupportsRouterDiscovery={} \
+         ReachableTime={} TransmitOffload={:#x} ReceiveOffload={:#x} DisableDefaultRoutes={}",
+        get_row.Family.0,
+        unsafe { get_row.InterfaceLuid.Value },
+        get_row.InterfaceIndex,
+        get_row.MaxReassemblySize,
+        get_row.InterfaceIdentifier,
+        get_row.MinRouterAdvertisementInterval,
+        get_row.MaxRouterAdvertisementInterval,
+        get_row.AdvertisingEnabled,
+        get_row.ForwardingEnabled,
+        get_row.WeakHostSend,
+        get_row.WeakHostReceive,
+        get_row.UseAutomaticMetric,
+        get_row.UseNeighborUnreachabilityDetection,
+        get_row.ManagedAddressConfigurationSupported,
+        get_row.OtherStatefulConfigurationSupported,
+        get_row.AdvertiseDefaultRoute,
+        get_row.RouterDiscoveryBehavior.0,
+        get_row.DadTransmits,
+        get_row.BaseReachableTime,
+        get_row.RetransmitTime,
+        get_row.PathMtuDiscoveryTimeout,
+        get_row.LinkLocalAddressBehavior.0,
+        get_row.LinkLocalAddressTimeout,
+        get_row.ZoneIndices,
+        get_row.SitePrefixLength,
+        get_row.Metric,
+        get_row.NlMtu,
+        get_row.Connected,
+        get_row.SupportsWakeUpPatterns,
+        get_row.SupportsNeighborDiscovery,
+        get_row.SupportsRouterDiscovery,
+        get_row.ReachableTime,
+        get_row.TransmitOffload._bitfield,
+        get_row.ReceiveOffload._bitfield,
+        get_row.DisableDefaultRoutes,
+    );
+
+    probe_set("a) unmodified Get row", get_row);
+
+    let mut no_mtu = *get_row;
+    no_mtu.NlMtu = 0;
+    probe_set("b) Get row with NlMtu=0", &no_mtu);
+
+    let mut minimal = MIB_IPINTERFACE_ROW::default();
+    unsafe { InitializeIpInterfaceEntry(&mut minimal) };
+    minimal.Family = get_row.Family;
+    minimal.InterfaceLuid = get_row.InterfaceLuid;
+    minimal.UseAutomaticMetric = get_row.UseAutomaticMetric;
+    minimal.Metric = get_row.Metric;
+    probe_set("c) InitializeIpInterfaceEntry row", &minimal);
+
+    let mut no_index = *get_row;
+    no_index.InterfaceIndex = 0;
+    probe_set("d) Get row with InterfaceIndex=0", &no_index);
+}
+
+/// Run one probe variant and log whether SetIpInterfaceEntry accepts it.
+fn probe_set(label: &str, row: &MIB_IPINTERFACE_ROW) {
+    let mut row = *row;
+    let err = unsafe { SetIpInterfaceEntry(&mut row) };
+    if err == ERROR_SUCCESS {
+        warn!("ifmetric debug: probe {label}: SUCCESS");
+    } else {
+        warn!("ifmetric debug: probe {label}: Win32 error {}", err.0);
+    }
 }
 
 fn sockaddr_inet(addr: IpAddr) -> SOCKADDR_INET {
