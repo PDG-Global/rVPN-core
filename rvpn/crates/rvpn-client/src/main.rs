@@ -470,15 +470,27 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
     // then resolve the server IP while the network is still untouched so the
     // covering routes can pin a host route to it. The state file lives under
     // %ProgramData%\rvpn (created with a SYSTEM+Administrators-only ACL, so
-    // the elevated restore can trust it); the pre-hardening location in the
-    // user-writable data dir is restored once more for migration.
+    // the elevated restore can trust it). The pre-hardening location in the
+    // user-writable data dir must NOT be parsed: a user could plant a crafted
+    // file there and the elevated restore would act on it. Delete it
+    // unopened; live changes it may describe are torn down by the admin
+    // cleanup procedure instead.
     #[cfg(windows)]
     let route_state_path = crate::windows::routes::state_path()
         .context("Failed to prepare the route state directory")?;
     #[cfg(windows)]
     crate::windows::routes::restore_from_state_file(&route_state_path);
     #[cfg(windows)]
-    crate::windows::routes::restore_from_state_file(&config.data_dir.join("route_state.json"));
+    {
+        let legacy = config.data_dir.join("route_state.json");
+        if legacy.exists() {
+            warn!(
+                "ignoring legacy route state file at {} (user-writable location); deleting it without trusting its contents",
+                legacy.display()
+            );
+            let _ = std::fs::remove_file(&legacy);
+        }
+    }
     #[cfg(windows)]
     let server_ip = {
         use std::net::ToSocketAddrs;
