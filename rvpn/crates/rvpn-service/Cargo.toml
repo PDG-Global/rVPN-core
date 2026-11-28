@@ -1,0 +1,32 @@
+[package]
+name = "rvpn-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+description = "Privileged Windows helper service: owns wintun adapter creation and route/DNS changes on behalf of the unelevated rvpn-client"
+
+# Windows-only by design; the crate compiles only under cfg(windows).
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# 0.48 is already pinned in the workspace lockfile (via tun-rs).
+windows-sys = { version = "0.48", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Services",
+] }
