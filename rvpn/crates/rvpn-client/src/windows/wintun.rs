@@ -1,17 +1,33 @@
-//! Locate and verify the bundled wintun.dll before it is handed to tun-rs.
+//! Locate, verify and load the bundled wintun.dll before it is handed to tun-rs.
 //!
-//! The DLL is loaded by full path only, and only after its SHA-256 matches
-//! the pinned hash of the official signed build. Anything else is a hard
-//! error: a planted or tampered DLL must never reach the loader.
+//! The DLL is loaded only after its SHA-256 matches the pinned hash of the
+//! official signed build and its Authenticode signature verifies against the
+//! pinned signer. Anything else is a hard error: a planted or tampered DLL
+//! must never reach the loader.
+//!
+//! Verification is TOCTOU-hardened end to end:
+//! - the directory holding the DLL must not grant write access to any
+//!   principal other than SYSTEM, Administrators or TrustedInstaller, and no
+//!   path component may be a reparse point — otherwise a verified DLL could
+//!   be swapped for a planted one before the load;
+//! - the file is opened with a deny-write share mode and that handle is held
+//!   across hashing, signature verification and the load, so the bytes
+//!   verified are the bytes loaded;
+//! - the load itself uses LoadLibraryExW with
+//!   LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, so the
+//!   dependency search order cannot be hijacked. tun-rs loads the same path
+//!   afterwards; the Windows loader returns this already-loaded image, never
+//!   a re-read from disk.
 
 use std::ffi::c_void;
-use std::os::windows::ffi::OsStrExt;
+use std::fs::File;
+use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tracing::warn;
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{FreeLibrary, GENERIC_READ, HANDLE, HMODULE, HWND};
 use windows::Win32::Security::Cryptography::{
     CERT_CONTEXT, CERT_FIND_CERT_ID, CERT_ID, CERT_ID_0, CERT_ID_ISSUER_SERIAL_NUMBER,
     CERT_ISSUER_SERIAL_NUMBER, CERT_NAME_ATTR_TYPE, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED,
@@ -27,7 +43,16 @@ use windows::Win32::Security::WinTrust::{
     WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE, WTD_UICONTEXT_EXECUTE,
     WinVerifyTrust,
 };
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
+};
+use windows::Win32::System::LibraryLoader::{
+    LOAD_LIBRARY_FLAGS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    LoadLibraryExW,
+};
 use windows::core::PCWSTR;
+
+use super::sec;
 
 /// SHA-256 of the official signed wintun.dll (amd64) shipped in
 /// wintun-0.14.1.zip. The archive's own SHA-256
@@ -46,32 +71,85 @@ const OVERRIDE_ENV: &str = "RVPN_WINTUN_DLL";
 /// different-but-hash-colliding artifact can never be substituted silently.
 const EXPECTED_SIGNER_SUBJECT: &str = "WireGuard LLC";
 
-/// Resolve the wintun.dll to load and verify its integrity.
+/// Verified wintun.dll, ready to be handed to tun-rs. The guard holds the
+/// protections that close the check-then-load race: a deny-write file handle
+/// and a reference on the already-loaded module. Keep it alive until tun-rs
+/// has opened the DLL (it then holds its own reference to the same verified
+/// in-memory image).
+pub struct VerifiedWintunDll {
+    path: PathBuf,
+    /// Deny-write handle: no one can open the file for modification while it
+    /// is held. Closed when the guard drops.
+    _file: File,
+    /// Reference on the module loaded with the restricted search flags.
+    /// Freed when the guard drops; tun-rs keeps the module loaded through
+    /// its own library handle.
+    _module: LibraryGuard,
+}
+
+impl VerifiedWintunDll {
+    /// Verified absolute path of wintun.dll, to pass to tun-rs.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Frees the module reference on drop on every exit path.
+struct LibraryGuard(HMODULE);
+
+impl Drop for LibraryGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = FreeLibrary(self.0);
+        }
+    }
+}
+
+/// Resolve, verify and load the wintun.dll.
 ///
 /// Resolution order: `RVPN_WINTUN_DLL` (dev override, debug builds only),
-/// then `wintun.dll` beside the current executable. The returned path is
-/// absolute and verified.
+/// then `wintun.dll` beside the current executable. The returned guard is
+/// absolute and verified, and keeps the verified bytes pinned until dropped.
 ///
 /// Production installs must place the DLL in a directory only administrators
-/// can write (for example under Program Files): the checks below only close
-/// the check-then-load race when a non-admin user cannot replace the file
-/// between the check and the load.
-pub fn resolve_and_verify() -> Result<PathBuf> {
-    let path = match override_path() {
-        Some(custom) => custom,
-        None => std::env::current_exe()
-            .context("Failed to locate current executable")?
-            .parent()
-            .context("Executable has no parent directory")?
-            .join("wintun.dll"),
+/// can write (for example under Program Files): the checks below refuse any
+/// other location for the non-override path.
+pub fn resolve_and_verify() -> Result<VerifiedWintunDll> {
+    let (path, from_override) = match override_path() {
+        Some(custom) => (custom, true),
+        None => (
+            std::env::current_exe()
+                .context("Failed to locate current executable")?
+                .parent()
+                .context("Executable has no parent directory")?
+                .join("wintun.dll"),
+            false,
+        ),
     };
 
     let path = std::fs::canonicalize(&path)
         .with_context(|| format!("wintun.dll not found or not readable: {}", path.display()))?;
 
-    verify_sha256(&path)?;
+    // A directory ordinary users can write lets them swap the verified DLL
+    // for a planted one before the load. Enforced for the production path
+    // only: the debug-only override points wherever the developer works.
+    if !from_override {
+        check_dll_directory(&path)?;
+    }
+
+    // Opened before any check and held until after the load: the deny-write
+    // share mode blocks in-place modification of the bytes between the
+    // hash/signature verification and the load.
+    let file = open_deny_write(&path)?;
+    verify_sha256(&file, &path)?;
     verify_authenticode(&path)?;
-    Ok(path)
+    let module = load_restricted(&path)?;
+
+    Ok(VerifiedWintunDll {
+        path,
+        _file: file,
+        _module: module,
+    })
 }
 
 /// Development override, honored in debug builds only. Release builds must
@@ -99,12 +177,50 @@ fn override_path() -> Option<PathBuf> {
     None
 }
 
-/// Hash check against the pinned digest. Applies to every path source,
-/// including the override: a warning never replaces the pin.
-fn verify_sha256(path: &Path) -> Result<()> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let digest = hex::encode(Sha256::digest(&bytes));
+/// The directory holding the DLL must not be modifiable by anyone outside
+/// SYSTEM, Administrators and TrustedInstaller, and no path component may
+/// be a reparse point: either would let a lesser principal replace the
+/// verified DLL before it is loaded.
+fn check_dll_directory(dll: &Path) -> Result<()> {
+    sec::check_no_reparse_points(dll)?;
+    let dir = dll
+        .parent()
+        .context("wintun.dll path has no parent directory")?;
+    sec::check_write_acl(dir, &sec::trusted_installer_sids()?)?;
+    Ok(())
+}
+
+/// Open the DLL with read access and a share mode that denies write
+/// (FILE_SHARE_READ only): no one can modify the bytes while the handle is
+/// held across hashing, signature verification and the load.
+fn open_deny_write(path: &Path) -> Result<File> {
+    let wide = sec::wide_path(path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .with_context(|| format!("Failed to open {}", path.display()))?;
+    // SAFETY: `handle` is a valid, owned file handle returned above; the
+    // File takes ownership and closes it on drop.
+    Ok(unsafe { File::from_raw_handle(handle.0 as RawHandle) })
+}
+
+/// Hash check against the pinned digest, read through the deny-write handle
+/// opened above so the hashed bytes are exactly the loaded bytes. Applies to
+/// every path source, including the override: a warning never replaces the
+/// pin.
+fn verify_sha256(file: &File, path: &Path) -> Result<()> {
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut &*file, &mut hasher)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let digest = hex::encode(hasher.finalize());
     if digest != WINTUN_DLL_AMD64_SHA256 {
         bail!(
             "Refusing to load {}: SHA-256 {} does not match the pinned wintun.dll hash {}. \
@@ -125,17 +241,9 @@ fn verify_sha256(path: &Path) -> Result<()> {
 /// unqualified name follows PATH and the working directory, which would
 /// reopen the planted-binary problem this check exists to close.
 fn verify_authenticode(path: &Path) -> Result<()> {
-    let wide = wide_path(path);
+    let wide = sec::wide_path(path);
     verify_trust(path, &wide)?;
     verify_signer(path, &wide)
-}
-
-/// NUL-terminated UTF-16 encoding of a path for the Win32 wide APIs.
-fn wide_path(path: &Path) -> Vec<u16> {
-    path.as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
 }
 
 /// Trust check: WinVerifyTrust with WINTRUST_ACTION_GENERIC_VERIFY_V2. A
@@ -196,8 +304,9 @@ fn verify_trust(path: &Path, wide: &[u16]) -> Result<()> {
 }
 
 /// Signer check: extract the PKCS#7 signature with CryptQueryObject and
-/// confirm the signer's certificate common name is the expected WireGuard
-/// LLC identity.
+/// confirm the signer's certificate common name is exactly the expected
+/// WireGuard LLC identity (case-sensitive: case-insensitive comparison
+/// would accept a differently-cased CN from a rogue CA-issued cert).
 fn verify_signer(path: &Path, wide: &[u16]) -> Result<()> {
     let mut store = HCERTSTORE(std::ptr::null_mut());
     let mut msg: *mut c_void = std::ptr::null_mut();
@@ -317,15 +426,34 @@ fn verify_signer(path: &Path, wide: &[u16]) -> Result<()> {
     // The returned length counts the terminating NUL and may exceed the
     // buffer if the name was truncated; clamp to what was actually written.
     let cn = String::from_utf16_lossy(&name[..(len as usize - 1).min(name.len())]);
-    if !cn.eq_ignore_ascii_case(EXPECTED_SIGNER_SUBJECT) {
+    if cn != EXPECTED_SIGNER_SUBJECT {
         bail!(
-            "Refusing to load {}: signer '{}' is not the expected wintun signer ({}).",
+            "Refusing to load {}: signer '{}' is not exactly the expected wintun signer ({}).",
             path.display(),
             cn,
             EXPECTED_SIGNER_SUBJECT
         );
     }
     Ok(())
+}
+
+/// Load the verified DLL with a restricted search path: dependencies are
+/// resolved only from System32 and the DLL's own directory, never from the
+/// application directory, the working directory or PATH, so the search
+/// order cannot be hijacked. tun-rs loads the same path immediately after;
+/// the Windows loader returns this already-loaded image instead of
+/// re-reading the file, so the verified bytes are the executed bytes.
+fn load_restricted(path: &Path) -> Result<LibraryGuard> {
+    let wide = sec::wide_path(path);
+    let module = unsafe {
+        LoadLibraryExW(
+            PCWSTR::from_raw(wide.as_ptr()),
+            None,
+            LOAD_LIBRARY_FLAGS(LOAD_LIBRARY_SEARCH_SYSTEM32.0 | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR.0),
+        )
+    }
+    .with_context(|| format!("Failed to load {}", path.display()))?;
+    Ok(LibraryGuard(module))
 }
 
 /// Closes the certificate store on every exit path, including early returns.
@@ -377,5 +505,14 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );
+    }
+
+    /// The signer comparison is exact and case-sensitive: a differently
+    /// cased or padded CN must not be accepted.
+    #[test]
+    fn signer_cn_is_exact() {
+        assert_eq!(EXPECTED_SIGNER_SUBJECT, "WireGuard LLC");
+        assert_ne!("wireguard llc", EXPECTED_SIGNER_SUBJECT);
+        assert_ne!("WireGuard LLC ", EXPECTED_SIGNER_SUBJECT);
     }
 }

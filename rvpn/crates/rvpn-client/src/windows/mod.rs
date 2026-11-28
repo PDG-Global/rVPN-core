@@ -2,5 +2,6 @@
 //! WFP IPv6 blocking).
 
 pub mod routes;
+mod sec;
 pub mod wfp;
 pub mod wintun;

@@ -25,7 +25,6 @@
 
 use std::ffi::c_void;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -33,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_BUFFER_OVERFLOW, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS,
-    ERROR_SUCCESS, HLOCAL, LocalFree, WIN32_ERROR,
+    ERROR_SUCCESS, WIN32_ERROR,
 };
 use windows::Win32::NetworkManagement::IpHelper::{
     ConvertInterfaceIndexToLuid, CreateIpForwardEntry2, DNS_INTERFACE_SETTINGS,
@@ -49,19 +48,16 @@ use windows::Win32::Networking::WinSock::{
     MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1,
-    SE_FILE_OBJECT,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows::Win32::Security::{
-    CreateWellKnownSid, EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
-};
-use windows::Win32::Storage::FileSystem::{
-    CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
-};
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Storage::FileSystem::CreateDirectoryW;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 use windows::core::{GUID, HRESULT, PCWSTR, PWSTR, w};
+
+use super::sec;
+use super::sec::check;
 
 /// Fail-closed covering routes. Two /1 routes per family cover the whole
 /// address space without touching the physical default route. IPv6 is
@@ -436,14 +432,14 @@ fn ensure_state_dir(dir: &Path) -> Result<()> {
     }
     .context("failed to build security descriptor for the state directory")?;
     // Frees the descriptor on every exit path below.
-    let _guard = LocalFreeGuard(descriptor.0);
+    let _guard = sec::LocalFreeGuard(descriptor.0);
 
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0,
         bInheritHandle: false.into(),
     };
-    let wide = wide_path(dir);
+    let wide = sec::wide_path(dir);
     match unsafe { CreateDirectoryW(PCWSTR::from_raw(wide.as_ptr()), Some(&attributes)) } {
         Ok(()) => return Ok(()),
         Err(e) if e.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => {}
@@ -453,7 +449,7 @@ fn ensure_state_dir(dir: &Path) -> Result<()> {
     }
     // The directory already existed: it must at least be a real directory,
     // not a junction planted to redirect our writes somewhere else.
-    if get_file_attributes(dir)? & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    if sec::is_reparse_point(dir)? {
         bail!(
             "refusing to use {}: it is a reparse point/junction",
             dir.display()
@@ -467,100 +463,13 @@ fn ensure_state_dir(dir: &Path) -> Result<()> {
 /// process elsewhere) and is owned by SYSTEM or the Administrators group —
 /// matching the ACL the directory is created with.
 fn validate_state_file(path: &Path) -> Result<()> {
-    if get_file_attributes(path)? & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    if sec::is_reparse_point(path)? {
         bail!("file is a reparse point/junction");
     }
-
-    let wide = wide_path(path);
-    let mut owner = PSID(std::ptr::null_mut());
-    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-    let err = unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR::from_raw(wide.as_ptr()),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            Some(&mut owner),
-            None,
-            None,
-            None,
-            &mut descriptor,
-        )
-    };
-    check(err, "GetNamedSecurityInfoW")?;
-    // Frees the security descriptor on every exit path below.
-    let _guard = LocalFreeGuard(descriptor.0);
-    if owner.0.is_null() {
-        bail!("file has no owner SID");
-    }
-
-    // EqualSid reports equality as Ok(()) and inequality as Err, which is
-    // all the comparison needs; the error carries no extra information.
-    let trusted = [WinLocalSystemSid, WinBuiltinAdministratorsSid]
-        .into_iter()
-        .filter_map(|kind| well_known_sid(kind).ok())
-        .any(|sid| unsafe { EqualSid(owner, PSID(sid.as_ptr() as *mut c_void)) }.is_ok());
-    if !trusted {
+    if !sec::owner_is_trusted(path, &sec::trusted_system_sids()?)? {
         bail!("file owner is neither SYSTEM nor Administrators");
     }
     Ok(())
-}
-
-fn get_file_attributes(path: &Path) -> Result<u32> {
-    let wide = wide_path(path);
-    let attrs = unsafe { GetFileAttributesW(PCWSTR::from_raw(wide.as_ptr())) };
-    if attrs == INVALID_FILE_ATTRIBUTES {
-        return Err(windows::core::Error::from_win32())
-            .with_context(|| format!("GetFileAttributesW failed for {}", path.display()));
-    }
-    Ok(attrs)
-}
-
-/// Bytes of a well-known SID (e.g. SYSTEM, Administrators), sized via the
-/// required two-call CreateWellKnownSid pattern.
-fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<Vec<u8>> {
-    let mut size = 0u32;
-    // Expected to fail with ERROR_INSUFFICIENT_BUFFER while filling `size`.
-    let _ = unsafe { CreateWellKnownSid(kind, None, None, &mut size) };
-    if size == 0 {
-        bail!(
-            "CreateWellKnownSid did not report a size for SID type {}",
-            kind.0
-        );
-    }
-    let mut sid = vec![0u8; size as usize];
-    unsafe {
-        CreateWellKnownSid(
-            kind,
-            None,
-            Some(PSID(sid.as_mut_ptr() as *mut c_void)),
-            &mut size,
-        )
-    }
-    .context("CreateWellKnownSid failed")?;
-    Ok(sid)
-}
-
-/// Frees a local allocation (security descriptors returned by
-/// GetNamedSecurityInfoW / ConvertStringSecurityDescriptorToSecurityDescriptorW)
-/// on every exit path.
-struct LocalFreeGuard(*mut c_void);
-
-impl Drop for LocalFreeGuard {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                let _ = LocalFree(Some(HLOCAL(self.0)));
-            }
-        }
-    }
-}
-
-/// NUL-terminated UTF-16 encoding of a path for the Win32 wide APIs.
-fn wide_path(path: &Path) -> Vec<u16> {
-    path.as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
 }
 
 /// Best-effort reversal of every recorded change, in reverse order of
@@ -645,16 +554,6 @@ fn rollback_state(state: &AppliedState) -> AppliedState {
 }
 
 // ---- IP Helper wrappers ---------------------------------------------------
-
-fn check(err: WIN32_ERROR, op: &str) -> Result<()> {
-    if err == ERROR_SUCCESS {
-        Ok(())
-    } else {
-        // HRESULT::from_win32 keeps the original code for display.
-        Err(windows::core::Error::from(HRESULT::from_win32(err.0)))
-            .with_context(|| format!("{op} failed (Win32 error {})", err.0))
-    }
-}
 
 /// LUID of an interface index. The LUID is stable for the adapter's lifetime
 /// and is never reused for a different adapter, unlike the index.

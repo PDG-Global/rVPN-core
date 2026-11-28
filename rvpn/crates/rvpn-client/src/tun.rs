@@ -50,6 +50,11 @@ impl TunDevice {
             // Use specified interface name
             info!("Creating TUN device '{}' with IP {}", name, ip_cidr);
             {
+                // Windows: resolve + verify wintun.dll first; the guard holds
+                // the deny-write handle and the loaded module until after
+                // build_sync, which is when tun-rs opens the DLL itself.
+                #[cfg(windows)]
+                let wintun = crate::windows::wintun::resolve_and_verify()?;
                 let builder = tun_rs::DeviceBuilder::new()
                     .name(name)
                     .mtu(config.mtu)
@@ -58,11 +63,7 @@ impl TunDevice {
                 #[cfg(not(windows))]
                 let builder = builder.packet_information(false);
                 #[cfg(windows)]
-                let builder = builder.wintun_file(
-                    crate::windows::wintun::resolve_and_verify()?
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+                let builder = builder.wintun_file(wintun.path().to_string_lossy().into_owned());
                 builder
                     .build_sync()
                     .with_context(|| format!("Failed to create TUN device '{}'", name))?
@@ -71,6 +72,8 @@ impl TunDevice {
             // Auto-assign interface name
             info!("Creating TUN device with auto-assigned name");
             {
+                #[cfg(windows)]
+                let wintun = crate::windows::wintun::resolve_and_verify()?;
                 let builder = tun_rs::DeviceBuilder::new()
                     .mtu(config.mtu)
                     .layer(tun_rs::Layer::L3)
@@ -78,11 +81,7 @@ impl TunDevice {
                 #[cfg(not(windows))]
                 let builder = builder.packet_information(false);
                 #[cfg(windows)]
-                let builder = builder.wintun_file(
-                    crate::windows::wintun::resolve_and_verify()?
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+                let builder = builder.wintun_file(wintun.path().to_string_lossy().into_owned());
                 builder
                     .build_sync()
                     .with_context(|| "Failed to create TUN device (auto-name)")?
