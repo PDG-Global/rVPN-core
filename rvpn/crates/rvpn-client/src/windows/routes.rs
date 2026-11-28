@@ -702,8 +702,16 @@ fn luid_matches(best: NET_LUID_LH, expected: NET_LUID_LH) -> bool {
 /// connected instead of staying up with a silent leak.
 fn verify_routes_resolve_via_adapter(luid: NET_LUID_LH) -> Result<()> {
     for dest in [IpAddr::V4(VERIFY_V4), IpAddr::V6(VERIFY_V6)] {
-        let best =
-            best_route_luid(dest).with_context(|| format!("route lookup for {dest} failed"))?;
+        let best = match best_route_luid(dest) {
+            Ok(best) => best,
+            Err(err) => {
+                // A lookup error (e.g. ERROR_NETWORK_UNREACHABLE when
+                // next-hop resolution fails on the no-ARP interface) leaks
+                // just as surely as a wrong LUID: dump before failing.
+                dump_route_leak(dest, luid);
+                return Err(err).with_context(|| format!("route lookup for {dest} failed"));
+            }
+        };
         if !luid_matches(best, luid) {
             dump_route_leak(dest, luid);
             bail!(
@@ -738,8 +746,15 @@ fn adapter_is_up(luid: NET_LUID_LH) -> Result<()> {
 fn watchdog_check(luid: NET_LUID_LH, ops: &WatchdogOps) -> Result<()> {
     (ops.adapter_up)(luid).context("wintun adapter check failed")?;
     for dest in [IpAddr::V4(VERIFY_V4), IpAddr::V6(VERIFY_V6)] {
-        let best =
-            (ops.best_route)(dest).with_context(|| format!("route lookup for {dest} failed"))?;
+        let best = match (ops.best_route)(dest) {
+            Ok(best) => best,
+            Err(err) => {
+                // Same as the mismatch below: a lookup error means traffic
+                // would not take the tunnel — dump before failing.
+                dump_route_leak(dest, luid);
+                return Err(err).with_context(|| format!("route lookup for {dest} failed"));
+            }
+        };
         if !luid_matches(best, luid) {
             dump_route_leak(dest, luid);
             bail!("route lookup for {dest} no longer resolves via the tunnel adapter");
@@ -767,8 +782,9 @@ pub async fn watchdog(luid: NET_LUID_LH, ops: WatchdogOps) -> Result<()> {
 
 /// Dump route-leak diagnostics when RVPN_ROUTE_DEBUG=1; a no-op otherwise.
 /// Called on the fail-closed verification path and the watchdog's
-/// route-leak path; the callers still bail and roll back, so the dump only
-/// explains the failure.
+/// route-leak path, both when the lookup resolves via the wrong interface
+/// and when the lookup itself errors (e.g. ERROR_NETWORK_UNREACHABLE); the
+/// callers still bail and roll back, so the dump only explains the failure.
 fn dump_route_leak(dest: IpAddr, expected_luid: NET_LUID_LH) {
     if std::env::var_os(ROUTE_DEBUG_ENV).is_some() {
         diagnose_route_leak(dest, expected_luid);
