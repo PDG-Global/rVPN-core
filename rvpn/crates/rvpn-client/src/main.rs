@@ -640,6 +640,24 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
             }
         };
 
+        // IPv6 fail-closed: the covering ::/1 + 8000::/1 routes blackhole v6
+        // into the tunnel, but the server has no v6 lease, so it is dropped
+        // there (fail-closed, but slow timeouts). WFP block filters make
+        // apps fail fast instead. Filters are non-persistent: they vanish
+        // when this process exits or crashes. The covering routes are the
+        // leak protection; if the WFP add fails, v6 is still blackholed.
+        #[cfg(windows)]
+        let _v6_block_guard = match crate::windows::wfp::block_ipv6() {
+            Ok(g) => {
+                info!("IPv6 blocked while connected (server has no IPv6 lease)");
+                Some(g)
+            }
+            Err(e) => {
+                warn!("WFP IPv6 block failed ({:#}); v6 still blackholed by covering routes", e);
+                None
+            }
+        };
+
         // Run TUN device until tunnel disconnects OR shutdown signal received
         // Use tokio::select! to wait on both simultaneously
         let (local_shutdown_tx, local_shutdown_rx) = tokio::sync::watch::channel(false);

@@ -16,6 +16,18 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+/// Fail-closed covering routes. Two /1 routes per family cover the whole
+/// address space without touching the physical default route. IPv6 is
+/// covered even when the server assigns no v6 lease: v6 traffic must be
+/// blocked, never sent directly over the physical adapter (the leak is
+/// worse than the blackhole). The WFP block in `wfp.rs` makes that
+/// blackhole fail fast.
+pub(crate) const V4_COVERING: [(Ipv4Addr, Ipv4Addr); 2] = [
+    (Ipv4Addr::new(0, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)),
+    (Ipv4Addr::new(128, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)),
+];
+pub(crate) const V6_COVERING: [&str; 2] = ["::/1", "8000::/1"];
+
 /// Everything needed to set up tunnel routing.
 pub struct RouteConfig {
     /// IP of the VPN server we connect to (must stay routed via the
@@ -136,10 +148,7 @@ impl RouteGuard {
 
         // 2. IPv4: 0.0.0.0/1 + 128.0.0.0/1 via the adapter (covers the whole
         //    space without touching the physical default route).
-        for (net, mask) in [
-            (Ipv4Addr::new(0, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)),
-            (Ipv4Addr::new(128, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)),
-        ] {
+        for (net, mask) in V4_COVERING {
             route_add_v4_via_adapter(net, mask, self.cfg.adapter_ipv4, self.cfg.adapter_index)?;
         }
         self.state.ipv4_covered = true;
@@ -148,7 +157,7 @@ impl RouteGuard {
         // 3. IPv6: ::/1 + 8000::/1 via the adapter. If the adapter has no
         //    IPv6, block nothing here — the leak check in the smoke test
         //    must confirm no ::/0 traffic escapes on the physical NIC.
-        for prefix in ["::/1", "8000::/1"] {
+        for prefix in V6_COVERING {
             route_add_v6_via_adapter(prefix, self.cfg.adapter_index)?;
         }
         self.state.ipv6_covered = true;
@@ -203,17 +212,14 @@ fn rollback_state(state: &AppliedState) {
         }
     }
     if state.ipv6_covered {
-        for prefix in ["::/1", "8000::/1"] {
+        for prefix in V6_COVERING {
             if let Err(e) = route_delete_v6(prefix) {
                 warn!("failed to delete IPv6 route {prefix}: {e:#}");
             }
         }
     }
     if state.ipv4_covered {
-        for (net, mask) in [
-            (Ipv4Addr::new(0, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)),
-            (Ipv4Addr::new(128, 0, 0, 0), Ipv4Addr::new(128, 0, 0, 0)),
-        ] {
+        for (net, mask) in V4_COVERING {
             if let Err(e) = route_delete_v4(net, mask) {
                 warn!("failed to delete route {net}/{mask}: {e:#}");
             }
@@ -380,4 +386,46 @@ fn restore_interface_metric() -> Result<()> {
          Set-NetIPInterface -AutomaticMetric Enabled",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the fail-closed contract: both families are covered by exactly
+    /// the two /1 routes, so no traffic — IPv6 included, lease or not — can
+    /// take the physical default route while the tunnel is up.
+    #[test]
+    fn covering_routes_are_fail_closed() {
+        assert_eq!(V4_COVERING.len(), 2);
+        assert_eq!(V6_COVERING.len(), 2);
+        let mut covered = V4_COVERING
+            .iter()
+            .map(|(net, mask)| (net, mask))
+            .collect::<Vec<_>>();
+        covered.sort();
+        // The two /1 halves must be complementary and exhaustive.
+        assert_eq!(covered[0].0, &Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(covered[1].0, &Ipv4Addr::new(128, 0, 0, 0));
+        assert!(
+            covered
+                .iter()
+                .all(|(_, m)| *m == &Ipv4Addr::new(128, 0, 0, 0))
+        );
+        assert!(V6_COVERING.contains(&"::/1"));
+        assert!(V6_COVERING.contains(&"8000::/1"));
+    }
+
+    /// The state file must record IPv6 coverage so crash recovery tears the
+    /// v6 block down exactly like the v4 one.
+    #[test]
+    fn applied_state_records_ipv6_coverage() {
+        let state = AppliedState {
+            ipv6_covered: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: AppliedState = serde_json::from_str(&json).unwrap();
+        assert!(restored.ipv6_covered);
+    }
 }
