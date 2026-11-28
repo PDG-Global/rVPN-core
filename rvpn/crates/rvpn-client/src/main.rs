@@ -644,6 +644,28 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
 
         info!("TUN device ready");
 
+        // Windows: tun-rs assigns the tunnel address without touching DAD,
+        // so it can still be Tentative when the covering routes are verified;
+        // source address selection then fails and route lookups error with
+        // ERROR_NETWORK_UNREACHABLE. DAD is meaningless on a point-to-point
+        // tunnel interface — force the address to Preferred before route
+        // setup. A Duplicate report is a real address conflict and fails the
+        // connect attempt (retried like a route-setup failure).
+        #[cfg(windows)]
+        {
+            if let Some(assigned_ip) = virtual_ip {
+                let if_index = tun_device.adapter_index()?;
+                if let Err(e) = crate::windows::routes::force_dad_preferred(if_index, assigned_ip) {
+                    error!("Failed to finalize tunnel address DAD state: {:#}", e);
+                    reconnect_attempts += 1;
+                    let delay = retry_delay(reconnect_attempts);
+                    warn!("Retrying in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+        }
+
         // Windows: pin the server host route, cover IPv4 (two /1s) and IPv6
         // (::/1 + 8000::/1) via the adapter, and set adapter DNS with a
         // winning interface metric. Every change is persisted to the state

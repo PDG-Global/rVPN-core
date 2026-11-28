@@ -39,14 +39,16 @@ use windows::Win32::NetworkManagement::IpHelper::{
     DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, FreeMibTable,
     GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
     GAA_FLAG_SKIP_UNICAST, GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses, GetBestRoute2,
-    GetIfEntry2, GetIpForwardTable2, GetIpInterfaceEntry, IP_ADAPTER_ADDRESSES_LH,
-    IP_ADDRESS_PREFIX, InitializeIpInterfaceEntry, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
-    MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW, SetInterfaceDnsSettings, SetIpInterfaceEntry,
+    GetIfEntry2, GetIpForwardTable2, GetIpInterfaceEntry, GetUnicastIpAddressEntry,
+    IP_ADAPTER_ADDRESSES_LH, IP_ADDRESS_PREFIX, InitializeIpInterfaceEntry, MIB_IF_ROW2,
+    MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
+    SetInterfaceDnsSettings, SetIpInterfaceEntry, SetUnicastIpAddressEntry,
 };
 use windows::Win32::NetworkManagement::Ndis::{IfOperStatusUp, NET_LUID_LH};
 use windows::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0,
-    MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
+    IpDadStateDuplicate, IpDadStatePreferred, MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_IN6,
+    SOCKADDR_INET,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -693,6 +695,95 @@ fn best_route_luid(dest: IpAddr) -> Result<NET_LUID_LH> {
 /// interface index it is never reused for a different adapter.
 fn luid_matches(best: NET_LUID_LH, expected: NET_LUID_LH) -> bool {
     luid_value(best) == luid_value(expected)
+}
+
+// ---- tunnel address DAD ---------------------------------------------------
+
+/// Read/write access to a unicast-address row, injectable for tests.
+#[derive(Clone, Copy)]
+struct DadOps {
+    get: fn(Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW>,
+    set: fn(&MIB_UNICASTIPADDRESS_ROW) -> Result<()>,
+}
+
+const WIN32_DAD_OPS: DadOps = DadOps {
+    get: get_unicast_address_row,
+    set: set_unicast_address_row,
+};
+
+/// Current unicast-address row for `addr`. The row is keyed by address: an
+/// IPv4 address exists on exactly one interface, and the returned row names
+/// it (InterfaceLuid).
+fn get_unicast_address_row(addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    row.Address = sockaddr_inet(IpAddr::V4(addr));
+    let err = unsafe { GetUnicastIpAddressEntry(&mut row) };
+    check(err, "GetUnicastIpAddressEntry")?;
+    Ok(row)
+}
+
+fn set_unicast_address_row(row: &MIB_UNICASTIPADDRESS_ROW) -> Result<()> {
+    let err = unsafe { SetUnicastIpAddressEntry(row) };
+    check(err, "SetUnicastIpAddressEntry")
+}
+
+/// What force_dad_preferred did with the address's DAD state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DadForce {
+    /// Already Preferred: nothing to change.
+    AlreadyPreferred,
+    /// Was mid-DAD (e.g. Tentative); forced to Preferred.
+    Forced,
+}
+
+/// Force the tunnel address out of duplicate address detection into
+/// Preferred. tun-rs assigns the address without touching DadState, and
+/// while it is still Tentative source-address selection fails: GetBestRoute2
+/// then errors with ERROR_NETWORK_UNREACHABLE even though the covering
+/// routes exist. DAD is meaningless on a point-to-point tunnel interface
+/// (wireguard-windows sets IpDadStatePreferred when adding the address for
+/// the same reason). A Duplicate report is a real address conflict and fails
+/// closed instead of being papered over.
+///
+/// Deliberately NOT part of TunDevice::create_with_ip: the route_diag_probe
+/// test calls create_with_ip and must observe the raw tun-rs DAD behavior.
+pub fn force_dad_preferred(adapter_index: u32, addr: Ipv4Addr) -> Result<()> {
+    let luid = interface_luid(adapter_index)?;
+    match force_dad_preferred_with_ops(luid, addr, WIN32_DAD_OPS)? {
+        DadForce::AlreadyPreferred => {
+            info!("tunnel address {addr} already usable (DAD state Preferred)")
+        }
+        DadForce::Forced => info!(
+            "tunnel address {addr} forced past duplicate address detection \
+             (DAD is meaningless on the point-to-point tunnel interface)"
+        ),
+    }
+    Ok(())
+}
+
+fn force_dad_preferred_with_ops(
+    adapter_luid: NET_LUID_LH,
+    addr: Ipv4Addr,
+    ops: DadOps,
+) -> Result<DadForce> {
+    let mut row = (ops.get)(addr)?;
+    if !luid_matches(row.InterfaceLuid, adapter_luid) {
+        bail!(
+            "tunnel address {addr} lives on a different interface (luid {:#x}); \
+             refusing to touch it",
+            unsafe { row.InterfaceLuid.Value },
+        );
+    }
+    if row.DadState == IpDadStatePreferred {
+        return Ok(DadForce::AlreadyPreferred);
+    }
+    if row.DadState == IpDadStateDuplicate {
+        error!("tunnel address {addr} conflicts with another host (DAD duplicate)");
+        bail!("tunnel address {addr} is a DAD duplicate; refusing to connect");
+    }
+    row.DadState = IpDadStatePreferred;
+    (ops.set)(&row)?;
+    Ok(DadForce::Forced)
 }
 
 /// Fail-closed leak check run after the covering routes are installed: the
@@ -1363,9 +1454,6 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use windows::Win32::NetworkManagement::IpHelper::{
-        GetUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
-    };
     use windows::Win32::Networking::WinSock::{
         IpDadStateTentative, MIB_IPPROTO_NT_STATIC, NL_DAD_STATE,
     };
@@ -1666,6 +1754,113 @@ mod tests {
         let msg = format!("{e:#}");
         assert!(msg.contains("route lookup"));
         assert!(msg.contains("1.1.1.1"));
+    }
+
+    // ---- tunnel address DAD -------------------------------------------------
+
+    fn dad_test_row(state: NL_DAD_STATE, luid: u64) -> MIB_UNICASTIPADDRESS_ROW {
+        let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+        row.Address = sockaddr_inet(IpAddr::V4(Ipv4Addr::new(10, 200, 0, 3)));
+        row.InterfaceLuid = luid_from_value(luid);
+        row.DadState = state;
+        row
+    }
+
+    static DAD_SET_STATES: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+    fn stub_dad_get_tentative(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+        Ok(dad_test_row(IpDadStateTentative, TEST_ADAPTER_LUID))
+    }
+
+    fn stub_dad_get_preferred(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+        Ok(dad_test_row(IpDadStatePreferred, TEST_ADAPTER_LUID))
+    }
+
+    fn stub_dad_get_duplicate(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+        Ok(dad_test_row(IpDadStateDuplicate, TEST_ADAPTER_LUID))
+    }
+
+    fn stub_dad_get_wrong_interface(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+        Ok(dad_test_row(IpDadStateTentative, TEST_PHYSICAL_LUID))
+    }
+
+    fn stub_dad_set_record(row: &MIB_UNICASTIPADDRESS_ROW) -> Result<()> {
+        DAD_SET_STATES.lock().unwrap().push(row.DadState.0);
+        Ok(())
+    }
+
+    fn stub_dad_set_fail(_row: &MIB_UNICASTIPADDRESS_ROW) -> Result<()> {
+        bail!("SetUnicastIpAddressEntry must not be called")
+    }
+
+    /// A Tentative address (mid-DAD) is forced to Preferred: the row Windows
+    /// handed back is written back with only DadState changed.
+    #[test]
+    fn dad_tentative_is_forced_to_preferred() {
+        DAD_SET_STATES.lock().unwrap().clear();
+        let ops = DadOps {
+            get: stub_dad_get_tentative,
+            set: stub_dad_set_record,
+        };
+        let result = force_dad_preferred_with_ops(
+            luid_from_value(TEST_ADAPTER_LUID),
+            Ipv4Addr::new(10, 200, 0, 3),
+            ops,
+        );
+        assert_eq!(result.unwrap(), DadForce::Forced);
+        assert_eq!(
+            DAD_SET_STATES.lock().unwrap().as_slice(),
+            [IpDadStatePreferred.0]
+        );
+    }
+
+    /// An address already past DAD is left untouched (no Set call).
+    #[test]
+    fn dad_preferred_is_left_untouched() {
+        let ops = DadOps {
+            get: stub_dad_get_preferred,
+            set: stub_dad_set_fail,
+        };
+        let result = force_dad_preferred_with_ops(
+            luid_from_value(TEST_ADAPTER_LUID),
+            Ipv4Addr::new(10, 200, 0, 3),
+            ops,
+        );
+        assert_eq!(result.unwrap(), DadForce::AlreadyPreferred);
+    }
+
+    /// A DAD duplicate is a real address conflict: fail closed, never paper
+    /// over it by forcing the state.
+    #[test]
+    fn dad_duplicate_fails_closed() {
+        let ops = DadOps {
+            get: stub_dad_get_duplicate,
+            set: stub_dad_set_fail,
+        };
+        let e = force_dad_preferred_with_ops(
+            luid_from_value(TEST_ADAPTER_LUID),
+            Ipv4Addr::new(10, 200, 0, 3),
+            ops,
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("duplicate"));
+    }
+
+    /// The address row must belong to our adapter; forcing the state of an
+    /// address living on another interface is refused.
+    #[test]
+    fn dad_row_on_another_interface_is_refused() {
+        let ops = DadOps {
+            get: stub_dad_get_wrong_interface,
+            set: stub_dad_set_fail,
+        };
+        let e = force_dad_preferred_with_ops(
+            luid_from_value(TEST_ADAPTER_LUID),
+            Ipv4Addr::new(10, 200, 0, 3),
+            ops,
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("different interface"));
     }
 
     // ---- elevated manual diagnostic probe -----------------------------------
