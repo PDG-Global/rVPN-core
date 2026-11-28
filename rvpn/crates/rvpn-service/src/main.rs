@@ -5,18 +5,18 @@
 //! admin; it drives this service over the ACL'd named pipe
 //! `\\.\pipe\rvpn-service` (see pipe.rs).
 
-#[cfg(not(windows))]
-compile_error!("rvpn-service is a Windows-only crate");
-
 #[cfg(windows)]
 mod pipe;
 mod protocol;
 #[cfg(windows)]
 mod service;
 
+#[cfg(windows)]
 use anyhow::Result;
+#[cfg(windows)]
 use tracing_subscriber::EnvFilter;
 
+#[cfg(windows)]
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -39,4 +39,10 @@ fn main() -> Result<()> {
         #[cfg(not(windows))]
         unreachable!();
     }
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("rvpn-service is a Windows-only binary; nothing to do on this platform");
+    std::process::exit(2);
 }
