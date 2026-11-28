@@ -4,25 +4,35 @@
 //! Client admission control for rvpn-server (deny-by-default allow-list).
 //!
 //! Model (Thomas, #rVPN:#32): an unknown client identity key is refused at
-//! the handshake, after the X3DH proof, with ONE outward refusal code for
-//! unknown and revoked keys alike — an outsider must never learn whether a
-//! key was ever approved. Refused keys are recorded in a pending list
-//! (fingerprint + timestamps + attempt count only — **no IP addresses**, in
-//! line with the no-logs claims). An operator approves or revokes with the
+//! the handshake with ONE outward refusal shape for unknown and revoked keys
+//! alike — an outsider must never learn whether a key was ever approved.
+//! Admission runs only after the client has PROVED it holds its identity key
+//! (S1: key-confirmation MAC over the Hello, verified before `check()`).
+//! Refused keys are recorded in a pending list (fingerprint + timestamps +
+//! attempt count only — **no IP addresses**, in line with the no-logs
+//! claims). An operator approves or revokes with the
 //! `rvpn-server clients ...` subcommands, which edit a root-0600 allow-list
-//! file; the running server reloads it on change without a restart, and
-//! revoking drops live sessions. Rollout: `learn` mode first (admit and
-//! record the keys already connecting), then `enforce` once the operator has
-//! reviewed the learned list. Admin is local only — no network admin API.
+//! file under an `flock`; the running server reloads it on change without a
+//! restart, and revoking drops live sessions via a per-session registration
+//! channel plus a background reload task. Rollout: `learn` mode first
+//! (admit and record the PROVEN keys already connecting), then `enforce`
+//! once the operator has reviewed the learned list. Admin is local only —
+//! no network admin API.
+//!
+//! Failure policy (review round 2): a missing file is fine (empty list);
+//! an UNREADABLE or UNPARSEABLE file keeps the last good list in memory,
+//! and when the effective mode is `enforce` the server fails CLOSED —
+//! refuses every key — rather than falling open to learn.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -30,11 +40,11 @@ use tracing::{debug, info, warn};
 /// The handshake error code sent for a refused client key (unknown OR
 /// revoked — identical either way). Clients map this to their
 /// "waiting for approval" state (Victoria, #rVPN:3865ad67).
-pub const ADMISSION_REFUSAL_CODE: u16 = 20;
+pub const ADMISSION_REFUSAL_CODE: u16 = rvpn_core::crypto::admission::REFUSAL_CODE;
 
 /// The refusal message body. Fixed and detail-free by design: it must not
 /// say anything about which keys exist.
-pub const ADMISSION_REFUSAL_MESSAGE: &str = "pending_approval";
+pub const ADMISSION_REFUSAL_MESSAGE: &str = rvpn_core::crypto::admission::REFUSAL_MESSAGE;
 
 /// Cap on pending-list entries (oldest untouched entries are evicted).
 const PENDING_CAP: usize = 512;
@@ -43,14 +53,41 @@ const PENDING_CAP: usize = 512;
 /// (rate-limits the pending list against handshake spam).
 const PENDING_UPDATE_MIN_SECS: u64 = 60;
 
+/// Cap on learned keys. Beyond it, learn mode still admits but records no
+/// more (the operator must review and enforce anyway).
+const LEARNED_CAP: usize = 4096;
+
+/// Process-wide refusal rate limit (tokens per second, burst 2×): a flood
+/// of unknown keys cannot make the server do pending work at line rate.
+const REFUSAL_RATE_PER_SEC: f64 = 30.0;
+
+/// Pending-list flush interval (seconds) — the list lives in memory and is
+/// persisted periodically, not on every refusal.
+const PENDING_FLUSH_SECS: u64 = 30;
+
+/// Minimum fingerprint-prefix length accepted by the admin commands.
+pub const MIN_PREFIX_LEN: usize = 16;
+
 /// Operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AdmissionMode {
-    /// Admit every key and record it as learned (rollout phase 1).
+    /// Admit every key; record PROVEN keys as learned (rollout phase 1).
     Learn,
     /// Admit only approved keys; refuse the rest (rollout phase 2).
     Enforce,
+}
+
+/// Parse a config-mode string. Unknown values are a startup ERROR (S7):
+/// silently falling back could turn admission off.
+pub fn parse_admission_mode(s: &str) -> Result<AdmissionMode, String> {
+    match s.to_lowercase().as_str() {
+        "enforce" => Ok(AdmissionMode::Enforce),
+        "learn" => Ok(AdmissionMode::Learn),
+        other => Err(format!(
+            "admission.mode '{other}' is not one of: learn, enforce"
+        )),
+    }
 }
 
 /// One approved client.
@@ -75,6 +112,10 @@ pub struct AllowList {
     pub mode: Option<AdmissionMode>,
     #[serde(default)]
     pub clients: Vec<AllowedClient>,
+    /// Explicitly revoked keys (S6): never re-learned, refused in BOTH
+    /// modes. `revoke` adds here; `approve` removes.
+    #[serde(default)]
+    pub denied: Vec<String>,
 }
 
 /// One refused-key record in the pending list.
@@ -99,20 +140,6 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-/// Parse a config-mode string. Unknown values fall back to learn (the
-/// safer rollout mode) with a warning, since refusing every client on a
-/// typo is worse.
-pub fn parse_admission_mode(s: &str) -> AdmissionMode {
-    match s.to_lowercase().as_str() {
-        "enforce" => AdmissionMode::Enforce,
-        "learn" => AdmissionMode::Learn,
-        other => {
-            warn!("admission: unknown mode '{other}', falling back to learn");
-            AdmissionMode::Learn
-        }
-    }
-}
-
 /// SHA-256 fingerprint of a client identity key, full hex.
 pub fn fingerprint_of(identity_key: &[u8; 32]) -> String {
     hex::encode(Sha256::digest(identity_key))
@@ -123,53 +150,190 @@ pub fn short_fingerprint(fp: &str) -> String {
     fp.chars().take(16).collect()
 }
 
-/// Write a file root-0600 atomically (temp file + rename).
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
+/// Strip control characters from an operator label before printing it
+/// (nit: labels must not smuggle terminal escapes into operator output).
+fn sanitize_label(label: &str) -> String {
+    label.chars().filter(|c| !c.is_control()).collect()
 }
 
-fn read_json_or_default<T: Default + for<'de> Deserialize<'de>>(path: &Path) -> T {
+// ---------------------------------------------------------------------------
+// File handling. Every write: unique temp file (create-new, no-follow) →
+// write → fsync → rename → fsync the parent dir. Read-modify-write cycles
+// in the CLI hold an flock on `<file>.lock`.
+// ---------------------------------------------------------------------------
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// An flock guard for a path's lock file. Lock file is created 0600; the
+/// lock releases on drop.
+struct FileLock {
+    file: fs::File,
+}
+
+impl FileLock {
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        let lock_path = path.with_extension("lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)?;
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&self.file);
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+    }
+}
+
+/// Write a file root-0600 atomically: unique temp (create-new, no-follow),
+/// fsync, rename, fsync dir. A stale same-name temp can never be followed.
+fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), n));
+    let res = (|| -> std::io::Result<()> {
+        {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            if let Ok(d) = fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// Make sure an existing file is 0600 (nit: older temp/audit files may
+/// carry looser modes from before this module).
+fn tighten_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(md) = fs::metadata(path) {
+        let mode = md.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+/// File identity for change detection: (mtime, length, inode). Catches a
+/// same-mtime replacement that mtime-only comparison misses (S3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    mtime: SystemTime,
+    len: u64,
+    ino: u64,
+}
+
+fn stamp_of(path: &Path) -> Option<FileStamp> {
+    let md = fs::metadata(path).ok()?;
+    Some(FileStamp {
+        mtime: md.modified().ok()?,
+        len: md.len(),
+        ino: md.ino(),
+    })
+}
+
+enum FileRead<T> {
+    Ok(T),
+    Missing,
+    Corrupt,
+}
+
+/// Read a JSON file, distinguishing "missing" (empty default is fine) from
+/// "corrupt" (keep the last good list — never silently wipe state, B2).
+fn read_json<T: Default + for<'de> Deserialize<'de>>(path: &Path) -> FileRead<T> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => T::default(),
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(v) => FileRead::Ok(v),
+            Err(_) => FileRead::Corrupt,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileRead::Missing,
+        Err(_) => FileRead::Corrupt,
     }
 }
 
 /// The decision for one handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionDecision {
-    /// Key is approved (or mode is learn and the key was recorded).
+    /// Key is approved (or mode is learn and the key is not denied).
     Admit,
-    /// Key is not approved; refuse with the pending_approval shape.
+    /// Key is not approved (or explicitly denied); refuse with the
+    /// pending_approval shape.
     Refuse,
 }
 
 struct AdmissionState {
     allow: AllowList,
-    mtime: Option<SystemTime>,
-    /// fingerprint → session-close senders (revocation drops live sessions).
-    sessions: HashMap<String, Vec<oneshot::Sender<()>>>,
+    stamp: Option<FileStamp>,
+    /// The allow-list file could not be read/parsed at last attempt; the
+    /// in-memory list is the last good one. In enforce mode this fails
+    /// closed (B2).
+    file_degraded: bool,
+    /// fingerprint → live session registrations (revocation drops them).
+    sessions: HashMap<String, Vec<(u64, oneshot::Sender<()>)>>,
+    next_session_id: u64,
+    /// In-memory pending list (flushed periodically, S4).
+    pending: Vec<PendingEntry>,
+    pending_dirty: bool,
+    last_pending_flush: u64,
+    /// Process-wide refusal token bucket.
+    refusal_tokens: f64,
+    refusal_refill_at: u64,
 }
 
-/// Shared admission controller. Cheap to clone (Arc inside).
+/// A live session's admission registration (S8: drop guard). When it
+/// drops, the registration is removed — by id, so ending one session of a
+/// key can never kill another of the same key (B3).
+pub struct SessionRegistration {
+    admission: Admission,
+    fingerprint: String,
+    id: u64,
+    /// Fires with `Ok(())` when a reload revokes the key. `Err(Closed)`
+    /// means the registration is stale (already removed) — it must NEVER be
+    /// treated as a revocation.
+    pub revoke_rx: Option<oneshot::Receiver<()>>,
+}
+
+impl Drop for SessionRegistration {
+    fn drop(&mut self) {
+        let admission = self.admission.clone();
+        let fp = std::mem::take(&mut self.fingerprint);
+        let id = self.id;
+        tokio::spawn(async move {
+            admission.unregister_by_id(&fp, id).await;
+        });
+    }
+}
+
+/// Shared admission controller. Cheap to clone (Arc inside); ONE instance
+/// is built in `run_server` and shared by every handler (B1).
 #[derive(Clone)]
 pub struct Admission {
     inner: Arc<Mutex<AdmissionState>>,
-    allow_path: PathBuf,
-    pending_path: PathBuf,
-    audit_path: PathBuf,
+    allow_path: Arc<PathBuf>,
+    pending_path: Arc<PathBuf>,
+    audit_path: Arc<PathBuf>,
     /// Mode from the config file; the allow-list file's `mode` field (when
     /// set) wins, so operators can flip learn → enforce without a restart.
     config_mode: AdmissionMode,
@@ -188,16 +352,40 @@ impl Admission {
         pending_file: PathBuf,
         audit_file: PathBuf,
     ) -> Self {
-        let allow = read_json_or_default::<AllowList>(&allow_file);
+        let allow = match read_json::<AllowList>(&allow_file) {
+            FileRead::Ok(v) => v,
+            _ => AllowList::default(),
+        };
+        let pending = match read_json::<PendingList>(&pending_file) {
+            FileRead::Ok(v) => v.entries,
+            _ => Vec::new(),
+        };
+        tighten_permissions(&allow_file);
+        tighten_permissions(&pending_file);
+        tighten_permissions(&audit_file);
+        let degraded = matches!(read_json::<AllowList>(&allow_file), FileRead::Corrupt);
+        if degraded {
+            warn!(
+                "admission: allow-list file {} is unreadable/corrupt; keeping empty in-memory list and failing closed if enforcing",
+                allow_file.display()
+            );
+        }
         Self {
             inner: Arc::new(Mutex::new(AdmissionState {
                 allow,
-                mtime: fs::metadata(&allow_file).and_then(|m| m.modified()).ok(),
+                stamp: stamp_of(&allow_file),
+                file_degraded: degraded,
                 sessions: HashMap::new(),
+                next_session_id: 1,
+                pending,
+                pending_dirty: false,
+                last_pending_flush: now_unix(),
+                refusal_tokens: REFUSAL_RATE_PER_SEC * 2.0,
+                refusal_refill_at: now_unix(),
             })),
-            allow_path: allow_file,
-            pending_path: pending_file,
-            audit_path: audit_file,
+            allow_path: Arc::new(allow_file),
+            pending_path: Arc::new(pending_file),
+            audit_path: Arc::new(audit_file),
             config_mode: mode,
             enabled,
         }
@@ -219,59 +407,110 @@ impl Admission {
         allow.mode.unwrap_or(self.config_mode)
     }
 
-    /// Reload the allow-list if the file changed; revoke live sessions whose
-    /// fingerprint is no longer approved (enforce mode only).
-    async fn reload_if_changed(&self) {
-        let mtime = fs::metadata(&self.allow_path)
-            .and_then(|m| m.modified())
-            .ok();
-        let mut st = self.inner.lock().await;
-        if mtime == st.mtime {
+    /// Reload the allow-list if the file changed (mtime + length + inode,
+    /// S3). Parse errors keep the last good list and mark the file
+    /// degraded; a recovered file clears the flag. Revoked live sessions
+    /// are dropped (enforce mode).
+    pub async fn reload_if_changed(&self) {
+        if !self.enabled {
             return;
         }
-        st.mtime = mtime;
-        let new_allow = read_json_or_default::<AllowList>(&self.allow_path);
-        let mode = self.effective_mode(&new_allow);
-        if mode == AdmissionMode::Enforce {
-            // Drop live sessions whose fingerprint fell out of the list.
-            let approved: std::collections::HashSet<&str> = new_allow
-                .clients
-                .iter()
-                .map(|c| c.fingerprint.as_str())
-                .collect();
-            let mut dropped = Vec::new();
-            st.sessions.retain(|fp, senders| {
-                if approved.contains(fp.as_str()) {
-                    true
-                } else {
-                    dropped.append(senders);
-                    false
+        let stamp = stamp_of(&self.allow_path);
+        let mut st = self.inner.lock().await;
+        if stamp == st.stamp {
+            return;
+        }
+        st.stamp = stamp;
+        match read_json::<AllowList>(&self.allow_path) {
+            FileRead::Ok(new_allow) => {
+                if st.file_degraded {
+                    info!("admission: allow-list file readable again");
                 }
-            });
-            for tx in dropped {
-                let _ = tx.send(());
+                st.file_degraded = false;
+                let mode = self.effective_mode(&new_allow);
+                if mode == AdmissionMode::Enforce {
+                    // Drop live sessions whose fingerprint fell out of the
+                    // approved set (or landed on the deny list).
+                    let approved: std::collections::HashSet<&str> = new_allow
+                        .clients
+                        .iter()
+                        .map(|c| c.fingerprint.as_str())
+                        .filter(|fp| !new_allow.denied.iter().any(|d| d == fp))
+                        .collect();
+                    let mut dropped = Vec::new();
+                    st.sessions.retain(|fp, senders| {
+                        if approved.contains(fp.as_str()) {
+                            true
+                        } else {
+                            dropped.append(senders);
+                            false
+                        }
+                    });
+                    for (_, tx) in dropped {
+                        let _ = tx.send(());
+                    }
+                    debug!("admission: reloaded allow-list (enforce), sessions pruned");
+                }
+                st.allow = new_allow;
             }
-            if !st.sessions.is_empty() || mode == AdmissionMode::Enforce {
-                debug!("admission: reloaded allow-list (enforce), sessions pruned");
+            FileRead::Missing => {
+                // Missing file = empty list, not an error (operator may
+                // start admit-nobody on purpose by writing the file).
+                if st.file_degraded {
+                    info!("admission: allow-list file removed");
+                }
+                st.file_degraded = false;
+                if self.effective_mode(&AllowList::default()) == AdmissionMode::Enforce
+                    || self.config_mode == AdmissionMode::Enforce
+                {
+                    // Fail closed: with no file in enforce, nobody is
+                    // approved — drop every live session.
+                    let mut dropped = Vec::new();
+                    for (_, senders) in st.sessions.drain() {
+                        dropped.extend(senders);
+                    }
+                    for (_, tx) in dropped {
+                        let _ = tx.send(());
+                    }
+                }
+                st.allow = AllowList {
+                    mode: st.allow.mode,
+                    ..AllowList::default()
+                };
+            }
+            FileRead::Corrupt => {
+                if !st.file_degraded {
+                    warn!(
+                        "admission: allow-list file {} unreadable/corrupt; keeping last good list{}",
+                        self.allow_path.display(),
+                        if self.effective_mode(&st.allow) == AdmissionMode::Enforce {
+                            " and failing closed (enforce)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                st.file_degraded = true;
             }
         }
-        st.allow = new_allow;
     }
 
-    /// The handshake check. Call AFTER the X3DH agreement has succeeded, so
-    /// only a client that holds its identity key is answered at all.
+    /// The handshake check. Call only AFTER the client proved it holds its
+    /// identity key (S1: the admission MAC verified by the caller), or with
+    /// `proven=false` for a legacy client without the capability.
     ///
-    /// - Learn mode: admit, and record the key as learned (once).
-    /// - Enforce mode: admit approved keys; refuse the rest, recording the
-    ///   refusal in the pending list (rate-limited, capped).
+    /// - Enforce mode: admit approved keys; refuse the rest. A degraded
+    ///   allow-list file fails CLOSED here (refuse everything, B2).
+    /// - Learn mode: admit everything except denied keys; only PROVEN keys
+    ///   are recorded as learned (S1).
     ///
-    /// Returns (decision, revocation receiver). The receiver fires when a
-    /// later reload revokes the key; the connection task must drop the
-    /// session when it does. `None` receiver when admission is disabled.
+    /// On admit, returns a [`SessionRegistration`] whose receiver fires
+    /// with `Ok(())` when a later reload revokes the key.
     pub async fn check(
         &self,
         identity_key: &[u8; 32],
-    ) -> (AdmissionDecision, Option<oneshot::Receiver<()>>) {
+        proven: bool,
+    ) -> (AdmissionDecision, Option<SessionRegistration>) {
         if !self.enabled {
             return (AdmissionDecision::Admit, None);
         }
@@ -279,11 +518,27 @@ impl Admission {
         let fp = fingerprint_of(identity_key);
         let mut st = self.inner.lock().await;
         let mode = self.effective_mode(&st.allow);
-        let approved = st.allow.clients.iter().any(|c| c.fingerprint == fp);
+        let approved = st.allow.clients.iter().any(|c| c.fingerprint == fp)
+            && !st.allow.denied.iter().any(|d| d == &fp);
+        let denied = st.allow.denied.iter().any(|d| d == &fp);
+
         let admit = match mode {
-            AdmissionMode::Enforce => approved,
+            AdmissionMode::Enforce => {
+                if st.file_degraded {
+                    // Fail closed: without a readable list, approve nobody.
+                    false
+                } else {
+                    approved
+                }
+            }
             AdmissionMode::Learn => {
-                if !approved {
+                if denied {
+                    false
+                } else if proven
+                    && !approved
+                    && !st.file_degraded
+                    && st.allow.clients.len() < LEARNED_CAP
+                {
                     st.allow.clients.push(AllowedClient {
                         fingerprint: fp.clone(),
                         label: String::new(),
@@ -291,99 +546,185 @@ impl Admission {
                         learned: true,
                     });
                     let allow = st.allow.clone();
-                    let path = self.allow_path.clone();
-                    drop(st);
-                    if let Ok(json) = serde_json::to_vec_pretty(&allow) {
-                        if let Err(e) = write_private(&path, &json) {
-                            warn!("admission: failed to persist learned key: {e}");
+                    let path = (*self.allow_path).clone();
+                    // Persist under the flock, off the async reactor (S4).
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(_lock) = FileLock::acquire(&path) {
+                            if let Ok(json) = serde_json::to_vec_pretty(&allow) {
+                                if let Err(e) = write_private(&path, &json) {
+                                    warn!("admission: failed to persist learned key: {e}");
+                                }
+                            }
                         }
-                    }
-                    st = self.inner.lock().await;
+                    });
                     info!(
                         "admission: learned new client key {}",
                         short_fingerprint(&fp)
                     );
+                    true
+                } else {
+                    true
                 }
-                true
             }
         };
+
         if !admit {
-            // Record the refusal (fingerprint + times + count only — NO IP).
-            let mut pending = read_json_or_default::<PendingList>(&self.pending_path);
+            // Global refusal rate limit (S4): beyond it, record nothing and
+            // just refuse.
             let now = now_unix();
-            let mut dirty = false;
-            match pending.entries.iter_mut().find(|e| e.fingerprint == fp) {
-                Some(e) => {
-                    if now.saturating_sub(e.last_seen) >= PENDING_UPDATE_MIN_SECS {
-                        e.last_seen = now;
-                        e.attempts = e.attempts.saturating_add(1);
-                        dirty = true;
-                    }
-                }
-                None => {
-                    if pending.entries.len() >= PENDING_CAP {
-                        // Evict the entry with the oldest last_seen.
-                        if let Some((idx, _)) = pending
-                            .entries
-                            .iter()
-                            .enumerate()
-                            .min_by_key(|(_, e)| e.last_seen)
-                        {
-                            pending.entries.remove(idx);
+            if now > st.refusal_refill_at {
+                st.refusal_tokens = REFUSAL_RATE_PER_SEC * 2.0;
+                st.refusal_refill_at = now;
+            }
+            if st.refusal_tokens >= 1.0 {
+                st.refusal_tokens -= 1.0;
+                // Record the refusal (fingerprint + times + count only — NO
+                // IP), in memory; flushed periodically (S4).
+                match st.pending.iter_mut().find(|e| e.fingerprint == fp) {
+                    Some(e) => {
+                        if now.saturating_sub(e.last_seen) >= PENDING_UPDATE_MIN_SECS {
+                            e.last_seen = now;
+                            e.attempts = e.attempts.saturating_add(1);
+                            st.pending_dirty = true;
                         }
                     }
-                    pending.entries.push(PendingEntry {
-                        fingerprint: fp.clone(),
-                        first_seen: now,
-                        last_seen: now,
-                        attempts: 1,
-                    });
-                    dirty = true;
-                }
-            }
-            if dirty {
-                if let Ok(json) = serde_json::to_vec_pretty(&pending) {
-                    if let Err(e) = write_private(&self.pending_path, &json) {
-                        warn!("admission: failed to persist pending list: {e}");
+                    None => {
+                        if st.pending.len() >= PENDING_CAP {
+                            if let Some((idx, _)) = st
+                                .pending
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, e)| e.last_seen)
+                            {
+                                st.pending.remove(idx);
+                            }
+                        }
+                        st.pending.push(PendingEntry {
+                            fingerprint: fp.clone(),
+                            first_seen: now,
+                            last_seen: now,
+                            attempts: 1,
+                        });
+                        st.pending_dirty = true;
                     }
                 }
             }
+            self.maybe_flush_pending(&mut st);
             debug!(
                 "admission: refusing client key {} (pending approval)",
                 short_fingerprint(&fp)
             );
             return (AdmissionDecision::Refuse, None);
         }
-        // Register the session for revocation drop.
+
+        // Register the session for revocation drop (by id, B3).
+        let id = st.next_session_id;
+        st.next_session_id = st.next_session_id.wrapping_add(1);
         let (tx, rx) = oneshot::channel();
-        st.sessions.entry(fp).or_default().push(tx);
-        (AdmissionDecision::Admit, Some(rx))
+        st.sessions.entry(fp.clone()).or_default().push((id, tx));
+        let reg = SessionRegistration {
+            admission: self.clone(),
+            fingerprint: fp,
+            id,
+            revoke_rx: Some(rx),
+        };
+        (AdmissionDecision::Admit, Some(reg))
     }
 
-    /// Forget a session's registration (call when the connection ends).
-    pub async fn unregister(&self, identity_key: &[u8; 32]) {
+    /// Flush the in-memory pending list if it is due (S4).
+    fn maybe_flush_pending(&self, st: &mut AdmissionState) {
+        let now = now_unix();
+        if !st.pending_dirty || now.saturating_sub(st.last_pending_flush) < PENDING_FLUSH_SECS {
+            return;
+        }
+        let list = PendingList {
+            entries: st.pending.clone(),
+        };
+        let path = (*self.pending_path).clone();
+        st.pending_dirty = false;
+        st.last_pending_flush = now;
+        tokio::task::spawn_blocking(move || {
+            if let Ok(_lock) = FileLock::acquire(&path) {
+                if let Ok(json) = serde_json::to_vec_pretty(&list) {
+                    if let Err(e) = write_private(&path, &json) {
+                        warn!("admission: failed to flush pending list: {e}");
+                    }
+                }
+            }
+        });
+    }
+
+    /// Flush pending unconditionally (shutdown path).
+    pub async fn flush_pending(&self) {
         if !self.enabled {
             return;
         }
-        let fp = fingerprint_of(identity_key);
         let mut st = self.inner.lock().await;
-        if let Some(v) = st.sessions.get_mut(&fp) {
-            v.pop();
+        st.last_pending_flush = 0;
+        self.maybe_flush_pending(&mut st);
+    }
+
+    /// Remove ONE session registration by id (B3).
+    async fn unregister_by_id(&self, fp: &str, id: u64) {
+        if !self.enabled {
+            return;
+        }
+        let mut st = self.inner.lock().await;
+        if let Some(v) = st.sessions.get_mut(fp) {
+            v.retain(|(rid, _)| *rid != id);
             if v.is_empty() {
-                st.sessions.remove(&fp);
+                st.sessions.remove(fp);
             }
         }
     }
+
+    /// Current counts for the startup log (S7).
+    pub async fn startup_summary(&self) -> (AdmissionMode, usize, usize) {
+        let st = self.inner.lock().await;
+        let learned = st.allow.clients.iter().filter(|c| c.learned).count();
+        (
+            self.effective_mode(&st.allow),
+            st.allow.clients.len(),
+            learned,
+        )
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// Spawn the background reload task (B1): every 2 seconds, pick up
+/// allow-list changes and drop revoked sessions without waiting for a new
+/// handshake. Runs for the life of the server.
+pub fn spawn_reload_task(admission: Admission) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            tick.tick().await;
+            admission.reload_if_changed().await;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
-// Admin operations (the `rvpn-server clients ...` subcommands). These operate
-// directly on the files; the running server picks changes up via the mtime
-// reload. Local only — no network admin surface.
+// Admin operations (the `rvpn-server clients ...` subcommands). These
+// operate directly on the files under an flock; the running server picks
+// changes up via the reload. Local only — no network admin surface.
 // ---------------------------------------------------------------------------
 
 fn load_allow(path: &Path) -> AllowList {
-    read_json_or_default(path)
+    match read_json::<AllowList>(path) {
+        FileRead::Ok(v) => v,
+        FileRead::Missing => AllowList::default(),
+        FileRead::Corrupt => {
+            eprintln!(
+                "rvpn-server: allow-list {} is corrupt; refusing to touch it (fix or remove it manually)",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 fn save_allow(path: &Path, allow: &AllowList) -> std::io::Result<()> {
@@ -403,9 +744,11 @@ fn audit(path: &Path, action: &str, fingerprint: &str) {
     if let Err(e) = res {
         warn!("admission: audit log write failed: {e}");
     }
+    tighten_permissions(path);
 }
 
-/// Resolve a fingerprint argument: full 64-char hex, or a unique prefix.
+/// Resolve a fingerprint argument: full 64-char hex, or a unique prefix of
+/// at least MIN_PREFIX_LEN hex characters.
 fn resolve_fingerprint(
     allow: &AllowList,
     pending: &[PendingEntry],
@@ -415,11 +758,17 @@ fn resolve_fingerprint(
     if arg.len() == 64 && arg.chars().all(|c| c.is_ascii_hexdigit()) {
         return Ok(arg);
     }
+    if arg.len() < MIN_PREFIX_LEN || !arg.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "'{arg}' is too short or not hex — give at least {MIN_PREFIX_LEN} hex characters"
+        ));
+    }
     let mut matches: Vec<&str> = allow
         .clients
         .iter()
         .map(|c| c.fingerprint.as_str())
         .chain(pending.iter().map(|e| e.fingerprint.as_str()))
+        .chain(allow.denied.iter().map(String::as_str))
         .filter(|fp| fp.starts_with(&arg))
         .collect();
     matches.sort_unstable();
@@ -433,14 +782,21 @@ fn resolve_fingerprint(
     }
 }
 
+fn load_pending(path: &Path) -> Vec<PendingEntry> {
+    match read_json::<PendingList>(path) {
+        FileRead::Ok(v) => v.entries,
+        _ => Vec::new(),
+    }
+}
+
 /// `rvpn-server clients pending` — print the pending list.
 pub fn cmd_pending(pending_path: &Path) -> i32 {
-    let pending = read_json_or_default::<PendingList>(pending_path);
-    if pending.entries.is_empty() {
+    let entries = load_pending(pending_path);
+    if entries.is_empty() {
         println!("no pending client keys");
         return 0;
     }
-    for e in &pending.entries {
+    for e in &entries {
         println!(
             "{}  first={} last={} attempts={}",
             short_fingerprint(&e.fingerprint),
@@ -467,7 +823,7 @@ pub fn cmd_list(allow_path: &Path) -> i32 {
             if c.label.is_empty() {
                 String::new()
             } else {
-                format!("{} ", c.label)
+                format!("{} ", sanitize_label(&c.label))
             },
             c.fingerprint,
             c.approved_at,
@@ -477,7 +833,8 @@ pub fn cmd_list(allow_path: &Path) -> i32 {
     0
 }
 
-/// `rvpn-server clients approve <fingerprint> [--label ...]`.
+/// `rvpn-server clients approve <fingerprint> [--label ...]`. Also clears
+/// the key from the deny list (S6).
 pub fn cmd_approve(
     allow_path: &Path,
     pending_path: &Path,
@@ -485,15 +842,23 @@ pub fn cmd_approve(
     arg: &str,
     label: Option<&str>,
 ) -> i32 {
+    let _lock = match FileLock::acquire(allow_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("rvpn-server: cannot lock allow-list: {e}");
+            return 1;
+        }
+    };
     let mut allow = load_allow(allow_path);
-    let pending = read_json_or_default::<PendingList>(pending_path);
-    let fp = match resolve_fingerprint(&allow, &pending.entries, arg) {
+    let pending = load_pending(pending_path);
+    let fp = match resolve_fingerprint(&allow, &pending, arg) {
         Ok(fp) => fp,
         Err(e) => {
             eprintln!("rvpn-server: {e}");
             return 2;
         }
     };
+    allow.denied.retain(|d| d != &fp);
     if allow.clients.iter().any(|c| c.fingerprint == fp) {
         println!("already approved: {}", short_fingerprint(&fp));
         return 0;
@@ -513,12 +878,21 @@ pub fn cmd_approve(
     0
 }
 
-/// `rvpn-server clients revoke <fingerprint>` — removes from the allow-list;
-/// the running server drops the live session on its next reload.
+/// `rvpn-server clients revoke <fingerprint>` — removes from the allow-list
+/// AND adds to the deny list (S6: the key is never re-learned, and revoke
+/// therefore works in learn mode too). Live sessions drop within the
+/// server's reload interval.
 pub fn cmd_revoke(allow_path: &Path, pending_path: &Path, audit_path: &Path, arg: &str) -> i32 {
+    let _lock = match FileLock::acquire(allow_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("rvpn-server: cannot lock allow-list: {e}");
+            return 1;
+        }
+    };
     let mut allow = load_allow(allow_path);
-    let pending = read_json_or_default::<PendingList>(pending_path);
-    let fp = match resolve_fingerprint(&allow, &pending.entries, arg) {
+    let pending = load_pending(pending_path);
+    let fp = match resolve_fingerprint(&allow, &pending, arg) {
         Ok(fp) => fp,
         Err(e) => {
             eprintln!("rvpn-server: {e}");
@@ -527,29 +901,50 @@ pub fn cmd_revoke(allow_path: &Path, pending_path: &Path, audit_path: &Path, arg
     };
     let before = allow.clients.len();
     allow.clients.retain(|c| c.fingerprint != fp);
-    if allow.clients.len() == before {
-        eprintln!(
-            "rvpn-server: {} is not an approved client",
-            short_fingerprint(&fp)
-        );
-        return 2;
+    let was_approved = allow.clients.len() != before;
+    if !allow.denied.contains(&fp) {
+        allow.denied.push(fp.clone());
     }
     if let Err(e) = save_allow(allow_path, &allow) {
         eprintln!("rvpn-server: failed to write allow-list: {e}");
         return 1;
     }
     audit(audit_path, "revoke", &fp);
-    println!(
-        "revoked {} — live sessions drop on the server's next reload",
-        short_fingerprint(&fp)
-    );
+    if was_approved {
+        println!(
+            "revoked {} — live sessions drop within the server's reload interval",
+            short_fingerprint(&fp)
+        );
+    } else {
+        println!(
+            "denied {} (was not approved; now blocked even in learn mode)",
+            short_fingerprint(&fp)
+        );
+    }
     0
 }
 
 /// `rvpn-server clients mode <learn|enforce>` — set the mode in the
 /// allow-list file (the running server picks it up without a restart).
+/// Warns about learned keys when switching to enforce (S5).
 pub fn cmd_set_mode(allow_path: &Path, audit_path: &Path, mode: AdmissionMode) -> i32 {
+    let _lock = match FileLock::acquire(allow_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("rvpn-server: cannot lock allow-list: {e}");
+            return 1;
+        }
+    };
     let mut allow = load_allow(allow_path);
+    if mode == AdmissionMode::Enforce {
+        let learned = allow.clients.iter().filter(|c| c.learned).count();
+        if learned > 0 {
+            println!(
+                "note: {learned} of {} approved keys were auto-learned — review them before enforcing",
+                allow.clients.len()
+            );
+        }
+    }
     allow.mode = Some(mode);
     if let Err(e) = save_allow(allow_path, &allow) {
         eprintln!("rvpn-server: failed to write allow-list: {e}");
@@ -584,42 +979,50 @@ mod tests {
     async fn disabled_admits_everything() {
         let a = Admission::disabled();
         let key = [1u8; 32];
-        let (d, rx) = a.check(&key).await;
+        let (d, reg) = a.check(&key, true).await;
         assert_eq!(d, AdmissionDecision::Admit);
-        assert!(rx.is_none());
+        assert!(reg.is_none());
     }
 
     #[tokio::test]
-    async fn learn_mode_admits_and_records() {
+    async fn learn_records_only_proven_keys() {
         let (dir, a) = tmp_admission(AdmissionMode::Learn);
-        let key = [2u8; 32];
-        let (d, _rx) = a.check(&key).await;
+        let unproven = [2u8; 32];
+        let proven = [3u8; 32];
+        // Unproven keys are admitted but NOT recorded (S1).
+        let (d, _) = a.check(&unproven, false).await;
         assert_eq!(d, AdmissionDecision::Admit);
-        let allow = read_json_or_default::<AllowList>(&dir.path().join("clients.json"));
+        let (d, _) = a.check(&proven, true).await;
+        assert_eq!(d, AdmissionDecision::Admit);
+        // The learned key is persisted on the spawn_blocking write.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let allow = match read_json::<AllowList>(&dir.path().join("clients.json")) {
+            FileRead::Ok(v) => v,
+            _ => panic!("allow-list should exist"),
+        };
         assert_eq!(allow.clients.len(), 1);
         assert!(allow.clients[0].learned);
-        assert_eq!(allow.clients[0].fingerprint, fingerprint_of(&key));
+        assert_eq!(allow.clients[0].fingerprint, fingerprint_of(&proven));
     }
 
     #[tokio::test]
     async fn enforce_refuses_unknown_and_records_pending() {
         let (dir, a) = tmp_admission(AdmissionMode::Enforce);
-        let key = [3u8; 32];
-        let (d, rx) = a.check(&key).await;
+        let key = [4u8; 32];
+        let (d, reg) = a.check(&key, true).await;
         assert_eq!(d, AdmissionDecision::Refuse);
-        assert!(rx.is_none());
-        let pending = read_json_or_default::<PendingList>(&dir.path().join("pending.json"));
-        assert_eq!(pending.entries.len(), 1);
-        assert_eq!(pending.entries[0].fingerprint, fingerprint_of(&key));
-        assert_eq!(pending.entries[0].attempts, 1);
+        assert!(reg.is_none());
+        let st = a.inner.lock().await;
+        assert_eq!(st.pending.len(), 1);
+        assert_eq!(st.pending[0].fingerprint, fingerprint_of(&key));
+        assert_eq!(st.pending[0].attempts, 1);
     }
 
     #[tokio::test]
     async fn enforce_admits_approved_key() {
         let (dir, a) = tmp_admission(AdmissionMode::Enforce);
-        let key = [4u8; 32];
+        let key = [5u8; 32];
         let fp = fingerprint_of(&key);
-        // Approve via the admin op (writes the file; the server reloads).
         assert_eq!(
             cmd_approve(
                 &dir.path().join("clients.json"),
@@ -630,15 +1033,15 @@ mod tests {
             ),
             0
         );
-        let (d, rx) = a.check(&key).await;
+        let (d, reg) = a.check(&key, true).await;
         assert_eq!(d, AdmissionDecision::Admit);
-        assert!(rx.is_some());
+        assert!(reg.is_some());
     }
 
     #[tokio::test]
-    async fn revoke_drops_the_live_session() {
+    async fn revoke_drops_the_live_session_and_denies_relearn() {
         let (dir, a) = tmp_admission(AdmissionMode::Enforce);
-        let key = [5u8; 32];
+        let key = [6u8; 32];
         let fp = fingerprint_of(&key);
         cmd_approve(
             &dir.path().join("clients.json"),
@@ -647,9 +1050,9 @@ mod tests {
             &fp,
             None,
         );
-        let (d, rx) = a.check(&key).await;
+        let (d, reg) = a.check(&key, true).await;
         assert_eq!(d, AdmissionDecision::Admit);
-        let mut rx = rx.expect("admitted session registers a revocation channel");
+        let mut reg = reg.expect("admitted session registers a revocation channel");
         assert_eq!(
             cmd_revoke(
                 &dir.path().join("clients.json"),
@@ -659,56 +1062,86 @@ mod tests {
             ),
             0
         );
-        // The next check (any handshake) triggers the reload that drops the
-        // revoked session.
+        // The next reload (triggered by any check) drops the session.
         let other = [9u8; 32];
-        let _ = a.check(&other).await;
-        assert!(rx.try_recv().is_ok(), "revoked session must be dropped");
-        // And the revoked key is refused on a fresh handshake.
-        let (d, _) = a.check(&key).await;
+        let _ = a.check(&other, true).await;
+        let mut rx = reg.revoke_rx.take().unwrap();
+        match rx.try_recv() {
+            Ok(()) => {}
+            other => panic!("revoked session must be dropped, got {:?}", other.is_err()),
+        }
+        // The revoked key is denied: refused even in learn mode (S6).
+        let (d, _) = a.check(&key, true).await;
         assert_eq!(d, AdmissionDecision::Refuse);
+        let a2 = Admission::new(
+            true,
+            AdmissionMode::Learn,
+            dir.path().join("clients.json"),
+            dir.path().join("pending.json"),
+            dir.path().join("audit.log"),
+        );
+        let (d, _) = a2.check(&key, true).await;
+        assert_eq!(
+            d,
+            AdmissionDecision::Refuse,
+            "denied key must not be re-learned"
+        );
     }
 
     #[tokio::test]
-    async fn prefix_resolution_is_unique() {
-        let (dir, a) = tmp_admission(AdmissionMode::Learn);
-        let key = [6u8; 32];
-        a.check(&key).await;
+    async fn ending_one_session_keeps_the_other_of_same_key() {
+        // B3: two sessions of one key; ending the first must not drop the
+        // second.
+        let (dir, a) = tmp_admission(AdmissionMode::Enforce);
+        let key = [7u8; 32];
         let fp = fingerprint_of(&key);
-        // A unique prefix resolves (revoke finds the learned key).
-        assert_eq!(
-            cmd_revoke(
-                &dir.path().join("clients.json"),
-                &dir.path().join("pending.json"),
-                &dir.path().join("audit.log"),
-                &fp[..12],
-            ),
-            0
+        cmd_approve(
+            &dir.path().join("clients.json"),
+            &dir.path().join("pending.json"),
+            &dir.path().join("audit.log"),
+            &fp,
+            None,
         );
-        // Audit log has the revoke with the full fingerprint.
-        let audit = fs::read_to_string(dir.path().join("audit.log")).unwrap();
-        assert!(audit.contains("revoke"));
-        assert!(audit.contains(&fp));
-        // And an unknown prefix fails cleanly.
-        assert_eq!(
-            cmd_revoke(
-                &dir.path().join("clients.json"),
-                &dir.path().join("pending.json"),
-                &dir.path().join("audit.log"),
-                "ffffffffffff",
-            ),
-            2
+        let (_, reg1) = a.check(&key, true).await;
+        let (_, reg2) = a.check(&key, true).await;
+        let mut reg1 = reg1.unwrap();
+        let mut reg2 = reg2.unwrap();
+        drop(reg1); // ends session 1 (spawned unregister)
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Session 2's channel must NOT have fired.
+        let mut rx2 = reg2.revoke_rx.take().unwrap();
+        assert!(
+            matches!(rx2.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "ending one session must not revoke the other"
         );
+    }
+
+    #[tokio::test]
+    async fn corrupt_file_fails_closed_in_enforce() {
+        // B2: a corrupt allow-list must not fail open, and must not be
+        // rewritten with an empty list.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clients.json");
+        fs::write(&path, b"{not json").unwrap();
+        let a = Admission::new(
+            true,
+            AdmissionMode::Enforce,
+            path.clone(),
+            dir.path().join("pending.json"),
+            dir.path().join("audit.log"),
+        );
+        let key = [8u8; 32];
+        let (d, _) = a.check(&key, true).await;
+        assert_eq!(d, AdmissionDecision::Refuse, "corrupt file fails closed");
+        // The corrupt content is untouched (no silent wipe).
+        assert_eq!(fs::read(&path).unwrap(), b"{not json");
     }
 
     #[tokio::test]
     async fn unknown_and_revoked_get_one_identical_refusal() {
-        // Constraint 1 (Thomas): unknown and revoked keys are refused with
-        // the SAME outward code and message, so an outsider learns nothing
-        // about which keys were ever approved.
         let (dir, a) = tmp_admission(AdmissionMode::Enforce);
-        let unknown = [7u8; 32];
-        let revoked = [8u8; 32];
+        let unknown = [10u8; 32];
+        let revoked = [11u8; 32];
         let revoked_fp = fingerprint_of(&revoked);
         cmd_approve(
             &dir.path().join("clients.json"),
@@ -723,27 +1156,68 @@ mod tests {
             &dir.path().join("audit.log"),
             &revoked_fp,
         );
-        let (d_unknown, _) = a.check(&unknown).await;
-        let (d_revoked, _) = a.check(&revoked).await;
+        let (d_unknown, _) = a.check(&unknown, true).await;
+        let (d_revoked, _) = a.check(&revoked, true).await;
         assert_eq!(d_unknown, d_revoked);
         assert_eq!(ADMISSION_REFUSAL_CODE, 20);
         assert_eq!(ADMISSION_REFUSAL_MESSAGE, "pending_approval");
-        // Both refusals land in the pending list with identical shape.
-        let pending = read_json_or_default::<PendingList>(&dir.path().join("pending.json"));
-        assert_eq!(pending.entries.len(), 2);
+        let st = a.inner.lock().await;
+        assert_eq!(st.pending.len(), 2);
     }
 
     #[tokio::test]
     async fn pending_recording_is_rate_limited() {
         let (dir, a) = tmp_admission(AdmissionMode::Enforce);
-        let key = [11u8; 32];
-        let _ = a.check(&key).await;
-        let _ = a.check(&key).await;
-        let _ = a.check(&key).await;
-        let pending = read_json_or_default::<PendingList>(&dir.path().join("pending.json"));
-        // Immediate repeats within the rate window don't bump the counter.
-        assert_eq!(pending.entries.len(), 1);
-        assert_eq!(pending.entries[0].attempts, 1);
+        let key = [12u8; 32];
+        let _ = a.check(&key, true).await;
+        let _ = a.check(&key, true).await;
+        let _ = a.check(&key, true).await;
+        let st = a.inner.lock().await;
+        assert_eq!(st.pending.len(), 1);
+        assert_eq!(st.pending[0].attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn prefix_resolution_requires_16_hex_chars() {
+        let (dir, a) = tmp_admission(AdmissionMode::Learn);
+        let key = [13u8; 32];
+        let _ = a.check(&key, true).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let fp = fingerprint_of(&key);
+        // 12-char prefix: refused (too short, nit).
+        assert_eq!(
+            cmd_revoke(
+                &dir.path().join("clients.json"),
+                &dir.path().join("pending.json"),
+                &dir.path().join("audit.log"),
+                &fp[..12],
+            ),
+            2
+        );
+        // 16-char unique prefix works.
+        assert_eq!(
+            cmd_revoke(
+                &dir.path().join("clients.json"),
+                &dir.path().join("pending.json"),
+                &dir.path().join("audit.log"),
+                &fp[..16],
+            ),
+            0
+        );
+        let audit = fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        assert!(audit.contains("revoke"));
+        assert!(audit.contains(&fp));
+    }
+
+    #[test]
+    fn mode_parse_rejects_garbage() {
+        assert!(parse_admission_mode("learn").is_ok());
+        assert!(parse_admission_mode("enforce").is_ok());
+        assert!(
+            parse_admission_mode("enfore").is_err(),
+            "typo must be a startup error (S7)"
+        );
+        assert!(parse_admission_mode("").is_err());
     }
 
     #[test]

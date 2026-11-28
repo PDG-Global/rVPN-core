@@ -231,6 +231,7 @@ impl VpnTunnel {
             session_token: None,
             connection_nonce: None,
             capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
+            admission_mac: None,
         };
 
         let hello_bytes =
@@ -405,10 +406,69 @@ impl VpnTunnel {
 
                         debug!("X3DH shared secret derived successfully");
 
+                        // Third flight (S1): send the ClientAuth admission
+                        // proof — HMAC over the full handshake transcript,
+                        // keyed from the X3DH shared secret — then wait for
+                        // ServerAccept (or the pending_approval refusal).
+                        let kc = rvpn_core::crypto::admission::derive_confirm_key(&shared_secret);
+                        let transcript = rvpn_core::crypto::admission::transcript(
+                            &identity_public,
+                            &ephemeral_public,
+                            &None,
+                            rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                            &server_bundle_from_hello.identity_x25519_key,
+                            &[],
+                            &server_signed_prekey,
+                            &server_prekey_signature,
+                            server_capabilities.unwrap_or(0),
+                        );
+                        let mac = rvpn_core::crypto::admission::compute_mac(&kc, &transcript);
+                        let client_auth = HandshakeMessage::ClientAuth {
+                            encrypted_data: Vec::new(),
+                            identity: None,
+                            admission_mac: Some(mac.to_vec()),
+                        };
+                        ws_writer
+                            .send(Message::Binary(
+                                serde_json::to_vec(&client_auth)
+                                    .context("Failed to serialize ClientAuth")?,
+                            ))
+                            .await
+                            .context("Failed to send ClientAuth")?;
+
+                        let accept = ws_reader.recv().await.ok_or_else(|| {
+                            anyhow::anyhow!("WebSocket closed before ServerAccept")
+                        })?;
+                        match accept {
+                            Message::Binary(data) => {
+                                match serde_json::from_slice::<HandshakeMessage>(&data)
+                                    .context("Failed to parse ServerAccept")?
+                                {
+                                    HandshakeMessage::ServerAccept { .. } => {}
+                                    HandshakeMessage::Error { code, message }
+                                        if code == rvpn_core::crypto::admission::REFUSAL_CODE =>
+                                    {
+                                        return Err(anyhow::anyhow!(
+                                            "server refused this client key: {message}"
+                                        ));
+                                    }
+                                    _ => {
+                                        return Err(anyhow::anyhow!(
+                                            "expected ServerAccept from server"
+                                        ))
+                                    }
+                                }
+                            }
+                            _ => {
+                                return Err(anyhow::anyhow!("expected binary ServerAccept message"))
+                            }
+                        }
+
                         // Initialize Double Ratchet as Alice (initiator)
                         // In X3DH, the server (Bob) doesn't generate an ephemeral key.
                         // The server_ephemeral field is empty - init_alice doesn't use this parameter.
-                        let ratchet = DoubleRatchet::init_alice(shared_secret, [0u8; 32], ratchet_version);
+                        let ratchet =
+                            DoubleRatchet::init_alice(shared_secret, [0u8; 32], ratchet_version);
 
                         info!("Double Ratchet initialized as Alice (initiator)");
 

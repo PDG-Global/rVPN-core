@@ -7,11 +7,11 @@ use anyhow::Result;
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use rvpn_core::protocol::{HandshakeMessage, ProtocolVersion, AuthMethod};
+use rvpn_core::protocol::{AuthMethod, HandshakeMessage, ProtocolVersion};
 
 /// Create valid identity and prekey files for a test configuration.
 pub fn configure_test_keys(config: &mut crate::config::ServerConfig, directory: &std::path::Path) {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use rvpn_core::crypto::{IdentityKey, X3DHResponder};
 
     let identity = IdentityKey::generate();
@@ -49,12 +49,17 @@ pub async fn start_test_server(port: u16) -> Result<Arc<RwLock<crate::handler::V
     };
     configure_test_keys(&mut config, directory.path());
 
-    let handler = Arc::new(RwLock::new(VpnHandler::new(config)?));
+    let handler = Arc::new(RwLock::new(VpnHandler::new(
+        config,
+        crate::admission::Admission::disabled(),
+    )?));
     Ok(handler)
 }
 
 /// Connect to server via WebSocket
-pub async fn connect_to_server(addr: SocketAddr) -> Result<(
+pub async fn connect_to_server(
+    addr: SocketAddr,
+) -> Result<(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 )> {
     let url = format!("ws://{}", addr);
@@ -64,7 +69,9 @@ pub async fn connect_to_server(addr: SocketAddr) -> Result<(
 
 /// Perform X3DH handshake as client
 pub async fn client_handshake(
-    ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ws_stream: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
 ) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
 
@@ -77,13 +84,17 @@ pub async fn client_handshake(
         session_token: None,
         connection_nonce: Some(vec![0u8; 16]),
         capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
+        admission_mac: None,
     };
 
     let hello_bytes = serde_json::to_vec(&hello)?;
     ws_stream.send(Message::Binary(hello_bytes)).await?;
 
     // Wait for ServerHello
-    let msg = ws_stream.next().await.ok_or_else(|| anyhow::anyhow!("Connection closed"))??;
+    let msg = ws_stream
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Connection closed"))??;
     let _server_hello: HandshakeMessage = serde_json::from_slice(&msg.into_data())?;
 
     Ok(())

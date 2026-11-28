@@ -159,13 +159,13 @@ fn prune_dns_cache(cache: &mut std::collections::HashMap<String, DnsEntry>) {
     }
 }
 
-/// What a completed handshake yields: the ratchet plus the client's proven
-/// identity and the revocation channel (fires when a later allow-list reload
-/// revokes the key — the session must then be dropped).
+/// What a completed handshake yields: the ratchet plus the admission
+/// session registration. The registration's receiver fires with `Ok(())`
+/// when a later allow-list reload revokes the key — the session must then
+/// be dropped — and its Drop unregisters the session by id (B3).
 pub(crate) struct HandshakeResult {
     ratchet: DoubleRatchet,
-    identity_key: [u8; 32],
-    revocation_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    registration: Option<crate::admission::SessionRegistration>,
 }
 
 /// Simplified VPN handler - Brook-style architecture with X3DH + Double Ratchet
@@ -179,19 +179,12 @@ pub struct VpnHandler {
 }
 
 impl VpnHandler {
-    pub fn new(config: ServerConfig) -> Result<Self> {
+    pub fn new(config: ServerConfig, admission: crate::admission::Admission) -> Result<Self> {
         let x3dh_responder = Some(crate::private_files::load_responder(&config)?);
 
         // Read rate limit values before moving config into the struct
         let max_connections_per_ip = config.rate_limit.max_connections_per_ip;
         let max_handshakes_per_minute = config.rate_limit.max_handshakes_per_minute;
-        let admission = crate::admission::Admission::new(
-            config.admission.enabled,
-            parse_admission_mode(&config.admission.mode),
-            config.admission.allow_file.clone(),
-            config.admission.pending_file.clone(),
-            config.admission.audit_file.clone(),
-        );
 
         Ok(Self {
             config,
@@ -273,8 +266,7 @@ impl VpnHandler {
         };
         let HandshakeResult {
             mut ratchet,
-            identity_key,
-            mut revocation_rx,
+            mut registration,
         } = hs;
 
         // The session body, revocation-aware: when a reload revokes this
@@ -343,19 +335,24 @@ impl VpnHandler {
             Ok(())
         };
 
-        let outcome: Result<()> = match revocation_rx.as_mut() {
-            Some(rx) => {
-                tokio::select! {
-                    _ = rx => {
-                        debug!("session dropped: client key revoked (admission) for {}", peer_addr);
-                        Ok(())
-                    }
-                    res = session => res,
+        // Only `Ok(())` means "revoked" (B3): `Err(Closed)` says the
+        // registration is already stale — that session is NOT revoked and
+        // must keep running.
+        let outcome: Result<()> = match registration.as_mut().and_then(|r| r.revoke_rx.as_mut()) {
+            Some(rx) => match futures_util::future::select(Box::pin(session), rx).await {
+                futures_util::future::Either::Left((res, _rx)) => res,
+                futures_util::future::Either::Right((Ok(()), _session)) => {
+                    debug!(
+                        "session dropped: client key revoked (admission) for {}",
+                        peer_addr
+                    );
+                    Ok(())
                 }
-            }
+                futures_util::future::Either::Right((Err(_), session)) => session.await,
+            },
             None => session.await,
         };
-        self.admission.unregister(&identity_key).await;
+        // The registration's Drop unregisters this session by id (B3).
         outcome
     }
 
@@ -406,6 +403,11 @@ impl VpnHandler {
                 ephemeral_key,
                 identity_key,
                 capabilities,
+                // The Hello-time MAC field is unused by design: the proof
+                // moved to the ClientAuth flight (it must cover the
+                // server's wire keys, which arrive only in the
+                // ServerHello).
+                admission_mac: _,
                 ..
             } => {
                 // Protocol version detection and compatibility check
@@ -519,22 +521,6 @@ impl VpnHandler {
 
                 debug!("X3DH handshake successful from {}", peer_addr);
 
-                // Client admission: checked only AFTER the X3DH agreement
-                // succeeded, so only a client that holds its identity key is
-                // answered. Unknown and revoked keys get ONE identical refusal
-                // (#32): an outsider learns nothing about which keys exist.
-                let (decision, revocation_rx) = self.admission.check(&client_identity).await;
-                if decision == AdmissionDecision::Refuse {
-                    let refusal = HandshakeMessage::Error {
-                        code: ADMISSION_REFUSAL_CODE,
-                        message: ADMISSION_REFUSAL_MESSAGE.to_string(),
-                    };
-                    let _ = ws_write
-                        .send(Message::Binary(serde_json::to_vec(&refusal)?))
-                        .await;
-                    return Ok(None);
-                }
-
                 // Initialize Double Ratchet as Bob (responder)
                 let ratchet = DoubleRatchet::init_bob(shared_secret, ratchet_version);
 
@@ -549,12 +535,114 @@ impl VpnHandler {
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to send ServerHello: {:?}", e))?;
 
+                // Admission: after proof of possession (S1). Legacy
+                // clients (no v2 capability) keep the old flow — admitted
+                // in learn mode but NOT recorded. v2-capable clients get a
+                // third flight: ClientAuth carries a MAC over the full
+                // transcript (Hello + ServerHello), keyed from the X3DH
+                // shared secret.
+                let client_caps = capabilities.unwrap_or(0);
+                let proven = if client_caps & rvpn_core::crypto::x3dh::CAP_RATCHET_V2 != 0 {
+                    let kc = rvpn_core::crypto::admission::derive_confirm_key(&shared_secret);
+                    let transcript = rvpn_core::crypto::admission::transcript(
+                        &client_identity,
+                        &client_ephemeral,
+                        &None,
+                        client_caps,
+                        &public_bundle.identity_x25519_key,
+                        &[],
+                        &public_bundle.signed_prekey,
+                        &public_bundle.prekey_signature,
+                        public_bundle.capabilities,
+                    );
+                    match tokio::time::timeout(Duration::from_secs(5), ws_read.next()).await {
+                        Ok(Some(Ok(Message::Binary(data)))) => {
+                            match serde_json::from_slice::<HandshakeMessage>(&data) {
+                                Ok(HandshakeMessage::ClientAuth { admission_mac, .. }) => {
+                                    match admission_mac
+                                        .as_deref()
+                                        .and_then(|m| <[u8; 32]>::try_from(m).ok())
+                                    {
+                                        Some(mac)
+                                            if rvpn_core::crypto::admission::verify_mac(
+                                                &kc,
+                                                &transcript,
+                                                &mac,
+                                            ) =>
+                                        {
+                                            true
+                                        }
+                                        // A wrong or missing MAC is a
+                                        // protocol failure, never an
+                                        // admission refusal: the client has
+                                        // NOT proven possession, so it
+                                        // learns nothing (S1).
+                                        _ => {
+                                            debug!("invalid ClientAuth MAC from {}", peer_addr);
+                                            let _ = ws_write.send(Message::Close(None)).await;
+                                            return Ok(None);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    debug!("expected ClientAuth from v2 client {}", peer_addr);
+                                    let _ = ws_write.send(Message::Close(None)).await;
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        // Timeout / close / garbage: the handshake just
+                        // dies. The 5s wait counts against the handshake
+                        // rate limit like any other slow client.
+                        _ => {
+                            debug!("ClientAuth deadline exceeded from {}", peer_addr);
+                            return Ok(None);
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                // Only a proven client gets an admission answer; the
+                // refusal for unknown and revoked keys is ONE identical
+                // code (S1).
+                let (decision, registration) = self.admission.check(&client_identity, proven).await;
+                if decision == AdmissionDecision::Refuse {
+                    let refusal = HandshakeMessage::Error {
+                        code: ADMISSION_REFUSAL_CODE,
+                        message: ADMISSION_REFUSAL_MESSAGE.to_string(),
+                    };
+                    let _ = ws_write
+                        .send(Message::Binary(serde_json::to_vec(&refusal)?))
+                        .await;
+                    return Ok(None);
+                }
+
+                // ServerAccept closes the flight for v2 clients; legacy
+                // clients never wait for it, so nothing is sent to them.
+                if proven {
+                    let accept = HandshakeMessage::ServerAccept {
+                        session_id: rvpn_core::protocol::SessionId::generate(),
+                        session_token: vec![0u8; 32],
+                        server_time: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    if ws_write
+                        .send(Message::Binary(serde_json::to_vec(&accept)?))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(None);
+                    }
+                }
+
                 debug!("X3DH handshake completed with {}", peer_addr);
 
                 Ok(Some(HandshakeResult {
                     ratchet,
-                    identity_key: client_identity,
-                    revocation_rx,
+                    registration,
                 }))
             }
             _ => {
@@ -1349,16 +1437,8 @@ pub struct MultiplexerHandler {
 }
 
 impl MultiplexerHandler {
-    pub fn new(config: ServerConfig) -> Result<Self> {
+    pub fn new(config: ServerConfig, admission: crate::admission::Admission) -> Result<Self> {
         let x3dh_responder = Some(Arc::new(crate::private_files::load_responder(&config)?));
-
-        let admission = crate::admission::Admission::new(
-            config.admission.enabled,
-            parse_admission_mode(&config.admission.mode),
-            config.admission.allow_file.clone(),
-            config.admission.pending_file.clone(),
-            config.admission.audit_file.clone(),
-        );
 
         Ok(Self {
             config,
@@ -1403,9 +1483,13 @@ pub struct TunHandler {
 }
 
 impl TunHandler {
-    pub fn new(config: ServerConfig, tun_server: Option<Arc<dyn TunWriter>>) -> Result<Self> {
+    pub fn new(
+        config: ServerConfig,
+        tun_server: Option<Arc<dyn TunWriter>>,
+        admission: crate::admission::Admission,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: MultiplexerHandler::new(config.clone())?,
+            inner: MultiplexerHandler::new(config.clone(), admission)?,
             tun_server,
             tun_config: config.tun,
         })
@@ -1555,8 +1639,9 @@ pub struct MultiplexerSession<S> {
     client_identity: Option<[u8; 32]>,
     /// Client admission controller (#32).
     admission: crate::admission::Admission,
-    /// Fires when a later allow-list reload revokes this client's key.
-    revocation_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Live admission registration: its receiver fires with `Ok(())` when
+    /// a reload revokes this key; its Drop unregisters by id (B3).
+    registration: Option<crate::admission::SessionRegistration>,
 }
 
 impl<S> MultiplexerSession<S>
@@ -1594,7 +1679,7 @@ where
             tcp_pool: Arc::new(Mutex::new(HashMap::new())),
             client_identity: None,
             admission,
-            revocation_rx: None,
+            registration: None,
         }
     }
 
@@ -2006,14 +2091,21 @@ where
         };
 
         // Revocation watcher (#32): fires when a reload revokes this key.
-        let revocation_rx = self.revocation_rx.take();
+        // Only `Ok(())` is a revocation (B3): `Err(Closed)` means the
+        // registration went stale — the session keeps running. The
+        // registration is held for the life of this future so its Drop
+        // unregisters the session when the session ends.
+        let mut registration = self.registration.take();
         let revocation = async move {
-            match revocation_rx {
-                Some(mut rx) => {
-                    let _ = (&mut rx).await;
-                }
+            let rx = registration.as_mut().and_then(|r| r.revoke_rx.take());
+            match rx {
+                Some(mut rx) => match (&mut rx).await {
+                    Ok(()) => {}
+                    Err(_) => std::future::pending::<()>().await,
+                },
                 None => std::future::pending::<()>().await,
             }
+            drop(registration);
         };
 
         // Run all tasks concurrently
@@ -2057,11 +2149,6 @@ where
 
         // Clean up connection pool
         self.tcp_pool.lock().await.clear();
-
-        // Drop the admission session registration (#32).
-        if let Some(id) = self.client_identity {
-            self.admission.unregister(&id).await;
-        }
 
         // Unregister client from TUN server. The lease itself is kept
         // (sticky per client identity) so a fast reconnect reclaims the same
@@ -2980,6 +3067,8 @@ where
                 ephemeral_key,
                 identity_key,
                 capabilities,
+                // See site 1: the proof moved to the ClientAuth flight.
+                admission_mac: _,
                 ..
             } => {
                 debug!(
@@ -3086,24 +3175,6 @@ where
 
                 debug!("X3DH handshake successful from {}", self.peer_addr);
 
-                // Client admission: checked only AFTER the X3DH agreement
-                // succeeded, so only a client that holds its identity key is
-                // answered. Unknown and revoked keys get ONE identical refusal
-                // (#32): an outsider learns nothing about which keys exist.
-                let (decision, revocation_rx) = self.admission.check(&client_identity).await;
-                if decision == AdmissionDecision::Refuse {
-                    let refusal = HandshakeMessage::Error {
-                        code: ADMISSION_REFUSAL_CODE,
-                        message: ADMISSION_REFUSAL_MESSAGE.to_string(),
-                    };
-                    let _ = self
-                        .ws
-                        .send(Message::Binary(serde_json::to_vec(&refusal)?))
-                        .await;
-                    return Ok(None);
-                }
-                self.revocation_rx = revocation_rx;
-
                 // Initialize Double Ratchet as Bob (responder)
                 debug!("Initializing DoubleRatchet as Bob for {}", self.peer_addr);
                 let ratchet = DoubleRatchet::init_bob(shared_secret, ratchet_version);
@@ -3142,6 +3213,104 @@ where
                 }
 
                 debug!("ServerHello sent to {}", self.peer_addr);
+
+                // Third flight (S1): v2-capable clients must prove key
+                // possession with a ClientAuth MAC over the full transcript
+                // before admission is answered. See site 1.
+                let client_caps = capabilities.unwrap_or(0);
+                let proven = if client_caps & rvpn_core::crypto::x3dh::CAP_RATCHET_V2 != 0 {
+                    let kc = rvpn_core::crypto::admission::derive_confirm_key(&shared_secret);
+                    let transcript = rvpn_core::crypto::admission::transcript(
+                        &client_identity,
+                        &client_ephemeral,
+                        &None,
+                        client_caps,
+                        &public_bundle.identity_x25519_key,
+                        &[],
+                        &public_bundle.signed_prekey,
+                        &public_bundle.prekey_signature,
+                        public_bundle.capabilities,
+                    );
+                    match timeout(Duration::from_secs(5), self.ws.next()).await {
+                        Ok(Some(Ok(Message::Binary(data)))) => {
+                            match serde_json::from_slice::<HandshakeMessage>(&data) {
+                                Ok(HandshakeMessage::ClientAuth { admission_mac, .. }) => {
+                                    match admission_mac
+                                        .as_deref()
+                                        .and_then(|m| <[u8; 32]>::try_from(m).ok())
+                                    {
+                                        Some(mac)
+                                            if rvpn_core::crypto::admission::verify_mac(
+                                                &kc,
+                                                &transcript,
+                                                &mac,
+                                            ) =>
+                                        {
+                                            true
+                                        }
+                                        _ => {
+                                            debug!(
+                                                "invalid ClientAuth MAC from {}",
+                                                self.peer_addr
+                                            );
+                                            let _ = self.ws.send(Message::Close(None)).await;
+                                            return Ok(None);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    debug!("expected ClientAuth from v2 client {}", self.peer_addr);
+                                    let _ = self.ws.send(Message::Close(None)).await;
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        _ => {
+                            debug!("ClientAuth deadline exceeded from {}", self.peer_addr);
+                            return Ok(None);
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                // Admission answered only after proof (S1); unknown and
+                // revoked keys get ONE identical refusal.
+                let (decision, registration) = self.admission.check(&client_identity, proven).await;
+                if decision == AdmissionDecision::Refuse {
+                    let refusal = HandshakeMessage::Error {
+                        code: ADMISSION_REFUSAL_CODE,
+                        message: ADMISSION_REFUSAL_MESSAGE.to_string(),
+                    };
+                    let _ = self
+                        .ws
+                        .send(Message::Binary(serde_json::to_vec(&refusal)?))
+                        .await;
+                    return Ok(None);
+                }
+                self.registration = registration;
+
+                // ServerAccept closes the flight for v2 clients; legacy
+                // clients never wait for it, so nothing is sent to them.
+                if proven {
+                    let accept = HandshakeMessage::ServerAccept {
+                        session_id: rvpn_core::protocol::SessionId::generate(),
+                        session_token: vec![0u8; 32],
+                        server_time: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    if self
+                        .ws
+                        .send(Message::Binary(serde_json::to_vec(&accept)?))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(None);
+                    }
+                }
+
                 debug!("X3DH handshake completed with {}", self.peer_addr);
 
                 Ok(Some(ratchet))
@@ -3958,16 +4127,8 @@ pub struct DnsHandler {
 }
 
 impl DnsHandler {
-    pub fn new(config: ServerConfig) -> Result<Self> {
+    pub fn new(config: ServerConfig, admission: crate::admission::Admission) -> Result<Self> {
         let x3dh_responder = Some(crate::private_files::load_responder(&config)?);
-
-        let admission = crate::admission::Admission::new(
-            config.admission.enabled,
-            parse_admission_mode(&config.admission.mode),
-            config.admission.allow_file.clone(),
-            config.admission.pending_file.clone(),
-            config.admission.audit_file.clone(),
-        );
 
         Ok(Self {
             x3dh_responder,
@@ -4010,8 +4171,7 @@ impl DnsHandler {
         };
         let HandshakeResult {
             ratchet,
-            identity_key,
-            mut revocation_rx,
+            mut registration,
         } = hs;
 
         debug!("DNS handler: handshake complete for {}", peer_addr);
@@ -4181,19 +4341,24 @@ impl DnsHandler {
             Ok(())
         };
 
-        let outcome: Result<()> = match revocation_rx.as_mut() {
-            Some(rx) => {
-                tokio::select! {
-                    _ = rx => {
-                        debug!("DNS handler: session dropped: client key revoked (admission) for {}", peer_addr);
-                        Ok(())
-                    }
-                    res = session => res,
+        // Only `Ok(())` means "revoked" (B3): `Err(Closed)` says the
+        // registration is already stale — that session is NOT revoked and
+        // must keep running.
+        let outcome: Result<()> = match registration.as_mut().and_then(|r| r.revoke_rx.as_mut()) {
+            Some(rx) => match futures_util::future::select(Box::pin(session), rx).await {
+                futures_util::future::Either::Left((res, _rx)) => res,
+                futures_util::future::Either::Right((Ok(()), _session)) => {
+                    debug!(
+                        "DNS handler: session dropped: client key revoked (admission) for {}",
+                        peer_addr
+                    );
+                    Ok(())
                 }
-            }
+                futures_util::future::Either::Right((Err(_), session)) => session.await,
+            },
             None => session.await,
         };
-        self.admission.unregister(&identity_key).await;
+        // The registration's Drop unregisters this session by id (B3).
         outcome
     }
 
@@ -4337,6 +4502,8 @@ impl DnsHandler {
                 ephemeral_key,
                 identity_key,
                 capabilities,
+                // See site 1: the proof moved to the ClientAuth flight.
+                admission_mac: _,
                 ..
             } => {
                 if !version.is_compatible_with(&ProtocolVersion::CURRENT) {
@@ -4397,22 +4564,6 @@ impl DnsHandler {
                     }
                 };
 
-                // Client admission: checked only AFTER the X3DH agreement
-                // succeeded, so only a client that holds its identity key is
-                // answered. Unknown and revoked keys get ONE identical refusal
-                // (#32): an outsider learns nothing about which keys exist.
-                let (decision, revocation_rx) = self.admission.check(&client_identity).await;
-                if decision == AdmissionDecision::Refuse {
-                    let refusal = HandshakeMessage::Error {
-                        code: ADMISSION_REFUSAL_CODE,
-                        message: ADMISSION_REFUSAL_MESSAGE.to_string(),
-                    };
-                    let _ = ws_write
-                        .send(Message::Binary(serde_json::to_vec(&refusal)?))
-                        .await;
-                    return Ok(None);
-                }
-
                 let ratchet = DoubleRatchet::init_bob(shared_secret, ratchet_version);
 
                 let public_bundle = responder.get_public_bundle();
@@ -4428,11 +4579,110 @@ impl DnsHandler {
                         anyhow::anyhow!("DNS handler: failed to send ServerHello: {:?}", e)
                     })?;
 
+                // Third flight (S1): v2-capable clients must prove key
+                // possession with a ClientAuth MAC over the full transcript
+                // before admission is answered. See site 1.
+                let client_caps = capabilities.unwrap_or(0);
+                let proven = if client_caps & rvpn_core::crypto::x3dh::CAP_RATCHET_V2 != 0 {
+                    let kc = rvpn_core::crypto::admission::derive_confirm_key(&shared_secret);
+                    let transcript = rvpn_core::crypto::admission::transcript(
+                        &client_identity,
+                        &client_ephemeral,
+                        &None,
+                        client_caps,
+                        &public_bundle.identity_x25519_key,
+                        &[],
+                        &public_bundle.signed_prekey,
+                        &public_bundle.prekey_signature,
+                        public_bundle.capabilities,
+                    );
+                    match tokio::time::timeout(Duration::from_secs(5), ws_read.next()).await {
+                        Ok(Some(Ok(Message::Binary(data)))) => {
+                            match serde_json::from_slice::<HandshakeMessage>(&data) {
+                                Ok(HandshakeMessage::ClientAuth { admission_mac, .. }) => {
+                                    match admission_mac
+                                        .as_deref()
+                                        .and_then(|m| <[u8; 32]>::try_from(m).ok())
+                                    {
+                                        Some(mac)
+                                            if rvpn_core::crypto::admission::verify_mac(
+                                                &kc,
+                                                &transcript,
+                                                &mac,
+                                            ) =>
+                                        {
+                                            true
+                                        }
+                                        _ => {
+                                            debug!(
+                                                "DNS handler: invalid ClientAuth MAC from {}",
+                                                peer_addr
+                                            );
+                                            let _ = ws_write.send(Message::Close(None)).await;
+                                            return Ok(None);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    debug!(
+                                        "DNS handler: expected ClientAuth from v2 client {}",
+                                        peer_addr
+                                    );
+                                    let _ = ws_write.send(Message::Close(None)).await;
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        _ => {
+                            debug!(
+                                "DNS handler: ClientAuth deadline exceeded from {}",
+                                peer_addr
+                            );
+                            return Ok(None);
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                // Admission answered only after proof (S1); unknown and
+                // revoked keys get ONE identical refusal.
+                let (decision, registration) = self.admission.check(&client_identity, proven).await;
+                if decision == AdmissionDecision::Refuse {
+                    let refusal = HandshakeMessage::Error {
+                        code: ADMISSION_REFUSAL_CODE,
+                        message: ADMISSION_REFUSAL_MESSAGE.to_string(),
+                    };
+                    let _ = ws_write
+                        .send(Message::Binary(serde_json::to_vec(&refusal)?))
+                        .await;
+                    return Ok(None);
+                }
+
+                // ServerAccept closes the flight for v2 clients; legacy
+                // clients never wait for it, so nothing is sent to them.
+                if proven {
+                    let accept = HandshakeMessage::ServerAccept {
+                        session_id: rvpn_core::protocol::SessionId::generate(),
+                        session_token: vec![0u8; 32],
+                        server_time: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    if ws_write
+                        .send(Message::Binary(serde_json::to_vec(&accept)?))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(None);
+                    }
+                }
+
                 debug!("DNS handler: X3DH handshake complete for {}", peer_addr);
                 Ok(Some(HandshakeResult {
                     ratchet,
-                    identity_key: client_identity,
-                    revocation_rx,
+                    registration,
                 }))
             }
             _ => {
@@ -4778,5 +5028,411 @@ mod tun_source_tests {
                 None
             )
         );
+    }
+}
+// ---------------------------------------------------------------------------
+// ClientAuth admission-flight tests (S1, Thomas's four): driven end-to-end
+// through VpnHandler::perform_handshake over a loopback WebSocket.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod flight_tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use rvpn_core::crypto::admission as admission_proof;
+    use rvpn_core::crypto::x3dh::{X3DHInitiator, X3DHPublicBundle, CAP_RATCHET_V2};
+    use rvpn_core::crypto::IdentityKey;
+    use std::path::PathBuf;
+    use tokio_tungstenite::WebSocketStream;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        handler: VpnHandler,
+        allow_path: PathBuf,
+        pending_path: PathBuf,
+        audit_path: PathBuf,
+    }
+
+    async fn fixture(mode: crate::admission::AdmissionMode) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        // Server identity + signed prekey files (0600, as required).
+        let identity = IdentityKey::generate();
+        let id_path = dir.path().join("identity.key");
+        identity.save(&id_path).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let spk_private = [42u8; 32];
+        let bundle_path = dir.path().join("bundle.json");
+        let private_path = dir.path().join("bundle.private.json");
+        let private_json =
+            String::from("{\"signed_prekey_private\":\"") + &BASE64.encode(spk_private) + "\"}";
+        std::fs::write(&private_path, private_json).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let allow_path = dir.path().join("clients.json");
+        let pending_path = dir.path().join("pending.json");
+        let audit_path = dir.path().join("audit.log");
+        let admission = crate::admission::Admission::new(
+            true,
+            mode,
+            allow_path.clone(),
+            pending_path.clone(),
+            audit_path.clone(),
+        );
+
+        let mut config = ServerConfig::default();
+        config.identity_key_file = id_path;
+        config.prekey_bundle_file = Some(bundle_path);
+        let handler = VpnHandler::new(config, admission).unwrap();
+        Fixture {
+            _dir: dir,
+            handler,
+            allow_path,
+            pending_path,
+            audit_path,
+        }
+    }
+
+    type WsHalf = WebSocketStream<tokio::io::DuplexStream>;
+
+    async fn ws_pair() -> (WsHalf, WsHalf) {
+        let (a, b) = tokio::io::duplex(65536);
+        let server = WebSocketStream::from_raw_socket(
+            a,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let client = WebSocketStream::from_raw_socket(
+            b,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        (server, client)
+    }
+
+    /// The client side of the v2 flight: Hello (v2 caps) -> ServerHello ->
+    /// ClientAuth with the MAC (or a tampered one) -> the server's answer.
+    /// Returns the server's post-ClientAuth message (ServerAccept or
+    /// Error), or None if the server closed without one.
+    async fn client_v2_flight(
+        client: &mut WsHalf,
+        identity: std::sync::Arc<IdentityKey>,
+        tamper_mac: bool,
+    ) -> Option<HandshakeMessage> {
+        use futures_util::{SinkExt, StreamExt};
+
+        let initiator = X3DHInitiator::from_identity_key(identity);
+        let identity_public = initiator.identity_key.x25519_public_key();
+        let ephemeral_public = initiator.ephemeral_key.public_key.to_bytes();
+
+        let hello = HandshakeMessage::Hello {
+            version: rvpn_core::protocol::ProtocolVersion::CURRENT,
+            auth_method: rvpn_core::protocol::AuthMethod::X3DH,
+            ephemeral_key: Some(ephemeral_public.to_vec()),
+            identity_key: Some(identity_public.to_vec()),
+            session_token: None,
+            connection_nonce: None,
+            capabilities: Some(CAP_RATCHET_V2),
+            admission_mac: None,
+        };
+        client
+            .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
+            .await
+            .unwrap();
+
+        // ServerHello
+        let server_hello = match client.next().await {
+            Some(Ok(Message::Binary(data))) => {
+                serde_json::from_slice::<HandshakeMessage>(&data).unwrap()
+            }
+            other => panic!("expected ServerHello, got {:?}", other.is_some()),
+        };
+        let bundle = match server_hello {
+            HandshakeMessage::ServerHello {
+                identity_key,
+                signed_prekey,
+                prekey_signature,
+                identity_x25519_key,
+                capabilities,
+                ..
+            } => X3DHPublicBundle {
+                identity_key: identity_key.as_slice().try_into().unwrap(),
+                identity_x25519_key: identity_x25519_key.unwrap().as_slice().try_into().unwrap(),
+                signed_prekey: signed_prekey.as_slice().try_into().unwrap(),
+                prekey_signature: prekey_signature.as_slice().try_into().unwrap(),
+                one_time_prekey: None,
+                identity_key_version: 1,
+                rotation_signature: None,
+                identity_x25519_signature: None,
+                capabilities: capabilities.unwrap_or(0),
+            },
+            other => panic!("expected ServerHello, got {:?}", other),
+        };
+
+        let (shared_secret, _, _) = initiator.agree(&bundle).unwrap();
+        let kc = admission_proof::derive_confirm_key(&shared_secret);
+        let transcript = admission_proof::transcript(
+            &identity_public,
+            &ephemeral_public,
+            &None,
+            CAP_RATCHET_V2,
+            &bundle.identity_x25519_key,
+            &[],
+            &bundle.signed_prekey,
+            &bundle.prekey_signature,
+            bundle.capabilities,
+        );
+        let mut mac = admission_proof::compute_mac(&kc, &transcript);
+        if tamper_mac {
+            mac[0] ^= 1;
+        }
+        let client_auth = HandshakeMessage::ClientAuth {
+            encrypted_data: Vec::new(),
+            identity: None,
+            admission_mac: Some(mac.to_vec()),
+        };
+        client
+            .send(Message::Binary(serde_json::to_vec(&client_auth).unwrap()))
+            .await
+            .unwrap();
+
+        match client.next().await {
+            Some(Ok(Message::Binary(data))) => {
+                Some(serde_json::from_slice::<HandshakeMessage>(&data).unwrap())
+            }
+            // A reset without a close frame is the server dropping the
+            // connection with no answer - exactly what the generic failure
+            // looks like on the wire.
+            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => None,
+            Some(Ok(other)) => panic!("unexpected message: {:?}", other),
+        }
+    }
+
+    async fn run_server_handshake(fx: &Fixture, server: &mut WsHalf) -> bool {
+        use futures_util::StreamExt;
+        let (mut ws_write, mut ws_read) = server.split();
+        fx.handler
+            .perform_handshake(
+                &mut ws_write,
+                &mut ws_read,
+                "127.0.0.1:43210".parse().unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    fn approve_key(fx: &Fixture, identity: &IdentityKey) {
+        let fp = crate::admission::fingerprint_of(&identity.x25519_public_key());
+        crate::admission::cmd_approve(
+            &fx.allow_path,
+            &fx.pending_path,
+            &fx.audit_path,
+            &fp,
+            Some("flight test"),
+        );
+    }
+
+    /// Thomas test 4: a valid MAC plus an UNKNOWN key gets the one
+    /// pending_approval refusal.
+    #[tokio::test]
+    async fn valid_mac_unknown_key_gets_pending_approval() {
+        let fx = std::sync::Arc::new(fixture(crate::admission::AdmissionMode::Enforce).await);
+        let (mut server, mut client) = ws_pair().await;
+        let server_task = {
+            let fx = fx.clone();
+            tokio::spawn(async move { run_server_handshake(&fx, &mut server).await })
+        };
+        let answer = client_v2_flight(
+            &mut client,
+            std::sync::Arc::new(IdentityKey::generate()),
+            false,
+        )
+        .await;
+        assert!(
+            !server_task.await.unwrap(),
+            "unknown key must not be admitted"
+        );
+        match answer {
+            Some(HandshakeMessage::Error { code, message }) => {
+                assert_eq!(code, crate::admission::ADMISSION_REFUSAL_CODE);
+                assert_eq!(message, crate::admission::ADMISSION_REFUSAL_MESSAGE);
+            }
+            other => panic!("expected pending_approval refusal, got {:?}", other),
+        }
+    }
+
+    /// The happy path: valid MAC + approved key -> ServerAccept and an
+    /// admitted session.
+    #[tokio::test]
+    async fn valid_mac_approved_key_gets_server_accept() {
+        let fx = std::sync::Arc::new(fixture(crate::admission::AdmissionMode::Enforce).await);
+        let identity = IdentityKey::generate();
+        approve_key(&fx, &identity);
+        let (mut server, mut client) = ws_pair().await;
+        let server_task = {
+            let fx = fx.clone();
+            tokio::spawn(async move { run_server_handshake(&fx, &mut server).await })
+        };
+        let answer = client_v2_flight(&mut client, std::sync::Arc::new(identity), false).await;
+        assert!(server_task.await.unwrap(), "approved key must be admitted");
+        match answer {
+            Some(HandshakeMessage::ServerAccept {
+                session_id: _,
+                session_token,
+                server_time,
+            }) => {
+                assert_eq!(session_token.len(), 32);
+                assert!(server_time > 0);
+            }
+            other => panic!("expected ServerAccept, got {:?}", other),
+        }
+    }
+
+    /// Thomas test 1+2: a tampered MAC (equally: a MAC from another
+    /// session) gets the GENERIC failure - no pending_approval, no answer
+    /// at all, and the handshake dies.
+    #[tokio::test]
+    async fn tampered_mac_gets_generic_failure_not_refusal() {
+        let fx = std::sync::Arc::new(fixture(crate::admission::AdmissionMode::Enforce).await);
+        let identity = IdentityKey::generate();
+        approve_key(&fx, &identity);
+        let (mut server, mut client) = ws_pair().await;
+        let server_task = {
+            let fx = fx.clone();
+            tokio::spawn(async move { run_server_handshake(&fx, &mut server).await })
+        };
+        let answer = client_v2_flight(&mut client, std::sync::Arc::new(identity), true).await;
+        assert!(
+            !server_task.await.unwrap(),
+            "tampered MAC must fail the handshake"
+        );
+        assert!(
+            answer.is_none(),
+            "tampered MAC must get NO admission answer (no oracle), got {:?}",
+            answer
+        );
+    }
+
+    /// Thomas test 3: a v2 client that never sends ClientAuth hits the
+    /// deadline and dies, with no admission answer.
+    #[tokio::test(start_paused = true)]
+    async fn missing_client_auth_times_out() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let fx = std::sync::Arc::new(fixture(crate::admission::AdmissionMode::Enforce).await);
+        let (mut server, mut client) = ws_pair().await;
+        let server_task = {
+            let fx = fx.clone();
+            tokio::spawn(async move { run_server_handshake(&fx, &mut server).await })
+        };
+
+        let identity = IdentityKey::generate();
+        let hello = HandshakeMessage::Hello {
+            version: rvpn_core::protocol::ProtocolVersion::CURRENT,
+            auth_method: rvpn_core::protocol::AuthMethod::X3DH,
+            ephemeral_key: Some([7u8; 32].to_vec()),
+            identity_key: Some(identity.x25519_public_key().to_vec()),
+            session_token: None,
+            connection_nonce: None,
+            capabilities: Some(CAP_RATCHET_V2),
+            admission_mac: None,
+        };
+        client
+            .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
+            .await
+            .unwrap();
+        // Read the ServerHello, then go silent.
+        match client.next().await {
+            Some(Ok(Message::Binary(_))) => {}
+            other => panic!("expected ServerHello, got {:?}", other.is_some()),
+        }
+        // Advance time past the 5s ClientAuth deadline.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let admitted = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server handshake must finish after the deadline")
+            .unwrap();
+        assert!(!admitted, "missing ClientAuth must fail the handshake");
+        // And nothing further was sent to the client (no oracle).
+        match client.next().await {
+            Some(Ok(Message::Close(_))) | None => {}
+            Some(Ok(Message::Binary(data))) => {
+                panic!("no admission answer expected, got {} bytes", data.len())
+            }
+            _ => {}
+        }
+    }
+
+    /// Legacy client (no v2 capability): admitted in learn mode but NOT
+    /// recorded (S1), and receives no extra message - the old read loop is
+    /// untouched.
+    #[tokio::test]
+    async fn legacy_client_learn_mode_admitted_not_recorded() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let fx = std::sync::Arc::new(fixture(crate::admission::AdmissionMode::Learn).await);
+        let (mut server, mut client) = ws_pair().await;
+        let server_task = {
+            let fx = fx.clone();
+            tokio::spawn(async move { run_server_handshake(&fx, &mut server).await })
+        };
+
+        let identity = IdentityKey::generate();
+        let hello = HandshakeMessage::Hello {
+            version: rvpn_core::protocol::ProtocolVersion::CURRENT,
+            auth_method: rvpn_core::protocol::AuthMethod::X3DH,
+            ephemeral_key: Some([8u8; 32].to_vec()),
+            identity_key: Some(identity.x25519_public_key().to_vec()),
+            session_token: None,
+            connection_nonce: None,
+            capabilities: None, // legacy: no capabilities field at all
+            admission_mac: None,
+        };
+        client
+            .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
+            .await
+            .unwrap();
+        match client.next().await {
+            Some(Ok(Message::Binary(data))) => {
+                let msg = serde_json::from_slice::<HandshakeMessage>(&data).unwrap();
+                assert!(matches!(msg, HandshakeMessage::ServerHello { .. }));
+            }
+            other => panic!("expected ServerHello, got {:?}", other.is_some()),
+        }
+        // The server handshake completes immediately (no ClientAuth wait).
+        let admitted = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("legacy handshake must not wait for ClientAuth")
+            .unwrap();
+        assert!(admitted, "legacy client is admitted in learn mode");
+        // But NOT recorded: the allow-list stays empty (S1).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let allow_raw = std::fs::read(&fx.allow_path)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        assert!(
+            !allow_raw.contains(&crate::admission::fingerprint_of(
+                &identity.x25519_public_key()
+            )),
+            "unproven legacy key must not be learned"
+        );
+        // And no third message ever arrives for the legacy client (a bare
+        // connection drop is fine - that is the server finishing its side).
+        match tokio::time::timeout(Duration::from_millis(200), client.next()).await {
+            Err(_) => {}
+            Ok(Some(Ok(Message::Binary(data)))) => {
+                panic!(
+                    "legacy client must get no third message, got {} bytes",
+                    data.len()
+                )
+            }
+            Ok(_) => {}
+        }
     }
 }

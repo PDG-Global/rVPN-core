@@ -6,11 +6,14 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+pub mod admission;
 pub mod cipher;
 pub mod ratchet;
 pub mod x3dh;
 
-pub use ratchet::{DoubleRatchet, MessageHeader, RatchetMessage, RatchetMessageRef, RatchetVersion};
+pub use ratchet::{
+    DoubleRatchet, MessageHeader, RatchetMessage, RatchetMessageRef, RatchetVersion,
+};
 pub use x3dh::{verify_identity_x25519_signature, X3DHPublicBundle, X3DHResponder};
 
 /// Ed25519 identity key pair

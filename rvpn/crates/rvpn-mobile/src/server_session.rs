@@ -37,7 +37,9 @@ use crate::ws::{FrameType, MinimalWebSocket, MinimalWsReader, MinimalWsWriter};
 
 use rvpn_core::crypto::ratchet::{RatchetMessage, RatchetMessageRef};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
-use rvpn_core::crypto::{DoubleRatchet, EphemeralKey, IdentityKey, X3DHPublicBundle, RatchetVersion};
+use rvpn_core::crypto::{
+    DoubleRatchet, EphemeralKey, IdentityKey, RatchetVersion, X3DHPublicBundle,
+};
 use rvpn_core::protocol::padding::{pad_packet, unpad_packet, unpad_packet_slice};
 use rvpn_core::protocol::{
     ControlMessage, HandshakeMessage, MultiplexedFrame, PayloadType, VirtualIp,
@@ -851,6 +853,7 @@ impl ServerSession {
             session_token: None,
             connection_nonce: None,
             capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
+            admission_mac: None,
         };
 
         let hello_bytes =
@@ -884,8 +887,63 @@ impl ServerSession {
                     .agree(&validated.bundle)
                     .context("X3DH key agreement failed")?;
                 validated.commit(&self.security);
+
+                // Third flight (S1): ClientAuth admission proof, then
+                // ServerAccept (or the pending_approval refusal).
+                let kc = rvpn_core::crypto::admission::derive_confirm_key(&shared_secret);
+                let transcript = rvpn_core::crypto::admission::transcript(
+                    &identity_public,
+                    &ephemeral_public,
+                    &None,
+                    rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                    &validated.bundle.identity_x25519_key,
+                    &[],
+                    &validated.bundle.signed_prekey,
+                    &validated.bundle.prekey_signature,
+                    validated.bundle.capabilities,
+                );
+                let mac = rvpn_core::crypto::admission::compute_mac(&kc, &transcript);
+                let client_auth = HandshakeMessage::ClientAuth {
+                    encrypted_data: Vec::new(),
+                    identity: None,
+                    admission_mac: Some(mac.to_vec()),
+                };
+                let auth_bytes =
+                    serde_json::to_vec(&client_auth).context("Failed to serialize ClientAuth")?;
+                ws_writer
+                    .send_binary(&auth_bytes)
+                    .await
+                    .context("Failed to send ClientAuth")?;
+
+                let mut accept_buf = vec![0u8; 16384];
+                let (accept_type, accept_len) = timeout(
+                    std::time::Duration::from_secs(5),
+                    ws_reader.next_frame(&mut accept_buf),
+                )
+                .await
+                .context("WebSocket timeout waiting for ServerAccept (5s)")?
+                .context("WebSocket error waiting for ServerAccept")?;
+                if accept_type != FrameType::Binary {
+                    return Err(anyhow::anyhow!("expected binary ServerAccept message"));
+                }
+                match serde_json::from_slice::<HandshakeMessage>(&accept_buf[..accept_len])
+                    .context("Failed to parse ServerAccept")?
+                {
+                    HandshakeMessage::ServerAccept { .. } => {}
+                    HandshakeMessage::Error { code, message }
+                        if code == rvpn_core::crypto::admission::REFUSAL_CODE =>
+                    {
+                        return Err(anyhow::anyhow!("server refused this client key: {message}"));
+                    }
+                    _ => return Err(anyhow::anyhow!("expected ServerAccept from server")),
+                }
+
                 info!("[IosTun] Double Ratchet initialized after server identity validation");
-                Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32], ratchet_version))
+                Ok(DoubleRatchet::init_alice(
+                    shared_secret,
+                    [0u8; 32],
+                    ratchet_version,
+                ))
             }
             _ => Err(anyhow::anyhow!("Expected binary message during handshake")),
         }

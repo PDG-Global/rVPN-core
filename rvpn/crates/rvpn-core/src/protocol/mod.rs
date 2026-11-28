@@ -108,6 +108,12 @@ pub enum HandshakeMessage {
         /// X3DH KDF input, so altering it in flight diverges the secrets.
         #[serde(default)]
         capabilities: Option<u32>,
+        /// Admission key-confirmation MAC (v2-capable clients): proves the
+        /// sender holds the identity key in this Hello. Verified by the
+        /// server BEFORE any admission decision; see
+        /// `rvpn_core::crypto::x3dh::admission` . Absent in pre-v2 clients.
+        #[serde(default, with = "serde_bytes")]
+        admission_mac: Option<Vec<u8>>,
     },
 
     /// Server response with key bundle
@@ -135,7 +141,12 @@ pub enum HandshakeMessage {
         capabilities: Option<u32>,
     },
 
-    /// Client authentication proof
+    /// Client authentication proof. For v2-capable clients this carries the
+    /// admission key-confirmation MAC (see
+    /// `rvpn_core::crypto::admission`), sent as the third handshake flight
+    /// after ServerHello. The server allocates nothing and registers no
+    /// session until it verifies, and answers ServerAccept only after
+    /// admission passes.
     ClientAuth {
         /// Encrypted authentication data
         #[serde(with = "serde_bytes")]
@@ -143,6 +154,10 @@ pub enum HandshakeMessage {
         /// Client identity (if not anonymous)
         #[serde(with = "serde_bytes")]
         identity: Option<Vec<u8>>,
+        /// Admission key-confirmation MAC over the full handshake
+        /// transcript (Hello + ServerHello). Present in v2-capable clients.
+        #[serde(default, with = "serde_bytes")]
+        admission_mac: Option<Vec<u8>>,
     },
 
     /// Server authentication acceptance

@@ -144,13 +144,55 @@ async fn run_server(config: ServerConfig) -> Result<()> {
         info!("TUN server started on {}", config.tun.tun_ip);
     }
 
-    let handler = Arc::new(RwLock::new(VpnHandler::new(config.clone())?));
+    // ONE shared admission controller for every handler (B1): a revoke
+    // anywhere must drop live sessions on every endpoint, driven by the
+    // background reload task rather than the next handshake.
+    let admission = {
+        let mode = rvpn_server::admission::parse_admission_mode(&config.admission.mode)
+            .unwrap_or_else(|e| {
+                error!("{e}");
+                std::process::exit(2);
+            });
+        let a = rvpn_server::admission::Admission::new(
+            config.admission.enabled,
+            mode,
+            config.admission.allow_file.clone(),
+            config.admission.pending_file.clone(),
+            config.admission.audit_file.clone(),
+        );
+        if config.admission.enabled {
+            let (mode, total, learned) = a.startup_summary().await;
+            info!(
+                "client admission: enabled, mode={:?}, {} approved keys ({} learned), allow-list={}",
+                mode,
+                total,
+                learned,
+                config.admission.allow_file.display()
+            );
+            rvpn_server::admission::spawn_reload_task(a.clone());
+        } else {
+            info!("client admission: disabled (pre-#32 behaviour)");
+        }
+        a
+    };
+
+    let handler = Arc::new(RwLock::new(VpnHandler::new(
+        config.clone(),
+        admission.clone(),
+    )?));
     let tun_handler = Arc::new(RwLock::new(TunHandler::new(
         config.clone(),
         Some(tun_server.clone()),
+        admission.clone(),
     )?));
-    let dns_handler = Arc::new(RwLock::new(DnsHandler::new(config.clone())?));
-    let mux_handler = Arc::new(RwLock::new(MultiplexerHandler::new(config.clone())?));
+    let dns_handler = Arc::new(RwLock::new(DnsHandler::new(
+        config.clone(),
+        admission.clone(),
+    )?));
+    let mux_handler = Arc::new(RwLock::new(MultiplexerHandler::new(
+        config.clone(),
+        admission.clone(),
+    )?));
 
     // Decoy static site for non-VPN HTTPS requests (active-probing mask).
     // When absent or unusable, non-WebSocket requests keep the historical
@@ -1071,6 +1113,12 @@ fn clients_command(config: &ServerConfig, tail: Vec<String>, label: Option<Strin
     let pending = &config.admission.pending_file;
     let audit = &config.admission.audit_file;
 
+    if !config.admission.enabled {
+        eprintln!(
+            "rvpn-server: warning: admission is DISABLED in the config — this change takes no effect until `admission.enabled = true`"
+        );
+    }
+
     let code = match tail.first().map(String::as_str) {
         Some("pending") if tail.len() == 1 => cmd_pending(pending),
         Some("list") if tail.len() == 1 => cmd_list(allow),
@@ -1079,7 +1127,13 @@ fn clients_command(config: &ServerConfig, tail: Vec<String>, label: Option<Strin
         }
         Some("revoke") if tail.len() == 2 => cmd_revoke(allow, pending, audit, &tail[1]),
         Some("mode") if tail.len() == 2 && (tail[1] == "learn" || tail[1] == "enforce") => {
-            cmd_set_mode(allow, audit, parse_admission_mode(&tail[1]))
+            match parse_admission_mode(&tail[1]) {
+                Ok(m) => cmd_set_mode(allow, audit, m),
+                Err(e) => {
+                    eprintln!("rvpn-server: {e}");
+                    2
+                }
+            }
         }
         _ => {
             eprintln!("rvpn-server: usage:");
