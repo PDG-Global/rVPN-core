@@ -105,6 +105,14 @@ security-framework = "2"
 boring.workspace = true
 tokio-boring.workspace = true
 
+# Windows FFI for the wintun.dll Authenticode check (WinVerifyTrust + crypt32).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true
 rcgen = "0.13"

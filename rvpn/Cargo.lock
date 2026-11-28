@@ -2522,6 +2522,7 @@ dependencies = [
  "tun-rs",
  "tungstenite",
  "uuid",
+ "windows",
  "x25519-dalek",
 ]
 
