@@ -66,6 +66,22 @@ rvpn/
     rvpn-mobile/     FFI bindings for iOS/macOS/Android
 ```
 
+## Upgrading to protocol v2
+
+rVPN's handshake upgraded to **ratchet v2** (header-authenticating AAD with
+commit-after-verify). Compatibility is negotiated during the handshake:
+
+- A **v2-capable client refuses a v1 server**, by design — otherwise an
+  attacker could strip the v2 capability and silently downgrade your
+  connection. The client fails with
+  `server does not speak ratchet v2; a v2-capable client refuses v1`.
+- A **v2-capable server accepts v1 clients until 2027-02-01** (a sunset
+  coded into the software), so upgrading the server first locks nobody out.
+
+**Upgrade order: server first, then clients.**
+See [docs/version-compatibility.md](docs/version-compatibility.md) for the
+full compatibility matrix.
+
 ## Building
 
 Requires Rust 1.88+.
