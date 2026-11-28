@@ -381,6 +381,16 @@ impl Admission {
         tighten_permissions(&allow_file);
         tighten_permissions(&pending_file);
         tighten_permissions(&audit_file);
+        // Thomas's recovery-path ask: a REMOVED allow-list is also a
+        // noteworthy start — it silently drops every stored approval and
+        // mode, so say so loudly.
+        if !allow_file.exists() {
+            warn!(
+                "admission: allow-list {} missing: starting empty in {:?} (any previous approvals and the stored mode are gone)",
+                allow_file.display(),
+                mode
+            );
+        }
         let degraded = matches!(read_json::<AllowList>(&allow_file), FileRead::Corrupt);
         if degraded {
             // A corrupt file at startup must not fall back to the config
