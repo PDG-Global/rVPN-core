@@ -703,7 +703,7 @@ fn luid_matches(best: NET_LUID_LH, expected: NET_LUID_LH) -> bool {
 /// Read/write access to a unicast-address row, injectable for tests.
 #[derive(Clone, Copy)]
 struct DadOps {
-    get: fn(Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW>,
+    get: fn(NET_LUID_LH, Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW>,
     set: fn(&MIB_UNICASTIPADDRESS_ROW) -> Result<()>,
 }
 
@@ -712,11 +712,19 @@ const WIN32_DAD_OPS: DadOps = DadOps {
     set: set_unicast_address_row,
 };
 
-/// Current unicast-address row for `addr`. The row is keyed by address: an
-/// IPv4 address exists on exactly one interface, and the returned row names
-/// it (InterfaceLuid).
-fn get_unicast_address_row(addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
-    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+/// Current unicast-address row for `addr` on the adapter identified by
+/// `adapter_luid`. GetUnicastIpAddressEntry is keyed on the interface
+/// (InterfaceLuid or InterfaceIndex) AND the address — both must be
+/// initialized; a zeroed interface key never matches and the call always
+/// fails with ERROR_FILE_NOT_FOUND.
+fn get_unicast_address_row(
+    adapter_luid: NET_LUID_LH,
+    addr: Ipv4Addr,
+) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    let mut row = MIB_UNICASTIPADDRESS_ROW {
+        InterfaceLuid: adapter_luid,
+        ..Default::default()
+    };
     row.Address = sockaddr_inet(IpAddr::V4(addr));
     let err = unsafe { GetUnicastIpAddressEntry(&mut row) };
     check(err, "GetUnicastIpAddressEntry")?;
@@ -729,14 +737,14 @@ fn set_unicast_address_row(row: &MIB_UNICASTIPADDRESS_ROW) -> Result<()> {
 }
 
 /// How long to wait between GetUnicastIpAddressEntry polls while the
-/// netsh-assigned address row materializes.
+/// netsh-assigned address row becomes queryable.
 const ADDRESS_WAIT_POLL: Duration = Duration::from_millis(250);
 
 /// Poll access to the unicast row, injectable for tests (sleep is stubbed so
 /// the timeout path does not take real time).
 #[derive(Clone, Copy)]
 struct AddressWaitOps {
-    get: fn(Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW>,
+    get: fn(NET_LUID_LH, Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW>,
     sleep: fn(Duration),
 }
 
@@ -745,29 +753,33 @@ const WIN32_ADDRESS_WAIT_OPS: AddressWaitOps = AddressWaitOps {
     sleep: std::thread::sleep,
 };
 
-/// Whether an error from GetUnicastIpAddressEntry means "the address row
-/// does not exist (yet)": ERROR_FILE_NOT_FOUND (2) while the netsh-assigned
-/// row has not materialized in the active store. Anything else is a real
-/// failure and must not be retried.
+/// Whether an error from GetUnicastIpAddressEntry means "the address row is
+/// not queryable (yet)": ERROR_FILE_NOT_FOUND (2) before the netsh-assigned
+/// row can be read back. Anything else is a real failure and must not be
+/// retried.
 fn is_address_row_absent(e: &anyhow::Error) -> bool {
     e.downcast_ref::<windows::core::Error>()
         .is_some_and(|e| e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0))
 }
 
-/// Wait until the tunnel address exists in the unicast-address table.
+/// Wait until the tunnel address can be read back from the unicast-address
+/// table on the given adapter.
 ///
 /// tun-rs assigns the address by shelling out to `netsh interface ipv4 set
-/// address` inside build_sync; netsh returns synchronously, but the unicast
-/// row materializes in the active store seconds later, so every check right
-/// after adapter creation sees ERROR_FILE_NOT_FOUND. Polls every
-/// ADDRESS_WAIT_POLL until the row appears or `timeout` elapses. Only the
-/// not-found error is retried; any other failure bails immediately.
+/// address` inside build_sync, and netsh returns before the row is reliably
+/// queryable — checks right after adapter creation can see
+/// ERROR_FILE_NOT_FOUND. Polls every ADDRESS_WAIT_POLL until the row is
+/// present or `timeout` elapses. Only the not-found error is retried; any
+/// other failure bails immediately. The returned row may still be
+/// DAD-Tentative; that is what force_dad_preferred is for.
 pub fn wait_for_unicast_address(
+    adapter_index: u32,
     addr: Ipv4Addr,
     timeout: Duration,
 ) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    let luid = interface_luid(adapter_index)?;
     let start = Instant::now();
-    let row = wait_for_unicast_address_with_ops(addr, timeout, &WIN32_ADDRESS_WAIT_OPS)?;
+    let row = wait_for_unicast_address_with_ops(luid, addr, timeout, &WIN32_ADDRESS_WAIT_OPS)?;
     info!(
         "tunnel address {addr} present in the unicast table after {:?}",
         start.elapsed()
@@ -776,13 +788,14 @@ pub fn wait_for_unicast_address(
 }
 
 fn wait_for_unicast_address_with_ops(
+    adapter_luid: NET_LUID_LH,
     addr: Ipv4Addr,
     timeout: Duration,
     ops: &AddressWaitOps,
 ) -> Result<MIB_UNICASTIPADDRESS_ROW> {
     let start = Instant::now();
     loop {
-        match (ops.get)(addr) {
+        match (ops.get)(adapter_luid, addr) {
             Ok(row) => return Ok(row),
             Err(e) if is_address_row_absent(&e) => {
                 if start.elapsed() >= timeout {
@@ -812,17 +825,16 @@ enum DadForce {
 
 /// Force the tunnel address out of duplicate address detection into
 /// Preferred. tun-rs assigns the address via netsh without touching
-/// DadState, so once the row exists (see wait_for_unicast_address — the row
-/// itself materializes seconds after netsh returns) it is still Tentative,
-/// and source-address selection fails: GetBestRoute2 then errors with
-/// ERROR_NETWORK_UNREACHABLE even though the covering routes exist. DAD is
-/// meaningless on a point-to-point tunnel interface (wireguard-windows sets
-/// IpDadStatePreferred when adding the address for the same reason). A
-/// Duplicate report is a real address conflict and fails closed instead of
-/// being papered over.
+/// DadState, so once the row is queryable (see wait_for_unicast_address)
+/// it can still be Tentative, and source-address selection skips Tentative
+/// addresses: GetBestRoute2 then errors with ERROR_NETWORK_UNREACHABLE even
+/// though the covering routes exist. DAD is meaningless on a point-to-point
+/// tunnel interface (wireguard-windows sets IpDadStatePreferred when adding
+/// the address for the same reason). A Duplicate report is a real address
+/// conflict and fails closed instead of being papered over.
 ///
 /// Callers must run wait_for_unicast_address first: this looks the row up
-/// and fails with ERROR_FILE_NOT_FOUND while it has not materialized.
+/// and fails with ERROR_FILE_NOT_FOUND while it is not yet queryable.
 ///
 /// Deliberately NOT part of TunDevice::create_with_ip: the route_diag_probe
 /// test calls create_with_ip and must observe the raw tun-rs DAD behavior.
@@ -845,7 +857,7 @@ fn force_dad_preferred_with_ops(
     addr: Ipv4Addr,
     ops: DadOps,
 ) -> Result<DadForce> {
-    let mut row = (ops.get)(addr)?;
+    let mut row = (ops.get)(adapter_luid, addr)?;
     if !luid_matches(row.InterfaceLuid, adapter_luid) {
         bail!(
             "tunnel address {addr} lives on a different interface (luid {:#x}); \
@@ -1847,20 +1859,42 @@ mod tests {
 
     static DAD_SET_STATES: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
-    fn stub_dad_get_tentative(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    fn stub_dad_get_tentative(
+        _luid: NET_LUID_LH,
+        _addr: Ipv4Addr,
+    ) -> Result<MIB_UNICASTIPADDRESS_ROW> {
         Ok(dad_test_row(IpDadStateTentative, TEST_ADAPTER_LUID))
     }
 
-    fn stub_dad_get_preferred(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    fn stub_dad_get_preferred(
+        _luid: NET_LUID_LH,
+        _addr: Ipv4Addr,
+    ) -> Result<MIB_UNICASTIPADDRESS_ROW> {
         Ok(dad_test_row(IpDadStatePreferred, TEST_ADAPTER_LUID))
     }
 
-    fn stub_dad_get_duplicate(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    fn stub_dad_get_duplicate(
+        _luid: NET_LUID_LH,
+        _addr: Ipv4Addr,
+    ) -> Result<MIB_UNICASTIPADDRESS_ROW> {
         Ok(dad_test_row(IpDadStateDuplicate, TEST_ADAPTER_LUID))
     }
 
-    fn stub_dad_get_wrong_interface(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    fn stub_dad_get_wrong_interface(
+        _luid: NET_LUID_LH,
+        _addr: Ipv4Addr,
+    ) -> Result<MIB_UNICASTIPADDRESS_ROW> {
         Ok(dad_test_row(IpDadStateTentative, TEST_PHYSICAL_LUID))
+    }
+
+    static DAD_GET_LUIDS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+    fn stub_dad_get_record_luid(
+        luid: NET_LUID_LH,
+        _addr: Ipv4Addr,
+    ) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+        DAD_GET_LUIDS.lock().unwrap().push(luid_value(luid));
+        Ok(dad_test_row(IpDadStatePreferred, TEST_ADAPTER_LUID))
     }
 
     fn stub_dad_set_record(row: &MIB_UNICASTIPADDRESS_ROW) -> Result<()> {
@@ -1942,6 +1976,28 @@ mod tests {
         assert!(format!("{e:#}").contains("different interface"));
     }
 
+    /// The row lookup is keyed by interface + address: the adapter LUID must
+    /// be passed through to the get operation (GetUnicastIpAddressEntry never
+    /// matches with a zeroed interface key).
+    #[test]
+    fn dad_get_receives_the_adapter_luid() {
+        DAD_GET_LUIDS.lock().unwrap().clear();
+        let ops = DadOps {
+            get: stub_dad_get_record_luid,
+            set: stub_dad_set_fail,
+        };
+        let result = force_dad_preferred_with_ops(
+            luid_from_value(TEST_ADAPTER_LUID),
+            Ipv4Addr::new(10, 200, 0, 3),
+            ops,
+        );
+        assert_eq!(result.unwrap(), DadForce::AlreadyPreferred);
+        assert_eq!(
+            DAD_GET_LUIDS.lock().unwrap().as_slice(),
+            [TEST_ADAPTER_LUID]
+        );
+    }
+
     // ---- unicast-address wait -----------------------------------------------
 
     /// Same error shape the production path sees while the netsh-assigned
@@ -1956,10 +2012,12 @@ mod tests {
     fn stub_wait_sleep_noop(_d: Duration) {}
 
     static WAIT_LATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static WAIT_LATE_LUIDS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
     static WAIT_FATAL_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    /// Row appears on the third poll.
-    fn stub_wait_get_late(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    /// Row appears on the third poll; records the LUID it was keyed with.
+    fn stub_wait_get_late(luid: NET_LUID_LH, _addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+        WAIT_LATE_LUIDS.lock().unwrap().push(luid_value(luid));
         if WAIT_LATE_CALLS.fetch_add(1, Ordering::SeqCst) >= 2 {
             Ok(dad_test_row(IpDadStatePreferred, TEST_ADAPTER_LUID))
         } else {
@@ -1967,24 +2025,33 @@ mod tests {
         }
     }
 
-    fn stub_wait_get_never(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    fn stub_wait_get_never(
+        _luid: NET_LUID_LH,
+        _addr: Ipv4Addr,
+    ) -> Result<MIB_UNICASTIPADDRESS_ROW> {
         Err(address_not_found_error())
     }
 
-    fn stub_wait_get_fatal(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    fn stub_wait_get_fatal(
+        _luid: NET_LUID_LH,
+        _addr: Ipv4Addr,
+    ) -> Result<MIB_UNICASTIPADDRESS_ROW> {
         WAIT_FATAL_CALLS.fetch_add(1, Ordering::SeqCst);
         Err(anyhow::anyhow!("access denied"))
     }
 
-    /// The wait helper polls until the row appears, then returns it.
+    /// The wait helper polls until the row appears, then returns it; every
+    /// poll is keyed by the adapter LUID.
     #[test]
     fn wait_returns_row_once_address_appears() {
         WAIT_LATE_CALLS.store(0, Ordering::SeqCst);
+        WAIT_LATE_LUIDS.lock().unwrap().clear();
         let ops = AddressWaitOps {
             get: stub_wait_get_late,
             sleep: stub_wait_sleep_noop,
         };
         let row = wait_for_unicast_address_with_ops(
+            luid_from_value(TEST_ADAPTER_LUID),
             Ipv4Addr::new(10, 200, 0, 3),
             Duration::from_secs(5),
             &ops,
@@ -1992,6 +2059,10 @@ mod tests {
         .unwrap();
         assert_eq!(WAIT_LATE_CALLS.load(Ordering::SeqCst), 3);
         assert!(row.DadState == IpDadStatePreferred);
+        assert_eq!(
+            WAIT_LATE_LUIDS.lock().unwrap().as_slice(),
+            [TEST_ADAPTER_LUID; 3]
+        );
     }
 
     /// Only the not-found error is retried; any other failure bails on the
@@ -2004,6 +2075,7 @@ mod tests {
             sleep: stub_wait_sleep_noop,
         };
         let e = wait_for_unicast_address_with_ops(
+            luid_from_value(TEST_ADAPTER_LUID),
             Ipv4Addr::new(10, 200, 0, 3),
             Duration::from_secs(5),
             &ops,
@@ -2022,6 +2094,7 @@ mod tests {
             sleep: stub_wait_sleep_noop,
         };
         let e = wait_for_unicast_address_with_ops(
+            luid_from_value(TEST_ADAPTER_LUID),
             Ipv4Addr::new(10, 200, 0, 3),
             Duration::from_millis(20),
             &ops,
@@ -2159,9 +2232,9 @@ mod tests {
     ///
     /// Creates a throwaway adapter exactly the way the client does
     /// (TunDevice::create_with_ip), assigns 10.200.0.3/24 with MTU 1420,
-    /// logs a timeline of the unicast row materializing (netsh assigns the
-    /// address synchronously inside build_sync, but the row appears in the
-    /// active store seconds later) with every DadState transition, dumps the
+    /// logs a timeline of the unicast row becoming queryable (netsh assigns
+    /// the address synchronously inside build_sync but returns before the
+    /// row is reliably queryable) with every DadState transition, dumps the
     /// adapter/address/interface state (DAD included), installs the
     /// production covering routes via forward_row/create_route, and reports
     /// how GetBestRoute2 behaves for the production rows and a series of
@@ -2231,16 +2304,16 @@ mod tests {
         );
 
         // --- address materialization timeline ---
-        // tun-rs assigns the address via netsh inside build_sync; the
-        // unicast row materializes in the active store seconds later. Poll
-        // and log every transition so the timeline shows when the row
-        // appears and how DadState evolves.
+        // tun-rs assigns the address via netsh inside build_sync, and netsh
+        // returns before the row is reliably queryable. Poll and log every
+        // transition so the timeline shows when the row appears and how
+        // DadState evolves.
         println!("probe: t+0.00s: unicast row for {PROBE_IP}: not-found (polling up to 30s)");
         let timeline_start = std::time::Instant::now();
         let mut timeline_state = "not-found".to_string();
         while timeline_start.elapsed() < std::time::Duration::from_secs(30) {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            match get_unicast_address_row(PROBE_IP) {
+            match get_unicast_address_row(luid, PROBE_IP) {
                 Ok(row) => {
                     let state = format!("{} ({})", row.DadState.0, dad_state_name(row.DadState));
                     if state != timeline_state {
@@ -2295,7 +2368,7 @@ mod tests {
         }
 
         // --- address state + DAD watch ---
-        match get_unicast_address_row(PROBE_IP) {
+        match get_unicast_address_row(luid, PROBE_IP) {
             Ok(row) => {
                 println!(
                     "probe: address {PROBE_IP}: dad_state={} ({}) prefix_origin={} \
@@ -2322,7 +2395,7 @@ mod tests {
                         && start.elapsed() < std::time::Duration::from_secs(10)
                     {
                         std::thread::sleep(std::time::Duration::from_millis(250));
-                        match get_unicast_address_row(PROBE_IP) {
+                        match get_unicast_address_row(luid, PROBE_IP) {
                             Ok(current) => final_state = current.DadState,
                             Err(e) => {
                                 println!("probe: DAD poll failed: {e:#}");
@@ -2510,7 +2583,7 @@ mod tests {
         // lookup — proof whether the DAD force fixes ERROR_NETWORK_UNREACHABLE.
         match force_dad_preferred(if_index, PROBE_IP) {
             Ok(()) => {
-                match get_unicast_address_row(PROBE_IP) {
+                match get_unicast_address_row(luid, PROBE_IP) {
                     Ok(row) => println!(
                         "probe: variant g: force_dad_preferred ok; dad_state={} ({})",
                         row.DadState.0,

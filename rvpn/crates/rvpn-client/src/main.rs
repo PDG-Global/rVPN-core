@@ -644,22 +644,23 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
 
         info!("TUN device ready");
 
-        // Windows: tun-rs assigns the tunnel address via netsh, and the
-        // unicast row materializes in the active store seconds after netsh
-        // returns — every check right after adapter creation sees
-        // ERROR_FILE_NOT_FOUND, and each retry creates a NEW adapter that
-        // restarts the delay, so it must be waited out on THIS adapter. Once
-        // the row exists it is still DAD-Tentative, which breaks source
-        // address selection (route lookups error with
-        // ERROR_NETWORK_UNREACHABLE); DAD is meaningless on a point-to-point
-        // tunnel interface, so force the address to Preferred before route
-        // setup. Both failures retry like a route-setup failure; a DAD
-        // Duplicate report is a real address conflict and fails the attempt.
+        // Windows: tun-rs assigns the tunnel address via netsh, and netsh
+        // returns before the unicast row is reliably queryable — checks
+        // right after adapter creation can see ERROR_FILE_NOT_FOUND, and
+        // each retry creates a NEW adapter that restarts the delay, so it
+        // must be waited out on THIS adapter. The row can then still be
+        // DAD-Tentative, which breaks source address selection (route
+        // lookups error with ERROR_NETWORK_UNREACHABLE); DAD is meaningless
+        // on a point-to-point tunnel interface, so force the address to
+        // Preferred before route setup. Both failures retry like a
+        // route-setup failure; a DAD Duplicate report is a real address
+        // conflict and fails the attempt.
         #[cfg(windows)]
         {
             if let Some(assigned_ip) = virtual_ip {
                 let if_index = tun_device.adapter_index()?;
                 if let Err(e) = crate::windows::routes::wait_for_unicast_address(
+                    if_index,
                     assigned_ip,
                     std::time::Duration::from_secs(10),
                 ) {
