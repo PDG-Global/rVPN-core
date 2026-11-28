@@ -32,7 +32,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -351,7 +351,6 @@ pub struct Admission {
     inner: Arc<Mutex<AdmissionState>>,
     allow_path: Arc<PathBuf>,
     pending_path: Arc<PathBuf>,
-    audit_path: Arc<PathBuf>,
     /// Mode from the config file; the allow-list file's `mode` field (when
     /// set) wins, so operators can flip learn → enforce without a restart.
     config_mode: AdmissionMode,
@@ -421,7 +420,6 @@ impl Admission {
             })),
             allow_path: Arc::new(allow_file),
             pending_path: Arc::new(pending_file),
-            audit_path: Arc::new(audit_file),
             config_mode: mode,
             enabled,
         }
@@ -756,7 +754,7 @@ pub fn spawn_reload_task(admission: Admission) {
             // A quiet server that refuses nobody still flushes a dirty
             // pending list at least every ~30s (nit).
             ticks += 1;
-            if ticks % 15 == 0 {
+            if ticks.is_multiple_of(15) {
                 admission.flush_pending().await;
             }
         }
@@ -1093,7 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_refuses_unknown_and_records_pending() {
-        let (dir, a) = tmp_admission(AdmissionMode::Enforce);
+        let (_dir, a) = tmp_admission(AdmissionMode::Enforce);
         let key = [4u8; 32];
         let (d, reg) = a.check(&key, true).await;
         assert_eq!(d, AdmissionDecision::Refuse);
@@ -1190,7 +1188,7 @@ mod tests {
         );
         let (_, reg1) = a.check(&key, true).await;
         let (_, reg2) = a.check(&key, true).await;
-        let mut reg1 = reg1.unwrap();
+        let reg1 = reg1.unwrap();
         let mut reg2 = reg2.unwrap();
         drop(reg1); // ends session 1 (spawned unregister)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1424,7 +1422,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_recording_is_rate_limited() {
-        let (dir, a) = tmp_admission(AdmissionMode::Enforce);
+        let (_dir, a) = tmp_admission(AdmissionMode::Enforce);
         let key = [12u8; 32];
         let _ = a.check(&key, true).await;
         let _ = a.check(&key, true).await;

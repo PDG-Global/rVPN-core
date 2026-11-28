@@ -37,9 +37,7 @@ use crate::ws::{FrameType, MinimalWebSocket, MinimalWsReader, MinimalWsWriter};
 
 use rvpn_core::crypto::ratchet::{RatchetMessage, RatchetMessageRef};
 use rvpn_core::crypto::x3dh::X3DHInitiator;
-use rvpn_core::crypto::{
-    DoubleRatchet, EphemeralKey, IdentityKey, RatchetVersion, X3DHPublicBundle,
-};
+use rvpn_core::crypto::{DoubleRatchet, EphemeralKey, IdentityKey, X3DHPublicBundle};
 use rvpn_core::protocol::padding::{pad_packet, unpad_packet, unpad_packet_slice};
 use rvpn_core::protocol::{
     ControlMessage, HandshakeMessage, MultiplexedFrame, PayloadType, VirtualIp,
@@ -1350,7 +1348,7 @@ impl ServerSession {
             }
 
             let mut ws_guard = ws_write_for_swift.lock().await;
-            if let Err(e) = ws_guard.send_binary(&encrypted).await {
+            if let Err(e) = ws_guard.send_binary(encrypted).await {
                 error!(
                     "[IosTun] Swift->Server: WebSocket send failed: {}, sending shutdown",
                     e
@@ -1379,7 +1377,7 @@ impl ServerSession {
             // The leak is iOS libmalloc retaining BoringSSL's per-record
             // freed allocations. The 15s keepalive call isn't frequent
             // enough; calling here keeps internal growth bounded.
-            if batch_count % 100 == 0 {
+            if batch_count.is_multiple_of(100) {
                 all_zones_pressure_relief();
                 #[cfg(feature = "diagnostics")]
                 {

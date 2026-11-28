@@ -2,9 +2,7 @@
 //! One WebSocket = One SOCKS5 connection (1:1 mapping)
 //! Uses X3DH handshake + Double Ratchet encryption
 
-use crate::admission::{
-    parse_admission_mode, AdmissionDecision, ADMISSION_REFUSAL_CODE, ADMISSION_REFUSAL_MESSAGE,
-};
+use crate::admission::{AdmissionDecision, ADMISSION_REFUSAL_CODE, ADMISSION_REFUSAL_MESSAGE};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -5047,8 +5045,10 @@ mod tun_source_tests {
         let dns_cache: DnsCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let tcp_pool: TcpPool = Arc::new(Mutex::new(HashMap::new()));
         let pending_flows: PendingFlows = tokio::sync::Mutex::new(HashMap::new());
-        let mut tun_config = TunNetworkConfig::default();
-        tun_config.enabled = true;
+        let tun_config = TunNetworkConfig {
+            enabled: true,
+            ..Default::default()
+        };
         MultiplexerSession::<tokio::net::TcpStream>::dispatch_decrypted_frame(
             1, // non-zero flow id with no established flow -> TUN branch
             payload,
@@ -5195,9 +5195,11 @@ mod flight_tests {
             audit_path.clone(),
         );
 
-        let mut config = ServerConfig::default();
-        config.identity_key_file = id_path;
-        config.prekey_bundle_file = Some(bundle_path);
+        let config = ServerConfig {
+            identity_key_file: id_path,
+            prekey_bundle_file: Some(bundle_path),
+            ..Default::default()
+        };
         let handler = VpnHandler::new(config, admission).unwrap();
         Fixture {
             _dir: dir,
