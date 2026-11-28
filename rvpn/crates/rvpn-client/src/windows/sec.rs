@@ -263,14 +263,28 @@ pub(crate) fn is_reparse_point(path: &Path) -> Result<bool> {
     Ok(get_file_attributes(path)? & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0)
 }
 
+/// A path reduced to drive/share root components (`C:\`, `\\?\C:\`,
+/// `\\server\share\`) names a volume root. A volume root is never a redirect
+/// hazard, and some root forms are not queryable at all: the prefix-only
+/// `\\?\C:` form fails GetFileAttributesW with ERROR_INVALID_PARAMETER.
+fn is_volume_root(path: &Path) -> bool {
+    use std::path::Component;
+    path.components()
+        .all(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+}
+
 /// Every component of `path` must be a real directory or file, never a
 /// reparse point. `std::fs::canonicalize` already resolves reparse points
 /// once; this re-checks the resolved path at use time, so a junction
-/// planted between resolution and use is still caught.
+/// planted between resolution and use is still caught. Volume roots are
+/// exempt (see is_volume_root).
 pub(crate) fn check_no_reparse_points(path: &Path) -> Result<()> {
     let mut prefix = std::path::PathBuf::new();
     for component in path.components() {
         prefix.push(component.as_os_str());
+        if is_volume_root(&prefix) {
+            continue;
+        }
         match is_reparse_point(&prefix) {
             Ok(false) => {}
             Ok(true) => bail!("{} is a reparse point/junction", prefix.display()),
@@ -350,5 +364,19 @@ mod tests {
         // FILE_READ_ATTRIBUTES (0x80) and READ_CONTROL (0x20000) neither.
         assert_eq!(WRITE_BITS & 0x0000_0080, 0);
         assert_eq!(WRITE_BITS & 0x0002_0000, 0);
+    }
+
+    /// Volume roots are exempt from the reparse-point check: the prefix-only
+    /// `\\?\C:` form fails GetFileAttributesW, and a root is never a redirect
+    /// hazard. Deeper paths must still be checked.
+    #[test]
+    fn volume_root_is_skipped() {
+        assert!(is_volume_root(Path::new(r"\\?\C:")));
+        assert!(is_volume_root(Path::new(r"\\?\C:\")));
+        assert!(is_volume_root(Path::new(r"C:\")));
+        assert!(is_volume_root(Path::new(r"\\server\share\")));
+        assert!(!is_volume_root(Path::new(r"C:\Windows")));
+        assert!(!is_volume_root(Path::new(r"\\?\C:\Windows")));
+        assert!(!is_volume_root(Path::new(r"\\server\share\dir")));
     }
 }
