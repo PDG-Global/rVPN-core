@@ -1880,15 +1880,6 @@ mod tests {
         }
     }
 
-    /// GetUnicastIpAddressEntry for one IPv4 address.
-    fn probe_unicast_row(addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
-        let mut row = MIB_UNICASTIPADDRESS_ROW::default();
-        row.Address = sockaddr_inet(IpAddr::V4(addr));
-        let err = unsafe { GetUnicastIpAddressEntry(&mut row) };
-        check(err, "GetUnicastIpAddressEntry")?;
-        Ok(row)
-    }
-
     /// Every route the probe installed, deleted newest-first on any exit path
     /// (including panics), so the machine is left clean even on failure.
     struct ProbeCleanup {
@@ -2003,7 +1994,10 @@ mod tests {
     /// dumps the adapter/address/interface state (DAD included), installs the
     /// production covering routes via forward_row/create_route, and reports
     /// how GetBestRoute2 behaves for the production rows and a series of
-    /// variants. Every route is deleted and the adapter destroyed on exit.
+    /// variants — including variant g, which applies the production
+    /// force_dad_preferred fix and re-runs the lookup to prove whether
+    /// forcing the address past DAD fixes ERROR_NETWORK_UNREACHABLE. Every
+    /// route is deleted and the adapter destroyed on exit.
     ///
     /// Diagnostics only: always passes unless adapter creation itself fails.
     /// Run manually from an elevated shell with a signed wintun.dll
@@ -2044,7 +2038,14 @@ mod tests {
         let mut cleanup = ProbeCleanup { rows: Vec::new() };
         let mut results: Vec<(String, String)> = Vec::new();
 
-        let luid = match device.adapter_index().and_then(interface_luid) {
+        let if_index = match device.adapter_index() {
+            Ok(index) => index,
+            Err(e) => {
+                println!("probe: could not resolve adapter index: {e:#}");
+                return;
+            }
+        };
+        let luid = match interface_luid(if_index) {
             Ok(luid) => luid,
             Err(e) => {
                 println!("probe: could not resolve adapter LUID: {e:#}");
@@ -2054,7 +2055,7 @@ mod tests {
         println!(
             "probe: adapter '{}' if_index={} luid={:#x}",
             device.adapter_name().unwrap_or_else(|_| "?".to_string()),
-            device.adapter_index().unwrap_or(0),
+            if_index,
             unsafe { luid.Value },
         );
 
@@ -2080,7 +2081,7 @@ mod tests {
         }
 
         // --- address state + DAD watch ---
-        match probe_unicast_row(PROBE_IP) {
+        match get_unicast_address_row(PROBE_IP) {
             Ok(row) => {
                 println!(
                     "probe: address {PROBE_IP}: dad_state={} ({}) prefix_origin={} \
@@ -2107,7 +2108,7 @@ mod tests {
                         && start.elapsed() < std::time::Duration::from_secs(10)
                     {
                         std::thread::sleep(std::time::Duration::from_millis(250));
-                        match probe_unicast_row(PROBE_IP) {
+                        match get_unicast_address_row(PROBE_IP) {
                             Ok(current) => final_state = current.DadState,
                             Err(e) => {
                                 println!("probe: DAD poll failed: {e:#}");
@@ -2288,6 +2289,39 @@ mod tests {
             results.push(("variant f: gateway 10.200.0.1 lookup".to_string(), outcome));
         }
         cleanup.reset();
+
+        // (g) The client fix: force the address past DAD into Preferred
+        // (force_dad_preferred, same as main.rs calls before route setup),
+        // then re-install the production covering routes and re-run the
+        // lookup — proof whether the DAD force fixes ERROR_NETWORK_UNREACHABLE.
+        match force_dad_preferred(if_index, PROBE_IP) {
+            Ok(()) => {
+                match get_unicast_address_row(PROBE_IP) {
+                    Ok(row) => println!(
+                        "probe: variant g: force_dad_preferred ok; dad_state={} ({})",
+                        row.DadState.0,
+                        dad_state_name(row.DadState)
+                    ),
+                    Err(e) => println!("probe: variant g: address re-read failed: {e:#}"),
+                }
+                probe_scenario(
+                    &mut cleanup,
+                    &mut results,
+                    "variant g: DAD forced Preferred + production routes",
+                    base_rows(),
+                    luid,
+                    target,
+                );
+            }
+            Err(e) => {
+                let outcome = format!("force_dad_preferred failed: {e:#}");
+                println!("probe: variant g: {outcome}");
+                results.push((
+                    "variant g: DAD forced Preferred + production routes".to_string(),
+                    outcome,
+                ));
+            }
+        }
 
         println!("\n=== PROBE RESULTS ===");
         for (label, outcome) in &results {
