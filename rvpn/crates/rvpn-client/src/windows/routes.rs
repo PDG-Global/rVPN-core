@@ -1363,6 +1363,13 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
+    };
+    use windows::Win32::Networking::WinSock::{
+        IpDadStateTentative, MIB_IPPROTO_NT_STATIC, NL_DAD_STATE,
+    };
+
     /// Pin the fail-closed contract: both families are covered by exactly
     /// the two /1 routes, so no traffic — IPv6 included, lease or not — can
     /// take the physical default route while the tunnel is up.
@@ -1659,5 +1666,438 @@ mod tests {
         let msg = format!("{e:#}");
         assert!(msg.contains("route lookup"));
         assert!(msg.contains("1.1.1.1"));
+    }
+
+    // ---- elevated manual diagnostic probe -----------------------------------
+
+    /// Name for one NL_DAD_STATE value in probe output.
+    fn dad_state_name(state: NL_DAD_STATE) -> &'static str {
+        if state == IpDadStateTentative {
+            "Tentative"
+        } else {
+            match state.0 {
+                0 => "Invalid",
+                2 => "Duplicate",
+                3 => "Deprecated",
+                4 => "Preferred",
+                _ => "Unknown",
+            }
+        }
+    }
+
+    /// GetUnicastIpAddressEntry for one IPv4 address.
+    fn probe_unicast_row(addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+        let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+        row.Address = sockaddr_inet(IpAddr::V4(addr));
+        let err = unsafe { GetUnicastIpAddressEntry(&mut row) };
+        check(err, "GetUnicastIpAddressEntry")?;
+        Ok(row)
+    }
+
+    /// Every route the probe installed, deleted newest-first on any exit path
+    /// (including panics), so the machine is left clean even on failure.
+    struct ProbeCleanup {
+        rows: Vec<MIB_IPFORWARD_ROW2>,
+    }
+
+    impl ProbeCleanup {
+        fn track(&mut self, row: MIB_IPFORWARD_ROW2) {
+            self.rows.push(row);
+        }
+
+        /// Delete all tracked rows (used between variants and on drop).
+        fn reset(&mut self) {
+            let rows = std::mem::take(&mut self.rows);
+            for row in rows.iter().rev() {
+                let desc = format!(
+                    "{}/{}",
+                    sockaddr_display(&row.DestinationPrefix.Prefix),
+                    row.DestinationPrefix.PrefixLength
+                );
+                match delete_route(row) {
+                    Ok(()) => println!("probe cleanup: deleted route {desc}"),
+                    Err(e) => println!("probe cleanup: FAILED to delete route {desc}: {e:#}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for ProbeCleanup {
+        fn drop(&mut self) {
+            self.reset();
+        }
+    }
+
+    /// GetBestRoute2 with optional interface/source constraints, rendered as
+    /// a one-line outcome for the results table.
+    fn probe_lookup(
+        dest: IpAddr,
+        interface: Option<NET_LUID_LH>,
+        source: Option<IpAddr>,
+        adapter_luid: NET_LUID_LH,
+    ) -> String {
+        let dest_sa = sockaddr_inet(dest);
+        let source_sa = source.map(sockaddr_inet);
+        let mut row = MIB_IPFORWARD_ROW2::default();
+        let mut best_source = SOCKADDR_INET::default();
+        let err = unsafe {
+            GetBestRoute2(
+                interface.as_ref().map(|l| l as *const _),
+                0,
+                source_sa.as_ref().map(|sa| sa as *const _),
+                &dest_sa,
+                0,
+                &mut row,
+                &mut best_source,
+            )
+        };
+        if err != ERROR_SUCCESS {
+            return format!("FAIL: Win32 error {}", err.0);
+        }
+        format!(
+            "ok: if_index={} luid={:#x} ({}) next_hop={} metric={} protocol={} source={}",
+            row.InterfaceIndex,
+            unsafe { row.InterfaceLuid.Value },
+            if luid_matches(row.InterfaceLuid, adapter_luid) {
+                "our adapter"
+            } else {
+                "NOT OUR ADAPTER"
+            },
+            sockaddr_display(&row.NextHop),
+            row.Metric,
+            row.Protocol.0,
+            sockaddr_display(&best_source),
+        )
+    }
+
+    /// Install the given routes, run the unconstrained target lookup, record
+    /// the outcome and tear the routes down again.
+    fn probe_scenario(
+        cleanup: &mut ProbeCleanup,
+        results: &mut Vec<(String, String)>,
+        label: &str,
+        rows: Vec<MIB_IPFORWARD_ROW2>,
+        adapter_luid: NET_LUID_LH,
+        target: IpAddr,
+    ) {
+        for row in &rows {
+            match create_route(row) {
+                Ok(()) => cleanup.track(*row),
+                Err(e) => {
+                    let outcome = format!("route install failed: {e:#}");
+                    println!("probe: {label}: {outcome}");
+                    results.push((label.to_string(), outcome));
+                    cleanup.reset();
+                    return;
+                }
+            }
+        }
+        let outcome = probe_lookup(target, None, None, adapter_luid);
+        println!("probe: {label}: {outcome}");
+        results.push((label.to_string(), outcome));
+        cleanup.reset();
+    }
+
+    /// Elevated, read-only-apart-from-its-own-routes diagnostic probe for
+    /// route-resolution failures on the wintun adapter (smoke-run failure:
+    /// GetBestRoute2 for 1.1.1.1 fails with ERROR_NETWORK_UNREACHABLE even
+    /// though the on-link /1 covering routes exist).
+    ///
+    /// Creates a throwaway adapter exactly the way the client does
+    /// (TunDevice::create_with_ip), assigns 10.200.0.3/24 with MTU 1420,
+    /// dumps the adapter/address/interface state (DAD included), installs the
+    /// production covering routes via forward_row/create_route, and reports
+    /// how GetBestRoute2 behaves for the production rows and a series of
+    /// variants. Every route is deleted and the adapter destroyed on exit.
+    ///
+    /// Diagnostics only: always passes unless adapter creation itself fails.
+    /// Run manually from an elevated shell with a signed wintun.dll
+    /// resolvable (RVPN_WINTUN_DLL):
+    ///
+    ///   cargo test -p rvpn-client --lib route_diag_probe -- --ignored --nocapture
+    ///
+    /// Windows-only like the whole module; #[ignore] keeps it out of CI.
+    #[test]
+    #[ignore = "elevated manual diagnostic: creates a real wintun adapter"]
+    fn route_diag_probe() {
+        use crate::config::TunConfig;
+        use crate::tun::TunDevice;
+
+        const PROBE_IP: Ipv4Addr = Ipv4Addr::new(10, 200, 0, 3);
+        const PROBE_GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 200, 0, 1);
+        const PROBE_TARGET: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+
+        println!("=== rvpn route diagnostic probe ===");
+        println!("probe: adapter rvpn-diag0, ip {PROBE_IP}/24, mtu 1420, target {PROBE_TARGET}");
+
+        let config = TunConfig {
+            interface_name: Some("rvpn-diag0".to_string()),
+            dns_servers: Vec::new(),
+            routes: Vec::new(),
+            mtu: 1420,
+            ..Default::default()
+        };
+        let device = match TunDevice::create_with_ip(&config, "10.200.0.3/24") {
+            Ok(device) => device,
+            Err(e) => panic!(
+                "probe: adapter creation failed (run from an elevated shell with a \
+                 signed wintun.dll resolvable, e.g. via RVPN_WINTUN_DLL): {e:#}"
+            ),
+        };
+        // Declared after `device` so on scope exit the routes are deleted
+        // first and the adapter destroyed second.
+        let mut cleanup = ProbeCleanup { rows: Vec::new() };
+        let mut results: Vec<(String, String)> = Vec::new();
+
+        let luid = match device.adapter_index().and_then(interface_luid) {
+            Ok(luid) => luid,
+            Err(e) => {
+                println!("probe: could not resolve adapter LUID: {e:#}");
+                return;
+            }
+        };
+        println!(
+            "probe: adapter '{}' if_index={} luid={:#x}",
+            device.adapter_name().unwrap_or_else(|_| "?".to_string()),
+            device.adapter_index().unwrap_or(0),
+            unsafe { luid.Value },
+        );
+
+        // --- adapter state ---
+        let mut if_row = MIB_IF_ROW2 {
+            InterfaceLuid: luid,
+            ..Default::default()
+        };
+        let err = unsafe { GetIfEntry2(&mut if_row) };
+        if err == ERROR_SUCCESS {
+            println!(
+                "probe: GetIfEntry2: oper_status={} if_type={} media_connect_state={} \
+                 access_type={} tunnel_type={} mtu={}",
+                if_row.OperStatus.0,
+                if_row.Type,
+                if_row.MediaConnectState.0,
+                if_row.AccessType.0,
+                if_row.TunnelType.0,
+                if_row.Mtu,
+            );
+        } else {
+            println!("probe: GetIfEntry2 failed: Win32 error {}", err.0);
+        }
+
+        // --- address state + DAD watch ---
+        match probe_unicast_row(PROBE_IP) {
+            Ok(row) => {
+                println!(
+                    "probe: address {PROBE_IP}: dad_state={} ({}) prefix_origin={} \
+                     suffix_origin={} valid_lifetime={} preferred_lifetime={} \
+                     skip_as_source={} on_link_prefix_len={}",
+                    row.DadState.0,
+                    dad_state_name(row.DadState),
+                    row.PrefixOrigin.0,
+                    row.SuffixOrigin.0,
+                    row.ValidLifetime,
+                    row.PreferredLifetime,
+                    row.SkipAsSource,
+                    row.OnLinkPrefixLength,
+                );
+                results.push((
+                    "initial DAD state".to_string(),
+                    format!("{} ({})", row.DadState.0, dad_state_name(row.DadState)),
+                ));
+                if row.DadState == IpDadStateTentative {
+                    println!("probe: DAD is Tentative; polling up to 10s for it to settle...");
+                    let start = std::time::Instant::now();
+                    let mut final_state = row.DadState;
+                    while final_state == IpDadStateTentative
+                        && start.elapsed() < std::time::Duration::from_secs(10)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        match probe_unicast_row(PROBE_IP) {
+                            Ok(current) => final_state = current.DadState,
+                            Err(e) => {
+                                println!("probe: DAD poll failed: {e:#}");
+                                break;
+                            }
+                        }
+                    }
+                    let completed = final_state != IpDadStateTentative;
+                    println!(
+                        "probe: DAD {} after {:?}: state={} ({})",
+                        if completed {
+                            "settled"
+                        } else {
+                            "still Tentative"
+                        },
+                        start.elapsed(),
+                        final_state.0,
+                        dad_state_name(final_state),
+                    );
+                    results.push((
+                        "DAD after polling".to_string(),
+                        format!(
+                            "{} ({})",
+                            dad_state_name(final_state),
+                            if completed {
+                                "left Tentative"
+                            } else {
+                                "STUCK Tentative after 10s"
+                            }
+                        ),
+                    ));
+                }
+            }
+            Err(e) => println!("probe: GetUnicastIpAddressEntry({PROBE_IP}) failed: {e:#}"),
+        }
+
+        // --- per-family interface rows ---
+        for family in [AF_INET, AF_INET6] {
+            match get_ip_interface(luid, family) {
+                Ok(Some(row)) => println!(
+                    "probe: ip-interface family={}: metric={} use_automatic_metric={} \
+                     nl_mtu={} dad_transmits={} connected={}",
+                    family.0,
+                    row.Metric,
+                    row.UseAutomaticMetric,
+                    row.NlMtu,
+                    row.DadTransmits,
+                    row.Connected,
+                ),
+                Ok(None) => println!("probe: no ip-interface row for family {}", family.0),
+                Err(e) => println!(
+                    "probe: GetIpInterfaceEntry family={} failed: {e:#}",
+                    family.0
+                ),
+            }
+        }
+
+        let base_rows = || {
+            vec![
+                forward_row(luid, IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1, None),
+                forward_row(luid, IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1, None),
+            ]
+        };
+        let target = IpAddr::V4(PROBE_TARGET);
+
+        // Baseline: the exact production covering routes.
+        probe_scenario(
+            &mut cleanup,
+            &mut results,
+            "baseline: /1 pair, metric 1, on-link, NETMGMT",
+            base_rows(),
+            luid,
+            target,
+        );
+
+        // (a) Metric 0 instead of 1.
+        let mut rows = base_rows();
+        for row in &mut rows {
+            row.Metric = 0;
+        }
+        probe_scenario(
+            &mut cleanup,
+            &mut results,
+            "variant a: metric 0",
+            rows,
+            luid,
+            target,
+        );
+
+        // (b) Next hop = the adapter's own address instead of on-link.
+        let rows = vec![
+            forward_row(
+                luid,
+                IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+                1,
+                Some(IpAddr::V4(PROBE_IP)),
+            ),
+            forward_row(
+                luid,
+                IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)),
+                1,
+                Some(IpAddr::V4(PROBE_IP)),
+            ),
+        ];
+        probe_scenario(
+            &mut cleanup,
+            &mut results,
+            "variant b: next hop = own address 10.200.0.3",
+            rows,
+            luid,
+            target,
+        );
+
+        // (c) Protocol NT_STATIC instead of NETMGMT.
+        let mut rows = base_rows();
+        for row in &mut rows {
+            row.Protocol = MIB_IPPROTO_NT_STATIC;
+        }
+        probe_scenario(
+            &mut cleanup,
+            &mut results,
+            "variant c: protocol NT_STATIC",
+            rows,
+            luid,
+            target,
+        );
+
+        // (d) A single 0.0.0.0/0 instead of the /1 pair.
+        probe_scenario(
+            &mut cleanup,
+            &mut results,
+            "variant d: single 0.0.0.0/0",
+            vec![forward_row(
+                luid,
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                0,
+                None,
+            )],
+            luid,
+            target,
+        );
+
+        // (e) + (f): constrained lookups and the gateway baseline, with the
+        // production routes in place.
+        let mut installed = true;
+        for row in base_rows() {
+            match create_route(&row) {
+                Ok(()) => cleanup.track(row),
+                Err(e) => {
+                    println!("probe: variant e/f: route install failed: {e:#}");
+                    results.push((
+                        "variant e/f setup".to_string(),
+                        format!("route install failed: {e:#}"),
+                    ));
+                    installed = false;
+                    break;
+                }
+            }
+        }
+        if installed {
+            let outcome = probe_lookup(target, None, Some(IpAddr::V4(PROBE_IP)), luid);
+            println!("probe: variant e1 (source 10.200.0.3): {outcome}");
+            results.push((
+                "variant e1: explicit source 10.200.0.3".to_string(),
+                outcome,
+            ));
+
+            let outcome = probe_lookup(target, Some(luid), None, luid);
+            println!("probe: variant e2 (interface luid): {outcome}");
+            results.push(("variant e2: explicit interface LUID".to_string(), outcome));
+
+            let outcome = probe_lookup(target, Some(luid), Some(IpAddr::V4(PROBE_IP)), luid);
+            println!("probe: variant e3 (source + interface): {outcome}");
+            results.push(("variant e3: source + interface".to_string(), outcome));
+
+            let outcome = probe_lookup(IpAddr::V4(PROBE_GATEWAY), None, None, luid);
+            println!("probe: variant f (gateway {PROBE_GATEWAY}): {outcome}");
+            results.push(("variant f: gateway 10.200.0.1 lookup".to_string(), outcome));
+        }
+        cleanup.reset();
+
+        println!("\n=== PROBE RESULTS ===");
+        for (label, outcome) in &results {
+            println!("  {label}: {outcome}");
+        }
+        println!("probe: routes deleted; adapter is destroyed when the device drops");
     }
 }
