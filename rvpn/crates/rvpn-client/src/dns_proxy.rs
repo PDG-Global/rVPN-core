@@ -295,7 +295,10 @@ impl DnsProxy {
                                     {
                                         Ok(wire) => wire,
                                         Err(e) => {
-                                            warn!("DNS proxy: local resolution failed for {} (type={}): {}", domain, qtype, e);
+                                            warn!(
+                                                "DNS proxy: local resolution failed for {} (type={}): {}",
+                                                domain, qtype, e
+                                            );
                                             build_dns_servfail(&data, dns_txid)
                                         }
                                     };
@@ -370,7 +373,10 @@ impl DnsProxy {
                                                 query_start.elapsed(),
                                             );
                                             if let Err(e) = socket_clone.send_to(&wire, src).await {
-                                                debug!("DNS proxy: failed to send cached response to {}: {}", src, e);
+                                                debug!(
+                                                    "DNS proxy: failed to send cached response to {}: {}",
+                                                    src, e
+                                                );
                                             }
                                             return;
                                         }
@@ -673,7 +679,6 @@ async fn dns_handshake(
         session_token: None,
         connection_nonce: None,
         capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
-        admission_mac: None,
     };
 
     let hello_bytes = serde_json::to_vec(&hello).context("Failed to serialize Hello")?;
@@ -773,6 +778,7 @@ async fn dns_handshake(
                         &ephemeral_public,
                         &None,
                         rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                        &received_bundle.identity_key,
                         &received_bundle.identity_x25519_key,
                         &[],
                         &server_signed_prekey,

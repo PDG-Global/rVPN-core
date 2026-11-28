@@ -19,7 +19,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, trace, warn};
 
@@ -403,11 +403,6 @@ impl VpnHandler {
                 ephemeral_key,
                 identity_key,
                 capabilities,
-                // The Hello-time MAC field is unused by design: the proof
-                // moved to the ClientAuth flight (it must cover the
-                // server's wire keys, which arrive only in the
-                // ServerHello).
-                admission_mac: _,
                 ..
             } => {
                 // Protocol version detection and compatibility check
@@ -549,54 +544,76 @@ impl VpnHandler {
                         &client_ephemeral,
                         &None,
                         client_caps,
+                        &public_bundle.identity_key,
                         &public_bundle.identity_x25519_key,
                         &[],
                         &public_bundle.signed_prekey,
                         &public_bundle.prekey_signature,
                         public_bundle.capabilities,
                     );
-                    match tokio::time::timeout(Duration::from_secs(5), ws_read.next()).await {
-                        Ok(Some(Ok(Message::Binary(data)))) => {
-                            match serde_json::from_slice::<HandshakeMessage>(&data) {
-                                Ok(HandshakeMessage::ClientAuth { admission_mac, .. }) => {
-                                    match admission_mac
-                                        .as_deref()
-                                        .and_then(|m| <[u8; 32]>::try_from(m).ok())
+                    let admission_on = self.admission.is_enabled();
+                    // Ping-tolerant wait (nit): control frames inside the
+                    // deadline never count as the flight and never kill it.
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    let flight = loop {
+                        match tokio::time::timeout_at(deadline, ws_read.next()).await {
+                            Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => {
+                                continue;
+                            }
+                            Ok(Some(Ok(Message::Binary(data)))) => break Some(data),
+                            _ => break None,
+                        }
+                    };
+                    match flight {
+                        Some(data) => match serde_json::from_slice::<HandshakeMessage>(&data) {
+                            Ok(HandshakeMessage::ClientAuth { admission_mac, .. }) => {
+                                match admission_mac
+                                    .as_deref()
+                                    .and_then(|m| <[u8; 32]>::try_from(m).ok())
+                                {
+                                    Some(mac)
+                                        if rvpn_core::crypto::admission::verify_mac(
+                                            &kc,
+                                            &transcript,
+                                            &mac,
+                                        ) =>
                                     {
-                                        Some(mac)
-                                            if rvpn_core::crypto::admission::verify_mac(
-                                                &kc,
-                                                &transcript,
-                                                &mac,
-                                            ) =>
-                                        {
-                                            true
-                                        }
-                                        // A wrong or missing MAC is a
-                                        // protocol failure, never an
-                                        // admission refusal: the client has
-                                        // NOT proven possession, so it
-                                        // learns nothing (S1).
-                                        _ => {
-                                            debug!("invalid ClientAuth MAC from {}", peer_addr);
-                                            let _ = ws_write.send(Message::Close(None)).await;
-                                            return Ok(None);
-                                        }
+                                        true
                                     }
-                                }
-                                _ => {
-                                    debug!("expected ClientAuth from v2 client {}", peer_addr);
-                                    let _ = ws_write.send(Message::Close(None)).await;
-                                    return Ok(None);
+                                    // A wrong or missing MAC is a protocol
+                                    // failure, never an admission refusal
+                                    // (S1) — but only when admission is
+                                    // deciding. Disabled: fall through as
+                                    // an ordinary unproven client.
+                                    _ if admission_on => {
+                                        debug!("invalid ClientAuth MAC from {}", peer_addr);
+                                        let _ = ws_write.send(Message::Close(None)).await;
+                                        return Ok(None);
+                                    }
+                                    _ => false,
                                 }
                             }
-                        }
-                        // Timeout / close / garbage: the handshake just
-                        // dies. The 5s wait counts against the handshake
-                        // rate limit like any other slow client.
-                        _ => {
+                            _ if admission_on => {
+                                debug!("expected ClientAuth from v2 client {}", peer_addr);
+                                let _ = ws_write.send(Message::Close(None)).await;
+                                return Ok(None);
+                            }
+                            _ => false,
+                        },
+                        // Timeout / close / garbage. Admission on: the
+                        // handshake dies. Admission off: proceed as a
+                        // legacy client (the iOS FFI path sends no
+                        // ClientAuth yet — it must not hang here).
+                        None if admission_on => {
                             debug!("ClientAuth deadline exceeded from {}", peer_addr);
                             return Ok(None);
+                        }
+                        None => {
+                            debug!(
+                                "no ClientAuth from v2 client {} (admission disabled); continuing as legacy",
+                                peer_addr
+                            );
+                            false
                         }
                     }
                 } else {
@@ -689,7 +706,9 @@ impl VpnHandler {
                 }
                 Ok(Some(Ok(_))) => {
                     // Ignore other non-binary messages and continue
-                    debug!("Received non-binary message while waiting for target address, continuing...");
+                    debug!(
+                        "Received non-binary message while waiting for target address, continuing..."
+                    );
                     continue;
                 }
                 Ok(Some(Err(e))) => {
@@ -699,7 +718,9 @@ impl VpnHandler {
                     ));
                 }
                 Err(_) => {
-                    return Err(anyhow::anyhow!("Timeout (5s) waiting for target address - client may be stuck or sending data out of order"));
+                    return Err(anyhow::anyhow!(
+                        "Timeout (5s) waiting for target address - client may be stuck or sending data out of order"
+                    ));
                 }
             }
         };
@@ -815,11 +836,25 @@ impl VpnHandler {
             Some((dst_ip, dst_port, proto_type))
         } else if version == 6 && plaintext.len() >= 40 {
             let next_header = plaintext[6]; // Next header field
-            let dst_ip = format!("{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
-                plaintext[24], plaintext[25], plaintext[26], plaintext[27],
-                plaintext[28], plaintext[29], plaintext[30], plaintext[31],
-                plaintext[32], plaintext[33], plaintext[34], plaintext[35],
-                plaintext[36], plaintext[37], plaintext[38], plaintext[39]);
+            let dst_ip = format!(
+                "{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
+                plaintext[24],
+                plaintext[25],
+                plaintext[26],
+                plaintext[27],
+                plaintext[28],
+                plaintext[29],
+                plaintext[30],
+                plaintext[31],
+                plaintext[32],
+                plaintext[33],
+                plaintext[34],
+                plaintext[35],
+                plaintext[36],
+                plaintext[37],
+                plaintext[38],
+                plaintext[39]
+            );
             let dst_port = u16::from_be_bytes([plaintext[42], plaintext[43]]);
             let proto_type = if next_header == 17 {
                 ProtocolType::Udp
@@ -2617,8 +2652,11 @@ where
             // Control message
             trace!(
                 "FRAME: [#{:05}] RECEIVED CONTROL frame from {} after {:.3}s (msg_num: {}, payload_type: {})",
-                frame_number, peer_addr, elapsed.as_secs_f64(),
-                message.header.message_number, message.header.payload_type
+                frame_number,
+                peer_addr,
+                elapsed.as_secs_f64(),
+                message.header.message_number,
+                message.header.payload_type
             );
             // Dead code path — pass empty pool (this function is #[allow(dead_code)])
             let dummy_pool: TcpPool = Arc::new(Mutex::new(HashMap::new()));
@@ -2639,8 +2677,13 @@ where
             // Data for existing flow
             trace!(
                 "FRAME: [#{:05}] RECEIVED DATA frame for flow_id {} from {} after {:.3}s ({} bytes, msg_num: {}, payload_type: {})",
-                frame_number, flow_id, peer_addr, elapsed.as_secs_f64(), payload.len(),
-                message.header.message_number, message.header.payload_type
+                frame_number,
+                flow_id,
+                peer_addr,
+                elapsed.as_secs_f64(),
+                payload.len(),
+                message.header.message_number,
+                message.header.payload_type
             );
 
             // Check if flow exists before handling data
@@ -2828,11 +2871,25 @@ where
             }
 
             let _next_header = payload[6];
-            let dst_ip = format!("{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
-                payload[24], payload[25], payload[26], payload[27],
-                payload[28], payload[29], payload[30], payload[31],
-                payload[32], payload[33], payload[34], payload[35],
-                payload[36], payload[37], payload[38], payload[39]);
+            let dst_ip = format!(
+                "{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
+                payload[24],
+                payload[25],
+                payload[26],
+                payload[27],
+                payload[28],
+                payload[29],
+                payload[30],
+                payload[31],
+                payload[32],
+                payload[33],
+                payload[34],
+                payload[35],
+                payload[36],
+                payload[37],
+                payload[38],
+                payload[39]
+            );
 
             // For UDP (17) and TCP (6), extract destination port
             if payload.len() >= 44 {
@@ -2878,11 +2935,25 @@ where
             Some(src_ip)
         } else if version == 6 && payload.len() >= 40 {
             // IPv6: source IP at bytes 8-23
-            let src_ip = format!("{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
-                payload[8], payload[9], payload[10], payload[11],
-                payload[12], payload[13], payload[14], payload[15],
-                payload[16], payload[17], payload[18], payload[19],
-                payload[20], payload[21], payload[22], payload[23]);
+            let src_ip = format!(
+                "{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
+                payload[8],
+                payload[9],
+                payload[10],
+                payload[11],
+                payload[12],
+                payload[13],
+                payload[14],
+                payload[15],
+                payload[16],
+                payload[17],
+                payload[18],
+                payload[19],
+                payload[20],
+                payload[21],
+                payload[22],
+                payload[23]
+            );
             Some(src_ip)
         } else {
             None
@@ -3067,8 +3138,6 @@ where
                 ephemeral_key,
                 identity_key,
                 capabilities,
-                // See site 1: the proof moved to the ClientAuth flight.
-                admission_mac: _,
                 ..
             } => {
                 debug!(
@@ -3184,11 +3253,13 @@ where
                 let public_bundle = responder.get_public_bundle();
                 let response = server_hello(&public_bundle);
 
-                debug!("Serializing ServerHello for {} (signed_prekey={} bytes, sig={} bytes, identity={} bytes)",
+                debug!(
+                    "Serializing ServerHello for {} (signed_prekey={} bytes, sig={} bytes, identity={} bytes)",
                     self.peer_addr,
                     public_bundle.signed_prekey.len(),
                     public_bundle.prekey_signature.len(),
-                    public_bundle.identity_key.len());
+                    public_bundle.identity_key.len()
+                );
 
                 let response_bytes = match serde_json::to_vec(&response) {
                     Ok(b) => b,
@@ -3225,49 +3296,65 @@ where
                         &client_ephemeral,
                         &None,
                         client_caps,
+                        &public_bundle.identity_key,
                         &public_bundle.identity_x25519_key,
                         &[],
                         &public_bundle.signed_prekey,
                         &public_bundle.prekey_signature,
                         public_bundle.capabilities,
                     );
-                    match timeout(Duration::from_secs(5), self.ws.next()).await {
-                        Ok(Some(Ok(Message::Binary(data)))) => {
-                            match serde_json::from_slice::<HandshakeMessage>(&data) {
-                                Ok(HandshakeMessage::ClientAuth { admission_mac, .. }) => {
-                                    match admission_mac
-                                        .as_deref()
-                                        .and_then(|m| <[u8; 32]>::try_from(m).ok())
+                    let admission_on = self.admission.is_enabled();
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    let flight = loop {
+                        match timeout_at(deadline, self.ws.next()).await {
+                            Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => {
+                                continue;
+                            }
+                            Ok(Some(Ok(Message::Binary(data)))) => break Some(data),
+                            _ => break None,
+                        }
+                    };
+                    match flight {
+                        Some(data) => match serde_json::from_slice::<HandshakeMessage>(&data) {
+                            Ok(HandshakeMessage::ClientAuth { admission_mac, .. }) => {
+                                match admission_mac
+                                    .as_deref()
+                                    .and_then(|m| <[u8; 32]>::try_from(m).ok())
+                                {
+                                    Some(mac)
+                                        if rvpn_core::crypto::admission::verify_mac(
+                                            &kc,
+                                            &transcript,
+                                            &mac,
+                                        ) =>
                                     {
-                                        Some(mac)
-                                            if rvpn_core::crypto::admission::verify_mac(
-                                                &kc,
-                                                &transcript,
-                                                &mac,
-                                            ) =>
-                                        {
-                                            true
-                                        }
-                                        _ => {
-                                            debug!(
-                                                "invalid ClientAuth MAC from {}",
-                                                self.peer_addr
-                                            );
-                                            let _ = self.ws.send(Message::Close(None)).await;
-                                            return Ok(None);
-                                        }
+                                        true
                                     }
-                                }
-                                _ => {
-                                    debug!("expected ClientAuth from v2 client {}", self.peer_addr);
-                                    let _ = self.ws.send(Message::Close(None)).await;
-                                    return Ok(None);
+                                    _ if admission_on => {
+                                        debug!("invalid ClientAuth MAC from {}", self.peer_addr);
+                                        let _ = self.ws.send(Message::Close(None)).await;
+                                        return Ok(None);
+                                    }
+                                    _ => false,
                                 }
                             }
-                        }
-                        _ => {
+                            _ if admission_on => {
+                                debug!("expected ClientAuth from v2 client {}", self.peer_addr);
+                                let _ = self.ws.send(Message::Close(None)).await;
+                                return Ok(None);
+                            }
+                            _ => false,
+                        },
+                        None if admission_on => {
                             debug!("ClientAuth deadline exceeded from {}", self.peer_addr);
                             return Ok(None);
+                        }
+                        None => {
+                            debug!(
+                                "no ClientAuth from v2 client {} (admission disabled); continuing as legacy",
+                                self.peer_addr
+                            );
+                            false
                         }
                     }
                 } else {
@@ -3568,7 +3655,8 @@ where
                             if pending.len() > MAX_FLUSH_FRAMES {
                                 debug!(
                                     "CONTROL: [CreateFlow] Dropping {} excess buffered frames for flow {}",
-                                    pending.len() - MAX_FLUSH_FRAMES, flow_id
+                                    pending.len() - MAX_FLUSH_FRAMES,
+                                    flow_id
                                 );
                             }
                             for (data, _frame_num, _elapsed) in
@@ -3714,7 +3802,10 @@ where
         } else {
             // This should be handled in process_incoming_frame with detailed logging
             // But we keep this as a fallback
-            error!("DATA: Received data for unknown flow {} (this shouldn't happen with proper ordering checks)", flow_id);
+            error!(
+                "DATA: Received data for unknown flow {} (this shouldn't happen with proper ordering checks)",
+                flow_id
+            );
             Err(anyhow::anyhow!("Unknown flow ID: {}", flow_id))
         }
     }
@@ -3912,7 +4003,11 @@ where
             // Data for existing flow
             trace!(
                 "FRAME: [#{:05}] RECEIVED DATA frame for flow_id {} from {} after {:.3}s ({} bytes)",
-                frame_number, flow_id, peer_addr, elapsed.as_secs_f64(), payload.len()
+                frame_number,
+                flow_id,
+                peer_addr,
+                elapsed.as_secs_f64(),
+                payload.len()
             );
 
             let flow_exists = {
@@ -4502,8 +4597,6 @@ impl DnsHandler {
                 ephemeral_key,
                 identity_key,
                 capabilities,
-                // See site 1: the proof moved to the ClientAuth flight.
-                admission_mac: _,
                 ..
             } => {
                 if !version.is_compatible_with(&ProtocolVersion::CURRENT) {
@@ -4590,55 +4683,74 @@ impl DnsHandler {
                         &client_ephemeral,
                         &None,
                         client_caps,
+                        &public_bundle.identity_key,
                         &public_bundle.identity_x25519_key,
                         &[],
                         &public_bundle.signed_prekey,
                         &public_bundle.prekey_signature,
                         public_bundle.capabilities,
                     );
-                    match tokio::time::timeout(Duration::from_secs(5), ws_read.next()).await {
-                        Ok(Some(Ok(Message::Binary(data)))) => {
-                            match serde_json::from_slice::<HandshakeMessage>(&data) {
-                                Ok(HandshakeMessage::ClientAuth { admission_mac, .. }) => {
-                                    match admission_mac
-                                        .as_deref()
-                                        .and_then(|m| <[u8; 32]>::try_from(m).ok())
+                    let admission_on = self.admission.is_enabled();
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    let flight = loop {
+                        match timeout_at(deadline, ws_read.next()).await {
+                            Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => {
+                                continue;
+                            }
+                            Ok(Some(Ok(Message::Binary(data)))) => break Some(data),
+                            _ => break None,
+                        }
+                    };
+                    match flight {
+                        Some(data) => match serde_json::from_slice::<HandshakeMessage>(&data) {
+                            Ok(HandshakeMessage::ClientAuth { admission_mac, .. }) => {
+                                match admission_mac
+                                    .as_deref()
+                                    .and_then(|m| <[u8; 32]>::try_from(m).ok())
+                                {
+                                    Some(mac)
+                                        if rvpn_core::crypto::admission::verify_mac(
+                                            &kc,
+                                            &transcript,
+                                            &mac,
+                                        ) =>
                                     {
-                                        Some(mac)
-                                            if rvpn_core::crypto::admission::verify_mac(
-                                                &kc,
-                                                &transcript,
-                                                &mac,
-                                            ) =>
-                                        {
-                                            true
-                                        }
-                                        _ => {
-                                            debug!(
-                                                "DNS handler: invalid ClientAuth MAC from {}",
-                                                peer_addr
-                                            );
-                                            let _ = ws_write.send(Message::Close(None)).await;
-                                            return Ok(None);
-                                        }
+                                        true
                                     }
-                                }
-                                _ => {
-                                    debug!(
-                                        "DNS handler: expected ClientAuth from v2 client {}",
-                                        peer_addr
-                                    );
-                                    let _ = ws_write.send(Message::Close(None)).await;
-                                    return Ok(None);
+                                    _ if admission_on => {
+                                        debug!(
+                                            "DNS handler: invalid ClientAuth MAC from {}",
+                                            peer_addr
+                                        );
+                                        let _ = ws_write.send(Message::Close(None)).await;
+                                        return Ok(None);
+                                    }
+                                    _ => false,
                                 }
                             }
-                        }
-                        _ => {
+                            _ if admission_on => {
+                                debug!(
+                                    "DNS handler: expected ClientAuth from v2 client {}",
+                                    peer_addr
+                                );
+                                let _ = ws_write.send(Message::Close(None)).await;
+                                return Ok(None);
+                            }
+                            _ => false,
+                        },
+                        None if admission_on => {
                             debug!(
                                 "DNS handler: ClientAuth deadline exceeded from {}",
                                 peer_addr
                             );
                             return Ok(None);
+                        }
+                        None => {
+                            debug!(
+                                "DNS handler: no ClientAuth from v2 client {} (admission disabled); continuing as legacy",
+                                peer_addr
+                            );
+                            false
                         }
                     }
                 } else {
@@ -5138,7 +5250,6 @@ mod flight_tests {
             session_token: None,
             connection_nonce: None,
             capabilities: Some(CAP_RATCHET_V2),
-            admission_mac: None,
         };
         client
             .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
@@ -5181,6 +5292,7 @@ mod flight_tests {
             &ephemeral_public,
             &None,
             CAP_RATCHET_V2,
+            &bundle.identity_key,
             &bundle.identity_x25519_key,
             &[],
             &bundle.signed_prekey,
@@ -5341,7 +5453,6 @@ mod flight_tests {
             session_token: None,
             connection_nonce: None,
             capabilities: Some(CAP_RATCHET_V2),
-            admission_mac: None,
         };
         client
             .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))
@@ -5392,7 +5503,6 @@ mod flight_tests {
             session_token: None,
             connection_nonce: None,
             capabilities: None, // legacy: no capabilities field at all
-            admission_mac: None,
         };
         client
             .send(Message::Binary(serde_json::to_vec(&hello).unwrap()))

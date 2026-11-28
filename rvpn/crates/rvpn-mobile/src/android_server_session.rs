@@ -484,7 +484,6 @@ impl AndroidServerSession {
             session_token: None,
             connection_nonce: None,
             capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
-            admission_mac: None,
         };
 
         let hello_bytes =
@@ -518,6 +517,7 @@ impl AndroidServerSession {
 
                 // Third flight (S1): ClientAuth admission proof, then
                 // ServerAccept (or the pending_approval refusal).
+                let wire_identity_ed25519 = validated.bundle.identity_key;
                 let wire_identity_x25519 = validated.bundle.identity_x25519_key;
                 let wire_signed_prekey = validated.bundle.signed_prekey;
                 let wire_prekey_signature = validated.bundle.prekey_signature;
@@ -530,6 +530,7 @@ impl AndroidServerSession {
                     &ephemeral_public,
                     &None,
                     rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                    &wire_identity_ed25519,
                     &wire_identity_x25519,
                     &[],
                     &wire_signed_prekey,
@@ -817,7 +818,10 @@ impl AndroidServerSession {
             if batch_count <= 5 || batch_count % 100 == 0 {
                 tun_log!(
                     "[AndroidTun] Android->Server: encrypting batch of {} frames, {} bytes (batch #{}, total packets {})",
-                    batch.len(), batch_bytes, batch_count, packet_count
+                    batch.len(),
+                    batch_bytes,
+                    batch_count,
+                    packet_count
                 );
             }
 
@@ -1194,7 +1198,9 @@ impl AndroidServerSession {
                     // choose_exit_name only routes parseable IPv4 packets, so
                     // this means a malformed header (bad IHL). Drop — sending
                     // it unrewritten would break the exit's NAT.
-                    tun_log!("[AndroidTun] Uplink packet for secondary exit has unusable IPv4 header, dropped");
+                    tun_log!(
+                        "[AndroidTun] Uplink packet for secondary exit has unusable IPv4 header, dropped"
+                    );
                     return Ok(());
                 }
                 self.from_swift_sender.try_send(packet)

@@ -268,8 +268,10 @@ impl Socks5Tunnel {
                 }
                 // Mark tunnel as dead so callers will reconnect
                 tunnel.alive.store(false, Ordering::SeqCst);
-                error!("SOCKS5 multiplexed tunnel marked as DEAD (age {:.1}s) — next flow will trigger reconnect",
-                       tunnel.age().as_secs_f64());
+                error!(
+                    "SOCKS5 multiplexed tunnel marked as DEAD (age {:.1}s) — next flow will trigger reconnect",
+                    tunnel.age().as_secs_f64()
+                );
 
                 // Fail all pending FlowCreated oneshots so waiting open_flow calls
                 // return immediately instead of timing out after 10 seconds.
@@ -367,7 +369,6 @@ impl Socks5Tunnel {
             session_token: None,
             connection_nonce: None,
             capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
-            admission_mac: None,
         };
         ws_writer
             .send(Message::Binary(serde_json::to_vec(&hello)?))
@@ -481,10 +482,13 @@ impl Socks5Tunnel {
                             if mismatch_is_fatal(&res, cfg.reject_mismatch) {
                                 anyhow::bail!(
                                     "Server identity mismatch! Expected {}, got {}. Connection rejected.",
-                                    expected, got
+                                    expected,
+                                    got
                                 );
                             } else {
-                                tracing::warn!("Server identity mismatch — continuing because reject_mismatch = false: identity pinning is OFF for this connection (explicit dev opt-in, not safe for production)");
+                                tracing::warn!(
+                                    "Server identity mismatch — continuing because reject_mismatch = false: identity pinning is OFF for this connection (explicit dev opt-in, not safe for production)"
+                                );
                             }
                         }
                     }
@@ -502,6 +506,7 @@ impl Socks5Tunnel {
                     &ephemeral_public,
                     &None,
                     rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                    &bundle.identity_key,
                     &bundle.identity_x25519_key,
                     &[],
                     &srv_sp,

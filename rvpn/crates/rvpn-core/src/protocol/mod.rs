@@ -108,12 +108,6 @@ pub enum HandshakeMessage {
         /// X3DH KDF input, so altering it in flight diverges the secrets.
         #[serde(default)]
         capabilities: Option<u32>,
-        /// Admission key-confirmation MAC (v2-capable clients): proves the
-        /// sender holds the identity key in this Hello. Verified by the
-        /// server BEFORE any admission decision; see
-        /// `rvpn_core::crypto::x3dh::admission` . Absent in pre-v2 clients.
-        #[serde(default, with = "serde_bytes")]
-        admission_mac: Option<Vec<u8>>,
     },
 
     /// Server response with key bundle

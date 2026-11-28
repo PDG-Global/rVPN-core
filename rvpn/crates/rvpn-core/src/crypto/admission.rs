@@ -6,21 +6,24 @@
 //! The server's admission check must only ever answer a client that has
 //! PROVED it holds the identity key it claims. DH maths alone proves
 //! nothing about possession: anyone can send a victim's public identity key
-//! in a Hello. This module binds the Hello to the X3DH shared secret:
-//! the client derives a key-confirmation key `kc` from the shared secret
-//! and sends `HMAC-SHA256(kc, transcript)` in the Hello; the server derives
-//! the same `kc` after `agree()` and verifies the MAC in constant time
-//! BEFORE any admission decision. A wrong MAC is a generic handshake
+//! in a Hello. The proof rides a third handshake flight: after the
+//! ServerHello, a v2-capable client sends `ClientAuth` carrying
+//! `HMAC-SHA256(kc, transcript)`, where `kc` is derived from the X3DH
+//! shared secret (`derive_confirm_key`). The server derives the same `kc`
+//! after `agree()` and verifies the MAC in constant time BEFORE any
+//! admission decision. A wrong or missing MAC is a generic handshake
 //! failure — never the `pending_approval` refusal, so the refusal can
 //! never be used as an oracle for which keys exist.
 //!
-//! The transcript is identity-anchored: the client identity key, the
-//! client ephemeral, and the server identity key. Signed/one-time prekeys
-//! are deliberately NOT included: they rotate on the server (default every
-//! 168h), and a client that fetched its pinned bundle before a rotation
-//! would compute a transcript the server cannot reproduce. Identity keys
-//! are stable (rotations carry a rotation signature), so the binding holds
-//! across prekey rotations.
+//! The transcript covers BOTH flights (`transcript()`): the client's
+//! Hello fields (identity X25519, ephemeral, nonce, capabilities) and the
+//! server's ServerHello fields as sent on the wire (Ed25519 identity,
+//! derived X25519 identity, ephemeral, signed prekey, prekey signature,
+//! capabilities). The client computes it from the ServerHello it actually
+//! received, so a client that pinned a bundle before a server prekey
+//! rotation still binds to the keys of THIS connection. Every
+//! variable-length field is length-prefixed, so distinct field tuples
+//! can never collide.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -64,24 +67,33 @@ pub fn transcript(
     client_ephemeral: &[u8; 32],
     connection_nonce: &Option<Vec<u8>>,
     client_caps: u32,
+    server_identity_ed25519: &[u8; 32],
     server_identity_x25519: &[u8; 32],
     server_ephemeral: &[u8],
     server_signed_prekey: &[u8; 32],
     prekey_signature: &[u8],
     server_caps: u32,
 ) -> Vec<u8> {
-    let mut t = Vec::with_capacity(32 + 32 * 6 + 64 + 8 + 32);
-    t.extend_from_slice(b"rvpn-admission-transcript-v2");
-    t.extend_from_slice(client_identity_x25519);
-    t.extend_from_slice(client_ephemeral);
-    if let Some(n) = connection_nonce {
-        t.extend_from_slice(n);
+    // Every variable-length field is length-prefixed (u32 LE) so no two
+    // distinct field tuples can ever encode to the same bytes.
+    fn push(t: &mut Vec<u8>, field: &[u8]) {
+        t.extend_from_slice(&(field.len() as u32).to_le_bytes());
+        t.extend_from_slice(field);
     }
+    let mut t = Vec::with_capacity(32 + 32 * 7 + 64 + 8 * 12 + 32);
+    t.extend_from_slice(b"rvpn-admission-transcript-v2");
+    push(&mut t, client_identity_x25519);
+    push(&mut t, client_ephemeral);
+    push(&mut t, connection_nonce.as_deref().unwrap_or(&[]));
     t.extend_from_slice(&client_caps.to_le_bytes());
-    t.extend_from_slice(server_identity_x25519);
-    t.extend_from_slice(server_ephemeral);
-    t.extend_from_slice(server_signed_prekey);
-    t.extend_from_slice(prekey_signature);
+    // The server's long-term Ed25519 identity AND its derived X25519 wire
+    // key both go in: the MAC then binds exactly the server the client
+    // pinned, not just an X25519 key.
+    push(&mut t, server_identity_ed25519);
+    push(&mut t, server_identity_x25519);
+    push(&mut t, server_ephemeral);
+    push(&mut t, server_signed_prekey);
+    push(&mut t, prekey_signature);
     t.extend_from_slice(&server_caps.to_le_bytes());
     t
 }
@@ -118,6 +130,7 @@ mod tests {
             &[2u8; 32],
             &Some(vec![9u8; 16]),
             1,
+            &[6u8; 32],
             &[3u8; 32],
             &[],
             &[4u8; 32],
@@ -157,6 +170,7 @@ mod tests {
             &[9u8; 32],
             &Some(vec![9u8; 16]),
             1,
+            &[6u8; 32],
             &[3u8; 32],
             &[],
             &[4u8; 32],
@@ -170,6 +184,7 @@ mod tests {
             &[2u8; 32],
             &Some(vec![9u8; 16]),
             0,
+            &[6u8; 32],
             &[3u8; 32],
             &[],
             &[4u8; 32],

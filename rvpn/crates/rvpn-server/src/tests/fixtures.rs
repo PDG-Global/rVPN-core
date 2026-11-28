@@ -84,7 +84,6 @@ pub async fn client_handshake(
         session_token: None,
         connection_nonce: Some(vec![0u8; 16]),
         capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
-        admission_mac: None,
     };
 
     let hello_bytes = serde_json::to_vec(&hello)?;

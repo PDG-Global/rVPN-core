@@ -65,7 +65,6 @@ async fn test_handshake_message() -> anyhow::Result<()> {
             7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
         ]),
         capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
-        admission_mac: None,
     };
 
     // Serialize

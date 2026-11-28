@@ -853,7 +853,6 @@ impl ServerSession {
             session_token: None,
             connection_nonce: None,
             capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
-            admission_mac: None,
         };
 
         let hello_bytes =
@@ -891,6 +890,7 @@ impl ServerSession {
                 // ServerAccept (or the pending_approval refusal). The
                 // transcript binds the WIRE keys; extract them before
                 // commit() consumes the validated bundle.
+                let wire_identity_ed25519 = validated.bundle.identity_key;
                 let wire_identity_x25519 = validated.bundle.identity_x25519_key;
                 let wire_signed_prekey = validated.bundle.signed_prekey;
                 let wire_prekey_signature = validated.bundle.prekey_signature;
@@ -903,6 +903,7 @@ impl ServerSession {
                     &ephemeral_public,
                     &None,
                     rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                    &wire_identity_ed25519,
                     &wire_identity_x25519,
                     &[],
                     &wire_signed_prekey,
@@ -1330,7 +1331,10 @@ impl ServerSession {
                         for v in batch.drain(..) {
                             pool.put(v);
                         }
-                        error!("[IosTun] Swift->Server: encrypt_data_batch failed: {}, sending shutdown", e);
+                        error!(
+                            "[IosTun] Swift->Server: encrypt_data_batch failed: {}, sending shutdown",
+                            e
+                        );
                         let _ = shutdown_tx.send(());
                         break 'outer;
                     }
@@ -1392,7 +1396,10 @@ impl ServerSession {
             }
 
             if receiver_closed {
-                info!("[IosTun] Swift->Server: from_swift_receiver closed after batch, breaking (sent {} packets)", packet_count);
+                info!(
+                    "[IosTun] Swift->Server: from_swift_receiver closed after batch, breaking (sent {} packets)",
+                    packet_count
+                );
                 break 'outer;
             }
         }
@@ -1673,7 +1680,10 @@ impl ServerSession {
             let elapsed = now.duration_since(last_wall).unwrap_or_default();
             last_wall = now;
             if elapsed > std::time::Duration::from_secs(30) && doze_probe.is_none() {
-                warn!("[IosTun] Keepalive: process was suspended for {:.0}s, probing connection before reconnect...", elapsed.as_secs_f64());
+                warn!(
+                    "[IosTun] Keepalive: process was suspended for {:.0}s, probing connection before reconnect...",
+                    elapsed.as_secs_f64()
+                );
                 doze_probe = Some((now, this.rx_count.load(Ordering::Relaxed)));
             }
 
@@ -1684,7 +1694,9 @@ impl ServerSession {
                 } else if now.duration_since(probe_start).unwrap_or_default()
                     > std::time::Duration::from_secs(10)
                 {
-                    error!("[IosTun] Keepalive: no response after doze, connection dead. Reconnecting.");
+                    error!(
+                        "[IosTun] Keepalive: no response after doze, connection dead. Reconnecting."
+                    );
                     // Tell Swift to hold a background assertion BEFORE the
                     // teardown, so iOS can't suspend the process mid-reconnect
                     // (the assertion from connect()'s own Connecting state
@@ -1709,7 +1721,10 @@ impl ServerSession {
                         .as_secs();
                     let since_rx = now_secs.saturating_sub(rx_elapsed);
                     if since_rx > 30 {
-                        error!("[IosTun] Keepalive: no server data for {}s, connection dead. Reconnecting.", since_rx);
+                        error!(
+                            "[IosTun] Keepalive: no server data for {}s, connection dead. Reconnecting.",
+                            since_rx
+                        );
                         // Same pre-teardown assertion request as the
                         // probe-failed path above.
                         this.notify_state(TunClientState::Connecting, None, "Reconnecting")
@@ -2005,7 +2020,9 @@ impl ServerSession {
                     // choose_exit_name only routes parseable IPv4 packets, so
                     // this means a malformed header (bad IHL). Drop — sending
                     // it unrewritten would break the exit's NAT.
-                    debug!("[IosTun] Uplink packet for secondary exit has unusable IPv4 header, dropped");
+                    debug!(
+                        "[IosTun] Uplink packet for secondary exit has unusable IPv4 header, dropped"
+                    );
                     return Ok(());
                 }
                 self.from_swift_sender.try_send(packet)

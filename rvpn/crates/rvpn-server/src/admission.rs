@@ -177,6 +177,7 @@ impl FileLock {
             .create(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&lock_path)?;
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
         let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
@@ -300,6 +301,10 @@ struct AdmissionState {
     /// Process-wide refusal token bucket.
     refusal_tokens: f64,
     refusal_refill_at: u64,
+    /// Set when the allow-list file was corrupt at startup: refuse
+    /// everything until a good file arrives (Thomas B3). Cleared on the
+    /// first successful reload.
+    startup_fail_closed: bool,
 }
 
 /// A live session's admission registration (S8: drop guard). When it
@@ -320,9 +325,22 @@ impl Drop for SessionRegistration {
         let admission = self.admission.clone();
         let fp = std::mem::take(&mut self.fingerprint);
         let id = self.id;
-        tokio::spawn(async move {
-            admission.unregister_by_id(&fp, id).await;
-        });
+        // tokio::spawn panics outside a runtime context (nit): when there
+        // is none — a handler future dropped during shutdown outside the
+        // runtime, or a plain test — unregister on a short-lived thread
+        // with its own current-thread runtime instead.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                admission.unregister_by_id(&fp, id).await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("current-thread runtime");
+                rt.block_on(admission.unregister_by_id(&fp, id));
+            });
+        }
     }
 }
 
@@ -365,11 +383,18 @@ impl Admission {
         tighten_permissions(&audit_file);
         let degraded = matches!(read_json::<AllowList>(&allow_file), FileRead::Corrupt);
         if degraded {
+            // A corrupt file at startup must not fall back to the config
+            // mode: the FILE may have stored `enforce`, and swapping in an
+            // empty default would admit everyone (Thomas B3). Fail closed
+            // in EVERY mode until a good file arrives. A learn-mode
+            // operator recovers by removing the corrupt file: a MISSING
+            // file is a clean empty list, not a degraded one.
             warn!(
-                "admission: allow-list file {} is unreadable/corrupt; keeping empty in-memory list and failing closed if enforcing",
+                "admission: allow-list file {} is unreadable/corrupt at startup; failing CLOSED (refusing every key) until it is readable or removed",
                 allow_file.display()
             );
         }
+        let startup_fail_closed = degraded;
         Self {
             inner: Arc::new(Mutex::new(AdmissionState {
                 allow,
@@ -380,8 +405,9 @@ impl Admission {
                 pending,
                 pending_dirty: false,
                 last_pending_flush: now_unix(),
-                refusal_tokens: REFUSAL_RATE_PER_SEC * 2.0,
+                refusal_tokens: REFUSAL_RATE_PER_SEC,
                 refusal_refill_at: now_unix(),
+                startup_fail_closed,
             })),
             allow_path: Arc::new(allow_file),
             pending_path: Arc::new(pending_file),
@@ -427,29 +453,34 @@ impl Admission {
                     info!("admission: allow-list file readable again");
                 }
                 st.file_degraded = false;
+                st.startup_fail_closed = false;
                 let mode = self.effective_mode(&new_allow);
-                if mode == AdmissionMode::Enforce {
-                    // Drop live sessions whose fingerprint fell out of the
-                    // approved set (or landed on the deny list).
+                {
+                    // Prune live sessions: a key on the DENY list drops in
+                    // ANY mode (a revoke must drop sessions in learn too),
+                    // and in enforce any key that fell out of the approved
+                    // set drops as well.
                     let approved: std::collections::HashSet<&str> = new_allow
                         .clients
                         .iter()
                         .map(|c| c.fingerprint.as_str())
                         .filter(|fp| !new_allow.denied.iter().any(|d| d == fp))
                         .collect();
+                    let denied: std::collections::HashSet<&str> =
+                        new_allow.denied.iter().map(String::as_str).collect();
                     let mut dropped = Vec::new();
                     st.sessions.retain(|fp, senders| {
-                        if approved.contains(fp.as_str()) {
-                            true
-                        } else {
+                        let drop_it = denied.contains(fp.as_str())
+                            || (mode == AdmissionMode::Enforce && !approved.contains(fp.as_str()));
+                        if drop_it {
                             dropped.append(senders);
-                            false
                         }
+                        !drop_it
                     });
                     for (_, tx) in dropped {
                         let _ = tx.send(());
                     }
-                    debug!("admission: reloaded allow-list (enforce), sessions pruned");
+                    debug!("admission: reloaded allow-list, sessions pruned");
                 }
                 st.allow = new_allow;
             }
@@ -517,6 +548,15 @@ impl Admission {
         self.reload_if_changed().await;
         let fp = fingerprint_of(identity_key);
         let mut st = self.inner.lock().await;
+        if st.startup_fail_closed {
+            // Corrupt file at startup: refuse everyone until a good file
+            // arrives (Thomas B3).
+            debug!(
+                "admission: refusing client key {} (startup fail-closed)",
+                short_fingerprint(&fp)
+            );
+            return (AdmissionDecision::Refuse, None);
+        }
         let mode = self.effective_mode(&st.allow);
         let approved = st.allow.clients.iter().any(|c| c.fingerprint == fp)
             && !st.allow.denied.iter().any(|d| d == &fp);
@@ -528,7 +568,11 @@ impl Admission {
                     // Fail closed: without a readable list, approve nobody.
                     false
                 } else {
-                    approved
+                    // Proof is mandatory in enforce (Thomas B1): without it,
+                    // a legacy Hello carrying an approved client's PUBLIC
+                    // key would be admitted with no ClientAuth — an oracle
+                    // and a TUN-route hijack.
+                    approved && proven
                 }
             }
             AdmissionMode::Learn => {
@@ -539,24 +583,17 @@ impl Admission {
                     && !st.file_degraded
                     && st.allow.clients.len() < LEARNED_CAP
                 {
-                    st.allow.clients.push(AllowedClient {
+                    let entry = AllowedClient {
                         fingerprint: fp.clone(),
                         label: String::new(),
                         approved_at: now_unix(),
                         learned: true,
-                    });
-                    let allow = st.allow.clone();
+                    };
+                    st.allow.clients.push(entry.clone());
                     let path = (*self.allow_path).clone();
-                    // Persist under the flock, off the async reactor (S4).
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(_lock) = FileLock::acquire(&path) {
-                            if let Ok(json) = serde_json::to_vec_pretty(&allow) {
-                                if let Err(e) = write_private(&path, &json) {
-                                    warn!("admission: failed to persist learned key: {e}");
-                                }
-                            }
-                        }
-                    });
+                    // Persist off the async reactor (S4) as a proper
+                    // read-modify-write UNDER the flock (Thomas B2).
+                    tokio::task::spawn_blocking(move || persist_learned(&path, entry));
                     info!(
                         "admission: learned new client key {}",
                         short_fingerprint(&fp)
@@ -573,7 +610,9 @@ impl Admission {
             // just refuse.
             let now = now_unix();
             if now > st.refusal_refill_at {
-                st.refusal_tokens = REFUSAL_RATE_PER_SEC * 2.0;
+                // One second's worth per refill, so the sustained rate is
+                // REFUSAL_RATE_PER_SEC — not a 2x burst every window.
+                st.refusal_tokens = REFUSAL_RATE_PER_SEC;
                 st.refusal_refill_at = now;
             }
             if st.refusal_tokens >= 1.0 {
@@ -700,9 +739,16 @@ impl Admission {
 pub fn spawn_reload_task(admission: Admission) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut ticks = 0u32;
         loop {
             tick.tick().await;
             admission.reload_if_changed().await;
+            // A quiet server that refuses nobody still flushes a dirty
+            // pending list at least every ~30s (nit).
+            ticks += 1;
+            if ticks % 15 == 0 {
+                admission.flush_pending().await;
+            }
         }
     });
 }
@@ -790,6 +836,36 @@ fn load_pending(path: &Path) -> Vec<PendingEntry> {
 }
 
 /// `rvpn-server clients pending` — print the pending list.
+/// Persist one learned key as a read-modify-write UNDER the flock:
+/// re-read the file and merge, so a concurrent CLI approve/revoke is
+/// never overwritten by a stale snapshot (Thomas B2).
+fn persist_learned(path: &Path, entry: AllowedClient) {
+    if let Ok(_lock) = FileLock::acquire(path) {
+        let mut allow = match read_json::<AllowList>(path) {
+            FileRead::Ok(a) => a,
+            // Missing is a fresh list (create it); corrupt is left
+            // strictly alone — the server will learn again once it is
+            // readable.
+            FileRead::Missing => AllowList::default(),
+            FileRead::Corrupt => return,
+        };
+        if allow
+            .clients
+            .iter()
+            .any(|c| c.fingerprint == entry.fingerprint)
+            || allow.denied.iter().any(|d| d == &entry.fingerprint)
+        {
+            return;
+        }
+        allow.clients.push(entry);
+        if let Ok(json) = serde_json::to_vec_pretty(&allow) {
+            if let Err(e) = write_private(path, &json) {
+                warn!("admission: failed to persist learned key: {e}");
+            }
+        }
+    }
+}
+
 pub fn cmd_pending(pending_path: &Path) -> i32 {
     let entries = load_pending(pending_path);
     if entries.is_empty() {
@@ -1135,6 +1211,177 @@ mod tests {
         assert_eq!(d, AdmissionDecision::Refuse, "corrupt file fails closed");
         // The corrupt content is untouched (no silent wipe).
         assert_eq!(fs::read(&path).unwrap(), b"{not json");
+    }
+
+    /// Thomas B1 pin: in enforce, an APPROVED key still needs proof of
+    /// possession — a legacy client (proven=false) carrying an approved
+    /// client's public key is refused with the same code as an unknown key.
+    #[tokio::test]
+    async fn enforce_refuses_unproven_even_when_approved() {
+        let (dir, a) = tmp_admission(AdmissionMode::Enforce);
+        let victim = [42u8; 32];
+        cmd_approve(
+            &dir.path().join("clients.json"),
+            &dir.path().join("pending.json"),
+            &dir.path().join("audit.log"),
+            &fingerprint_of(&victim),
+            None,
+        );
+        // Proven + approved: admitted.
+        let (d, _) = a.check(&victim, true).await;
+        assert_eq!(d, AdmissionDecision::Admit);
+        // Unproven + approved (the public key is public!): refused.
+        let (d, _) = a.check(&victim, false).await;
+        assert_eq!(
+            d,
+            AdmissionDecision::Refuse,
+            "enforce must refuse an unproven client even for an approved key"
+        );
+    }
+
+    /// Thomas B2 pin: the learned-key persist merges into the CURRENT
+    /// file under the flock — a CLI revoke that landed after the server's
+    /// last reload must survive the write, and a key the CLI denied in
+    /// the meantime must not be learned into the file.
+    #[tokio::test]
+    async fn learn_write_merges_with_concurrent_cli_changes() {
+        let (dir, _a) = tmp_admission(AdmissionMode::Learn);
+        let revoked_key = [50u8; 32];
+        let learned_key = [51u8; 32];
+        let allow_path = dir.path().join("clients.json");
+        // The CLI revoke lands on disk; the server's in-memory snapshot
+        // never sees it (no reload). The persist must still keep it.
+        cmd_revoke(
+            &allow_path,
+            &dir.path().join("pending.json"),
+            &dir.path().join("audit.log"),
+            &fingerprint_of(&revoked_key),
+        );
+        persist_learned(
+            &allow_path,
+            AllowedClient {
+                fingerprint: fingerprint_of(&learned_key),
+                label: String::new(),
+                approved_at: now_unix(),
+                learned: true,
+            },
+        );
+        let allow = match read_json::<AllowList>(&allow_path) {
+            FileRead::Ok(v) => v,
+            _ => panic!("allow-list should exist"),
+        };
+        assert!(
+            allow
+                .denied
+                .iter()
+                .any(|d| d == &fingerprint_of(&revoked_key)),
+            "the CLI revoke must survive the concurrent learn write"
+        );
+        assert!(
+            allow
+                .clients
+                .iter()
+                .any(|c| c.fingerprint == fingerprint_of(&learned_key)),
+            "the learned key must be persisted"
+        );
+        // And a key the CLI denied before the write is NOT resurrected as
+        // learned.
+        persist_learned(
+            &allow_path,
+            AllowedClient {
+                fingerprint: fingerprint_of(&revoked_key),
+                label: String::new(),
+                approved_at: now_unix(),
+                learned: true,
+            },
+        );
+        let allow = match read_json::<AllowList>(&allow_path) {
+            FileRead::Ok(v) => v,
+            _ => panic!("allow-list should exist"),
+        };
+        assert!(
+            !allow
+                .clients
+                .iter()
+                .any(|c| c.fingerprint == fingerprint_of(&revoked_key)),
+            "a denied key must not be learned back into the file"
+        );
+    }
+
+    /// Thomas B3 pin: a corrupt allow-list at startup fails CLOSED in
+    /// every mode — the file may have stored `enforce`, and falling back
+    /// to config-learn would admit everyone (the probe scenario).
+    #[tokio::test]
+    async fn corrupt_file_at_startup_fails_closed_unless_config_learn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clients.json");
+        fs::write(&path, b"{not json").unwrap();
+        // Config says enforce -> refuse everything, even a "known" key.
+        let a = Admission::new(
+            true,
+            AdmissionMode::Enforce,
+            path.clone(),
+            dir.path().join("pending.json"),
+            dir.path().join("audit.log"),
+        );
+        let (d, _) = a.check(&[60u8; 32], true).await;
+        assert_eq!(d, AdmissionDecision::Refuse);
+        drop(a);
+        // Config says learn but the file is corrupt: STILL closed — the
+        // corrupt file may have stored `enforce`, and admitting everyone
+        // here was Thomas's probe scenario (B3).
+        let a = Admission::new(
+            true,
+            AdmissionMode::Learn,
+            path.clone(),
+            dir.path().join("pending.json"),
+            dir.path().join("audit.log"),
+        );
+        let (d, _) = a.check(&[61u8; 32], true).await;
+        assert_eq!(
+            d,
+            AdmissionDecision::Refuse,
+            "corrupt file at startup must fail closed in every mode"
+        );
+        drop(a);
+        // The learn-mode recovery path: remove the corrupt file -> a
+        // MISSING file is a clean empty list, and learn resumes.
+        fs::remove_file(&path).unwrap();
+        let a = Admission::new(
+            true,
+            AdmissionMode::Learn,
+            path.clone(),
+            dir.path().join("pending.json"),
+            dir.path().join("audit.log"),
+        );
+        let (d, _) = a.check(&[62u8; 32], true).await;
+        assert_eq!(d, AdmissionDecision::Admit);
+    }
+
+    /// Should-fix pin: revoking a key drops its live session in LEARN
+    /// mode too, not just in enforce.
+    #[tokio::test]
+    async fn revoke_drops_live_session_in_learn_mode() {
+        let (dir, a) = tmp_admission(AdmissionMode::Learn);
+        let key = [70u8; 32];
+        let (d, reg) = a.check(&key, true).await;
+        assert_eq!(d, AdmissionDecision::Admit);
+        let mut reg = reg.unwrap();
+        cmd_revoke(
+            &dir.path().join("clients.json"),
+            &dir.path().join("pending.json"),
+            &dir.path().join("audit.log"),
+            &fingerprint_of(&key),
+        );
+        a.reload_if_changed().await;
+        let mut rx = reg.revoke_rx.take().unwrap();
+        match rx.try_recv() {
+            Ok(()) => {}
+            other => panic!(
+                "revoked session must drop in learn mode too, got {:?}",
+                other.is_err()
+            ),
+        }
     }
 
     #[tokio::test]

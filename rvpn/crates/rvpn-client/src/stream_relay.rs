@@ -148,7 +148,6 @@ impl StreamRelay {
             session_token: None,
             connection_nonce: None,
             capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
-            admission_mac: None,
         };
 
         let hello_bytes =
@@ -291,10 +290,13 @@ impl StreamRelay {
                                     if mismatch_is_fatal(&result, config.reject_mismatch) {
                                         return Err(anyhow::anyhow!(
                                             "Server identity mismatch! Expected {}, got {}. Connection rejected.",
-                                            expected, got
+                                            expected,
+                                            got
                                         ));
                                     } else {
-                                        warn!("Server identity mismatch — continuing because reject_mismatch = false: identity pinning is OFF for this connection (explicit dev opt-in, not safe for production)");
+                                        warn!(
+                                            "Server identity mismatch — continuing because reject_mismatch = false: identity pinning is OFF for this connection (explicit dev opt-in, not safe for production)"
+                                        );
                                     }
                                 }
                             }
@@ -315,6 +317,7 @@ impl StreamRelay {
                             &ephemeral_public,
                             &None,
                             rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                            &received_bundle.identity_key,
                             &received_bundle.identity_x25519_key,
                             &[],
                             &server_signed_prekey,
@@ -354,12 +357,14 @@ impl StreamRelay {
                                     _ => {
                                         return Err(anyhow::anyhow!(
                                             "expected ServerAccept from server"
-                                        ))
+                                        ));
                                     }
                                 }
                             }
                             _ => {
-                                return Err(anyhow::anyhow!("expected binary ServerAccept message"))
+                                return Err(anyhow::anyhow!(
+                                    "expected binary ServerAccept message"
+                                ));
                             }
                         }
 

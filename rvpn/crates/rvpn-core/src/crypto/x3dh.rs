@@ -657,8 +657,8 @@ const X25519_LOW_ORDER: [[u8; 32]; 7] = [
     ],
     [
         0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef,
-        0x5b, 0x04, 0x44, 0x5c, 0x49, 0x94, 0x58, 0x1d, 0xda, 0xda, 0x90, 0xed, 0x39, 0x9c, 0x2f,
-        0xcb, 0x00,
+        0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f,
+        0x11, 0x57,
     ],
     [
         0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -772,6 +772,39 @@ mod tests {
             responder.agree(&valid_ik, &valid_ek, false, 0).is_ok(),
             "valid keys must still complete"
         );
+    }
+
+    /// Blocklist self-validation: EVERY entry of X25519_LOW_ORDER must be
+    /// a genuine contributory point — X25519(11, entry) == 0 — so a typo'd
+    /// entry can never rot into dead weight (review nit: entry 3 once
+    /// wasn't a low-order point at all). And every entry must be rejected
+    /// by the validator.
+    #[test]
+    fn low_order_blocklist_is_self_validating() {
+        let scalar = X25519StaticSecret::from({
+            let mut s = [0u8; 32];
+            s[0] = 11;
+            s
+        });
+        for entry in X25519_LOW_ORDER.iter() {
+            let out = scalar.diffie_hellman(&X25519PublicKey::from(*entry));
+            assert!(
+                out.as_bytes().iter().all(|b| *b == 0),
+                "blocklist entry {:02x?}… is NOT a contributory point",
+                &entry[..4]
+            );
+            assert!(
+                validate_x25519_public_key(entry).is_err(),
+                "blocklist entry {:02x?}… must be rejected",
+                &entry[..4]
+            );
+        }
+        // Control: the basepoint is neither blocked nor contributory.
+        let mut nine = [0u8; 32];
+        nine[0] = 9;
+        let out = scalar.diffie_hellman(&X25519PublicKey::from(nine));
+        assert!(!out.as_bytes().iter().all(|b| *b == 0));
+        assert!(validate_x25519_public_key(&nine).is_ok());
     }
 
     /// New bundles serialize both TOFU fields (version + optional rotation

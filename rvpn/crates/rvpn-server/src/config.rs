@@ -379,6 +379,7 @@ fn default_tun_name() -> String {
 /// Client admission configuration. `enabled=false` (default) admits every
 /// client key — the pre-#32 behaviour.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdmissionConfig {
     /// Turn deny-by-default admission on.
     #[serde(default)]

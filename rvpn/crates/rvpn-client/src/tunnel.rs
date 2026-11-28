@@ -231,7 +231,6 @@ impl VpnTunnel {
             session_token: None,
             connection_nonce: None,
             capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
-            admission_mac: None,
         };
 
         let hello_bytes =
@@ -391,10 +390,13 @@ impl VpnTunnel {
                                 ) {
                                     return Err(anyhow::anyhow!(
                                         "Server identity mismatch! Expected {}, got {}. Connection rejected.",
-                                        expected, got
+                                        expected,
+                                        got
                                     ));
                                 } else {
-                                    warn!("Server identity mismatch — continuing because reject_mismatch = false: identity pinning is OFF for this connection (explicit dev opt-in, not safe for production)");
+                                    warn!(
+                                        "Server identity mismatch — continuing because reject_mismatch = false: identity pinning is OFF for this connection (explicit dev opt-in, not safe for production)"
+                                    );
                                 }
                             }
                         }
@@ -416,6 +418,7 @@ impl VpnTunnel {
                             &ephemeral_public,
                             &None,
                             rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                            &server_bundle_from_hello.identity_key,
                             &server_bundle_from_hello.identity_x25519_key,
                             &[],
                             &server_signed_prekey,
@@ -455,12 +458,14 @@ impl VpnTunnel {
                                     _ => {
                                         return Err(anyhow::anyhow!(
                                             "expected ServerAccept from server"
-                                        ))
+                                        ));
                                     }
                                 }
                             }
                             _ => {
-                                return Err(anyhow::anyhow!("expected binary ServerAccept message"))
+                                return Err(anyhow::anyhow!(
+                                    "expected binary ServerAccept message"
+                                ));
                             }
                         }
 
@@ -546,8 +551,10 @@ impl VpnTunnel {
                                     &unpadded,
                                 ) {
                                     Ok(virtual_ip) => {
-                                        info!("Received VirtualIp assignment: ipv4={:?}, dns={:?}, mtu={}",
-                                              virtual_ip.ipv4, virtual_ip.dns_servers, virtual_ip.mtu);
+                                        info!(
+                                            "Received VirtualIp assignment: ipv4={:?}, dns={:?}, mtu={}",
+                                            virtual_ip.ipv4, virtual_ip.dns_servers, virtual_ip.mtu
+                                        );
                                         // Send to the connect function via channel (only first time)
                                         if !virtual_ip_sent {
                                             if let Err(e) = virtual_ip_tx.send(virtual_ip).await {

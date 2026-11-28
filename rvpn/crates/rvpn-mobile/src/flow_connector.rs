@@ -246,7 +246,6 @@ async fn perform_handshake(
         session_token: None,
         connection_nonce: None,
         capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
-        admission_mac: None,
     };
 
     let hello_bytes = serde_json::to_vec(&hello).context("Failed to serialize Hello message")?;
@@ -275,6 +274,7 @@ async fn perform_handshake(
 
             // Third flight (S1): ClientAuth admission proof, then
             // ServerAccept (or the pending_approval refusal).
+            let wire_identity_ed25519 = validated.bundle.identity_key;
             let wire_identity_x25519 = validated.bundle.identity_x25519_key;
             let wire_signed_prekey = validated.bundle.signed_prekey;
             let wire_prekey_signature = validated.bundle.prekey_signature;
@@ -287,6 +287,7 @@ async fn perform_handshake(
                 &ephemeral_public,
                 &None,
                 rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                &wire_identity_ed25519,
                 &wire_identity_x25519,
                 &[],
                 &wire_signed_prekey,
