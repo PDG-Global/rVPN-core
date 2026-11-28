@@ -644,17 +644,32 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
 
         info!("TUN device ready");
 
-        // Windows: tun-rs assigns the tunnel address without touching DAD,
-        // so it can still be Tentative when the covering routes are verified;
-        // source address selection then fails and route lookups error with
-        // ERROR_NETWORK_UNREACHABLE. DAD is meaningless on a point-to-point
-        // tunnel interface — force the address to Preferred before route
-        // setup. A Duplicate report is a real address conflict and fails the
-        // connect attempt (retried like a route-setup failure).
+        // Windows: tun-rs assigns the tunnel address via netsh, and the
+        // unicast row materializes in the active store seconds after netsh
+        // returns — every check right after adapter creation sees
+        // ERROR_FILE_NOT_FOUND, and each retry creates a NEW adapter that
+        // restarts the delay, so it must be waited out on THIS adapter. Once
+        // the row exists it is still DAD-Tentative, which breaks source
+        // address selection (route lookups error with
+        // ERROR_NETWORK_UNREACHABLE); DAD is meaningless on a point-to-point
+        // tunnel interface, so force the address to Preferred before route
+        // setup. Both failures retry like a route-setup failure; a DAD
+        // Duplicate report is a real address conflict and fails the attempt.
         #[cfg(windows)]
         {
             if let Some(assigned_ip) = virtual_ip {
                 let if_index = tun_device.adapter_index()?;
+                if let Err(e) = crate::windows::routes::wait_for_unicast_address(
+                    assigned_ip,
+                    std::time::Duration::from_secs(10),
+                ) {
+                    error!("Tunnel address did not materialize: {:#}", e);
+                    reconnect_attempts += 1;
+                    let delay = retry_delay(reconnect_attempts);
+                    warn!("Retrying in {} ms (attempt {}/{})", delay.as_millis(), reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
                 if let Err(e) = crate::windows::routes::force_dad_preferred(if_index, assigned_ip) {
                     error!("Failed to finalize tunnel address DAD state: {:#}", e);
                     reconnect_attempts += 1;

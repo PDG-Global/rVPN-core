@@ -26,13 +26,14 @@
 use std::ffi::c_void;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_BUFFER_OVERFLOW, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS,
-    ERROR_SUCCESS, WIN32_ERROR,
+    ERROR_ALREADY_EXISTS, ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND,
+    ERROR_OBJECT_ALREADY_EXISTS, ERROR_SUCCESS, WIN32_ERROR,
 };
 use windows::Win32::NetworkManagement::IpHelper::{
     ConvertInterfaceIndexToLuid, CreateIpForwardEntry2, DNS_INTERFACE_SETTINGS,
@@ -727,6 +728,79 @@ fn set_unicast_address_row(row: &MIB_UNICASTIPADDRESS_ROW) -> Result<()> {
     check(err, "SetUnicastIpAddressEntry")
 }
 
+/// How long to wait between GetUnicastIpAddressEntry polls while the
+/// netsh-assigned address row materializes.
+const ADDRESS_WAIT_POLL: Duration = Duration::from_millis(250);
+
+/// Poll access to the unicast row, injectable for tests (sleep is stubbed so
+/// the timeout path does not take real time).
+#[derive(Clone, Copy)]
+struct AddressWaitOps {
+    get: fn(Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW>,
+    sleep: fn(Duration),
+}
+
+const WIN32_ADDRESS_WAIT_OPS: AddressWaitOps = AddressWaitOps {
+    get: get_unicast_address_row,
+    sleep: std::thread::sleep,
+};
+
+/// Whether an error from GetUnicastIpAddressEntry means "the address row
+/// does not exist (yet)": ERROR_FILE_NOT_FOUND (2) while the netsh-assigned
+/// row has not materialized in the active store. Anything else is a real
+/// failure and must not be retried.
+fn is_address_row_absent(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<windows::core::Error>()
+        .is_some_and(|e| e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0))
+}
+
+/// Wait until the tunnel address exists in the unicast-address table.
+///
+/// tun-rs assigns the address by shelling out to `netsh interface ipv4 set
+/// address` inside build_sync; netsh returns synchronously, but the unicast
+/// row materializes in the active store seconds later, so every check right
+/// after adapter creation sees ERROR_FILE_NOT_FOUND. Polls every
+/// ADDRESS_WAIT_POLL until the row appears or `timeout` elapses. Only the
+/// not-found error is retried; any other failure bails immediately.
+pub fn wait_for_unicast_address(
+    addr: Ipv4Addr,
+    timeout: Duration,
+) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    let start = Instant::now();
+    let row = wait_for_unicast_address_with_ops(addr, timeout, &WIN32_ADDRESS_WAIT_OPS)?;
+    info!(
+        "tunnel address {addr} present in the unicast table after {:?}",
+        start.elapsed()
+    );
+    Ok(row)
+}
+
+fn wait_for_unicast_address_with_ops(
+    addr: Ipv4Addr,
+    timeout: Duration,
+    ops: &AddressWaitOps,
+) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+    let start = Instant::now();
+    loop {
+        match (ops.get)(addr) {
+            Ok(row) => return Ok(row),
+            Err(e) if is_address_row_absent(&e) => {
+                if start.elapsed() >= timeout {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "tunnel address {addr} did not appear in the unicast \
+                             table within {}s",
+                            timeout.as_secs()
+                        )
+                    });
+                }
+                (ops.sleep)(ADDRESS_WAIT_POLL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// What force_dad_preferred did with the address's DAD state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DadForce {
@@ -737,13 +811,18 @@ enum DadForce {
 }
 
 /// Force the tunnel address out of duplicate address detection into
-/// Preferred. tun-rs assigns the address without touching DadState, and
-/// while it is still Tentative source-address selection fails: GetBestRoute2
-/// then errors with ERROR_NETWORK_UNREACHABLE even though the covering
-/// routes exist. DAD is meaningless on a point-to-point tunnel interface
-/// (wireguard-windows sets IpDadStatePreferred when adding the address for
-/// the same reason). A Duplicate report is a real address conflict and fails
-/// closed instead of being papered over.
+/// Preferred. tun-rs assigns the address via netsh without touching
+/// DadState, so once the row exists (see wait_for_unicast_address — the row
+/// itself materializes seconds after netsh returns) it is still Tentative,
+/// and source-address selection fails: GetBestRoute2 then errors with
+/// ERROR_NETWORK_UNREACHABLE even though the covering routes exist. DAD is
+/// meaningless on a point-to-point tunnel interface (wireguard-windows sets
+/// IpDadStatePreferred when adding the address for the same reason). A
+/// Duplicate report is a real address conflict and fails closed instead of
+/// being papered over.
+///
+/// Callers must run wait_for_unicast_address first: this looks the row up
+/// and fails with ERROR_FILE_NOT_FOUND while it has not materialized.
 ///
 /// Deliberately NOT part of TunDevice::create_with_ip: the route_diag_probe
 /// test calls create_with_ip and must observe the raw tun-rs DAD behavior.
@@ -1861,6 +1940,95 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{e:#}").contains("different interface"));
+    }
+
+    // ---- unicast-address wait -----------------------------------------------
+
+    /// Same error shape the production path sees while the netsh-assigned
+    /// row has not materialized yet: ERROR_FILE_NOT_FOUND with context.
+    fn address_not_found_error() -> anyhow::Error {
+        anyhow::Error::new(windows::core::Error::from(HRESULT::from_win32(
+            ERROR_FILE_NOT_FOUND.0,
+        )))
+        .context("GetUnicastIpAddressEntry failed (Win32 error 2)")
+    }
+
+    fn stub_wait_sleep_noop(_d: Duration) {}
+
+    static WAIT_LATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static WAIT_FATAL_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Row appears on the third poll.
+    fn stub_wait_get_late(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+        if WAIT_LATE_CALLS.fetch_add(1, Ordering::SeqCst) >= 2 {
+            Ok(dad_test_row(IpDadStatePreferred, TEST_ADAPTER_LUID))
+        } else {
+            Err(address_not_found_error())
+        }
+    }
+
+    fn stub_wait_get_never(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+        Err(address_not_found_error())
+    }
+
+    fn stub_wait_get_fatal(_addr: Ipv4Addr) -> Result<MIB_UNICASTIPADDRESS_ROW> {
+        WAIT_FATAL_CALLS.fetch_add(1, Ordering::SeqCst);
+        Err(anyhow::anyhow!("access denied"))
+    }
+
+    /// The wait helper polls until the row appears, then returns it.
+    #[test]
+    fn wait_returns_row_once_address_appears() {
+        WAIT_LATE_CALLS.store(0, Ordering::SeqCst);
+        let ops = AddressWaitOps {
+            get: stub_wait_get_late,
+            sleep: stub_wait_sleep_noop,
+        };
+        let row = wait_for_unicast_address_with_ops(
+            Ipv4Addr::new(10, 200, 0, 3),
+            Duration::from_secs(5),
+            &ops,
+        )
+        .unwrap();
+        assert_eq!(WAIT_LATE_CALLS.load(Ordering::SeqCst), 3);
+        assert!(row.DadState == IpDadStatePreferred);
+    }
+
+    /// Only the not-found error is retried; any other failure bails on the
+    /// first call.
+    #[test]
+    fn wait_bails_immediately_on_non_retryable_error() {
+        WAIT_FATAL_CALLS.store(0, Ordering::SeqCst);
+        let ops = AddressWaitOps {
+            get: stub_wait_get_fatal,
+            sleep: stub_wait_sleep_noop,
+        };
+        let e = wait_for_unicast_address_with_ops(
+            Ipv4Addr::new(10, 200, 0, 3),
+            Duration::from_secs(5),
+            &ops,
+        )
+        .err()
+        .expect("non-retryable error must fail the wait");
+        assert!(format!("{e:#}").contains("access denied"));
+        assert_eq!(WAIT_FATAL_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    /// A row that never appears fails with a clear timeout error.
+    #[test]
+    fn wait_times_out_when_address_never_appears() {
+        let ops = AddressWaitOps {
+            get: stub_wait_get_never,
+            sleep: stub_wait_sleep_noop,
+        };
+        let e = wait_for_unicast_address_with_ops(
+            Ipv4Addr::new(10, 200, 0, 3),
+            Duration::from_millis(20),
+            &ops,
+        )
+        .err()
+        .expect("an address that never appears must time out");
+        assert!(format!("{e:#}").contains("did not appear"));
     }
 
     // ---- elevated manual diagnostic probe -----------------------------------
