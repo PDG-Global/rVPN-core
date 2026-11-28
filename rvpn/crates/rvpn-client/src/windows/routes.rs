@@ -123,11 +123,16 @@ impl RouteGuard {
 
     fn apply_all(&mut self) -> Result<()> {
         // 1. Pin the VPN server through the physical gateway, so the tunnel
-        //    transport never loops through the tunnel itself.
-        let gateway = physical_gateway()?;
-        route_add_host(self.cfg.server_ip, gateway)?;
-        self.state.server_route = Some((self.cfg.server_ip, gateway));
-        self.persist()?;
+        //    transport never loops through the tunnel itself. Skip this when
+        //    the server is on this machine: pointing a loopback address at a
+        //    physical gateway wedges the Windows loopback stack until reboot
+        //    (observed in the smoke test with a localhost test server).
+        if !self.cfg.server_ip.is_loopback() {
+            let gateway = physical_gateway()?;
+            route_add_host(self.cfg.server_ip, gateway)?;
+            self.state.server_route = Some((self.cfg.server_ip, gateway));
+            self.persist()?;
+        }
 
         // 2. IPv4: 0.0.0.0/1 + 128.0.0.0/1 via the adapter (covers the whole
         //    space without touching the physical default route).
@@ -151,7 +156,7 @@ impl RouteGuard {
 
         // 4. DNS on the adapter, then force a winning interface metric so
         //    Windows does not keep asking the physical adapter's DNS.
-        set_adapter_dns(&self.cfg.adapter_name, &self.cfg.dns_servers)?;
+        set_adapter_dns(self.cfg.adapter_index, &self.cfg.dns_servers)?;
         self.state.dns_servers = self.cfg.dns_servers.clone();
         self.state.adapter_index = Some(self.cfg.adapter_index);
         self.persist()?;
@@ -223,14 +228,22 @@ fn rollback_state(state: &AppliedState) {
 
 // ---- command runners ------------------------------------------------------
 
-fn run(cmd: &str, args: &[&str]) -> Result<String> {
+/// Full path to a System32 tool. This runs elevated, so a bare name must
+/// never be resolved through PATH or the working directory.
+fn system32_tool(tool: &str) -> PathBuf {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    Path::new(&root).join("System32").join(tool)
+}
+
+fn run(cmd: &std::ffi::OsStr, args: &[&str]) -> Result<String> {
     let output = std::process::Command::new(cmd)
         .args(args)
         .output()
-        .with_context(|| format!("failed to start {cmd}"))?;
+        .with_context(|| format!("failed to start {}", cmd.to_string_lossy()))?;
     if !output.status.success() {
         bail!(
-            "{cmd} {} failed (status {}): {}",
+            "{} {} failed (status {}): {}",
+            cmd.to_string_lossy(),
             args.join(" "),
             output.status,
             String::from_utf8_lossy(&output.stderr)
@@ -240,7 +253,14 @@ fn run(cmd: &str, args: &[&str]) -> Result<String> {
 }
 
 fn powershell(script: &str) -> Result<String> {
-    run("powershell.exe", &["-NoProfile", "-Command", script])
+    run(
+        system32_tool(r"WindowsPowerShell\v1.0\powershell.exe").as_os_str(),
+        &["-NoProfile", "-Command", script],
+    )
+}
+
+fn route_cmd(args: &[&str]) -> Result<String> {
+    run(system32_tool("route.exe").as_os_str(), args)
 }
 
 /// Physical default gateway of the machine (IPv4 default route's next hop).
@@ -262,18 +282,15 @@ fn physical_gateway() -> Result<IpAddr> {
 fn route_add_host(ip: IpAddr, gateway: IpAddr) -> Result<()> {
     match (ip, gateway) {
         (IpAddr::V4(ip), IpAddr::V4(gw)) => {
-            run(
-                "route",
-                &[
-                    "add",
-                    &ip.to_string(),
-                    "mask",
-                    "255.255.255.255",
-                    &gw.to_string(),
-                    "metric",
-                    "1",
-                ],
-            )?;
+            route_cmd(&[
+                "add",
+                &ip.to_string(),
+                "mask",
+                "255.255.255.255",
+                &gw.to_string(),
+                "metric",
+                "1",
+            ])?;
             Ok(())
         }
         _ => bail!("server host route for non-IPv4 gateway is not implemented"),
@@ -281,7 +298,7 @@ fn route_add_host(ip: IpAddr, gateway: IpAddr) -> Result<()> {
 }
 
 fn route_delete_host(ip: IpAddr) -> Result<()> {
-    run("route", &["delete", &ip.to_string()])?;
+    route_cmd(&["delete", &ip.to_string()])?;
     Ok(())
 }
 
@@ -291,28 +308,22 @@ fn route_add_v4_via_adapter(
     adapter_ip: Ipv4Addr,
     if_index: u32,
 ) -> Result<()> {
-    run(
-        "route",
-        &[
-            "add",
-            &net.to_string(),
-            "mask",
-            &mask.to_string(),
-            &adapter_ip.to_string(),
-            "metric",
-            "1",
-            "if",
-            &if_index.to_string(),
-        ],
-    )?;
+    route_cmd(&[
+        "add",
+        &net.to_string(),
+        "mask",
+        &mask.to_string(),
+        &adapter_ip.to_string(),
+        "metric",
+        "1",
+        "if",
+        &if_index.to_string(),
+    ])?;
     Ok(())
 }
 
 fn route_delete_v4(net: Ipv4Addr, mask: Ipv4Addr) -> Result<()> {
-    run(
-        "route",
-        &["delete", &net.to_string(), "mask", &mask.to_string()],
-    )?;
+    route_cmd(&["delete", &net.to_string(), "mask", &mask.to_string()])?;
     Ok(())
 }
 
@@ -330,54 +341,17 @@ fn route_delete_v6(prefix: &str) -> Result<()> {
     ))?;
     Ok(())
 }
-fn set_adapter_dns(adapter_name: &str, servers: &[IpAddr]) -> Result<()> {
-    let v4: Vec<String> = servers
-        .iter()
-        .filter_map(|s| match s {
-            IpAddr::V4(ip) => Some(ip.to_string()),
-            _ => None,
-        })
-        .collect();
-    let v6: Vec<String> = servers
-        .iter()
-        .filter_map(|s| match s {
-            IpAddr::V6(ip) => Some(ip.to_string()),
-            _ => None,
-        })
-        .collect();
-    let v4_refs: Vec<&str> = v4.iter().map(String::as_str).collect();
-    let v6_refs: Vec<&str> = v6.iter().map(String::as_str).collect();
-    if !v4_refs.is_empty() {
-        let joined = v4_refs.join(",");
-        run(
-            "netsh",
-            &[
-                "interface",
-                "ipv4",
-                "set",
-                "dnsservers",
-                adapter_name,
-                "static",
-                &joined,
-                "primary",
-            ],
-        )?;
-    }
-    if !v6_refs.is_empty() {
-        let joined = v6_refs.join(",");
-        run(
-            "netsh",
-            &[
-                "interface",
-                "ipv6",
-                "set",
-                "dnsservers",
-                adapter_name,
-                "static",
-                &joined,
-                "primary",
-            ],
-        )?;
+fn set_adapter_dns(if_index: u32, servers: &[IpAddr]) -> Result<()> {
+    // Set-DnsClientServerAddress takes the whole list in one call, mixed
+    // families included. (netsh set dnsservers takes exactly one address,
+    // which silently breaks configs with more than one resolver.)
+    let quoted: Vec<String> = servers.iter().map(|s| format!("'{s}'")).collect();
+    if !quoted.is_empty() {
+        powershell(&format!(
+            "Set-DnsClientServerAddress -InterfaceIndex {if_index} \
+             -ServerAddresses @({}) -ErrorAction Stop",
+            quoted.join(",")
+        ))?;
     }
     Ok(())
 }
