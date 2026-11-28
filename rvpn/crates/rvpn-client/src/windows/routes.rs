@@ -2159,7 +2159,10 @@ mod tests {
     ///
     /// Creates a throwaway adapter exactly the way the client does
     /// (TunDevice::create_with_ip), assigns 10.200.0.3/24 with MTU 1420,
-    /// dumps the adapter/address/interface state (DAD included), installs the
+    /// logs a timeline of the unicast row materializing (netsh assigns the
+    /// address synchronously inside build_sync, but the row appears in the
+    /// active store seconds later) with every DadState transition, dumps the
+    /// adapter/address/interface state (DAD included), installs the
     /// production covering routes via forward_row/create_route, and reports
     /// how GetBestRoute2 behaves for the production rows and a series of
     /// variants — including variant g, which applies the production
@@ -2226,6 +2229,49 @@ mod tests {
             if_index,
             unsafe { luid.Value },
         );
+
+        // --- address materialization timeline ---
+        // tun-rs assigns the address via netsh inside build_sync; the
+        // unicast row materializes in the active store seconds later. Poll
+        // and log every transition so the timeline shows when the row
+        // appears and how DadState evolves.
+        println!("probe: t+0.00s: unicast row for {PROBE_IP}: not-found (polling up to 30s)");
+        let timeline_start = std::time::Instant::now();
+        let mut timeline_state = "not-found".to_string();
+        while timeline_start.elapsed() < std::time::Duration::from_secs(30) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            match get_unicast_address_row(PROBE_IP) {
+                Ok(row) => {
+                    let state = format!("{} ({})", row.DadState.0, dad_state_name(row.DadState));
+                    if state != timeline_state {
+                        println!(
+                            "probe: t+{:.2?}: unicast row present; dad_state={state}",
+                            timeline_start.elapsed()
+                        );
+                        timeline_state = state;
+                    }
+                    if row.DadState == IpDadStatePreferred {
+                        break;
+                    }
+                }
+                Err(e) if is_address_row_absent(&e) => {}
+                Err(e) => {
+                    println!(
+                        "probe: t+{:.2?}: GetUnicastIpAddressEntry failed: {e:#}",
+                        timeline_start.elapsed()
+                    );
+                    break;
+                }
+            }
+        }
+        println!(
+            "probe: timeline ends at t+{:.2?}: {timeline_state}",
+            timeline_start.elapsed()
+        );
+        results.push((
+            "address materialization".to_string(),
+            format!("{timeline_state} after {:.2?}", timeline_start.elapsed()),
+        ));
 
         // --- adapter state ---
         let mut if_row = MIB_IF_ROW2 {
