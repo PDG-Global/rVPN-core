@@ -468,11 +468,17 @@ async fn run_tun(config: ClientConfig) -> Result<()> {
 
     // Windows: first undo any leftover route/DNS state from a crashed run,
     // then resolve the server IP while the network is still untouched so the
-    // covering routes can pin a host route to it.
+    // covering routes can pin a host route to it. The state file lives under
+    // %ProgramData%\rvpn (created with a SYSTEM+Administrators-only ACL, so
+    // the elevated restore can trust it); the pre-hardening location in the
+    // user-writable data dir is restored once more for migration.
     #[cfg(windows)]
-    let route_state_path = config.data_dir.join("route_state.json");
+    let route_state_path = crate::windows::routes::state_path()
+        .context("Failed to prepare the route state directory")?;
     #[cfg(windows)]
     crate::windows::routes::restore_from_state_file(&route_state_path);
+    #[cfg(windows)]
+    crate::windows::routes::restore_from_state_file(&config.data_dir.join("route_state.json"));
     #[cfg(windows)]
     let server_ip = {
         use std::net::ToSocketAddrs;

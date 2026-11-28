@@ -15,15 +15,25 @@
 //! and PowerShell; that was dropped because an elevated child process
 //! inherits user-controllable state (PATH, SystemRoot, PSModulePath module
 //! auto-load), which made it hijackable by malware running as the user.
+//!
+//! The state file lives at `%ProgramData%\rvpn\route_state.json` in a
+//! directory created with a SYSTEM + Administrators-only ACL (ProgramData is
+//! resolved via `SHGetKnownFolderPath`, never the user-controllable
+//! environment). Before an existing state file is trusted for restore it is
+//! validated: it must be a plain file (no reparse point/junction) owned by
+//! SYSTEM or Administrators — anything else is refused, loudly.
 
+use std::ffi::c_void;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use windows::Win32::Foundation::{
-    ERROR_BUFFER_OVERFLOW, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, ERROR_SUCCESS, WIN32_ERROR,
+    ERROR_ALREADY_EXISTS, ERROR_BUFFER_OVERFLOW, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS,
+    ERROR_SUCCESS, HLOCAL, LocalFree, WIN32_ERROR,
 };
 use windows::Win32::NetworkManagement::IpHelper::{
     ConvertInterfaceIndexToLuid, CreateIpForwardEntry2, DNS_INTERFACE_SETTINGS,
@@ -38,7 +48,20 @@ use windows::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0,
     MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
 };
-use windows::core::{GUID, HRESULT, PWSTR};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
+};
+use windows::Win32::Security::{
+    CreateWellKnownSid, EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+};
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+use windows::core::{GUID, HRESULT, PCWSTR, PWSTR, w};
 
 /// Fail-closed covering routes. Two /1 routes per family cover the whole
 /// address space without touching the physical default route. IPv6 is
@@ -173,11 +196,22 @@ impl Drop for RouteGuard {
 /// it recorded. Entries that fail to roll back stay in the file so the next
 /// start retries them; a fully restored file is deleted. Call this at client
 /// start, before applying any new state.
-pub fn restore_from_state_file(state_path: &std::path::Path) {
+pub fn restore_from_state_file(state_path: &Path) {
     let contents = match std::fs::read_to_string(state_path) {
         Ok(c) => c,
         Err(_) => return, // no crash state: nothing to restore
     };
+    // The file drives elevated restore operations, so it must be exactly the
+    // file we wrote: no reparse points, and owned by SYSTEM or the
+    // Administrators group. Anything else could have been planted by malware
+    // running as the user and is refused (loudly) rather than restored.
+    if let Err(e) = validate_state_file(state_path) {
+        warn!(
+            "refusing to restore from untrusted route state {}: {e:#}",
+            state_path.display()
+        );
+        return;
+    }
     warn!(
         "found leftover route state at {}; restoring system routing",
         state_path.display()
@@ -326,7 +360,7 @@ impl RouteGuard {
 
 /// Persist after a crash-time restore: delete the file when nothing is left,
 /// keep the remaining entries otherwise.
-fn finish_restore(state_path: &std::path::Path, remaining: AppliedState) {
+fn finish_restore(state_path: &Path, remaining: AppliedState) {
     if remaining.is_empty() {
         let _ = std::fs::remove_file(state_path);
     } else {
@@ -343,7 +377,7 @@ fn finish_restore(state_path: &std::path::Path, remaining: AppliedState) {
 /// Write the state file atomically: write a temp file in the same directory
 /// and rename it over the target (rename replaces atomically on Windows), so
 /// a crash mid-persist can never leave a truncated state file behind.
-fn persist_to(state_path: &std::path::Path, state: &AppliedState) -> Result<()> {
+fn persist_to(state_path: &Path, state: &AppliedState) -> Result<()> {
     let json = serde_json::to_string_pretty(state)?;
     let tmp = state_path.with_extension("json.tmp");
     std::fs::write(&tmp, json).with_context(|| format!("Failed to write {}", tmp.display()))?;
@@ -354,6 +388,179 @@ fn persist_to(state_path: &std::path::Path, state: &AppliedState) -> Result<()> 
             state_path.display()
         )
     })
+}
+
+// ---- state file location and trust -----------------------------------------
+
+/// Path of the route state file: `%ProgramData%\rvpn\route_state.json`.
+///
+/// The state file drives elevated restore operations, so it must live where
+/// unprivileged users cannot write: ProgramData is resolved through
+/// SHGetKnownFolderPath (never the environment, which is user-controllable)
+/// and the rvpn directory is created with a SYSTEM + Administrators-only
+/// ACL. Creating that directory needs the elevation TUN mode already
+/// requires, so a failure here is a hard error.
+pub fn state_path() -> Result<PathBuf> {
+    let dir = program_data()?.join("rvpn");
+    ensure_state_dir(&dir)?;
+    Ok(dir.join("route_state.json"))
+}
+
+/// Resolve FOLDERID_ProgramData via SHGetKnownFolderPath. The `ProgramData`
+/// environment variable comes from the user environment and must not be
+/// trusted by an elevated process.
+fn program_data() -> Result<PathBuf> {
+    let path = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, KF_FLAG_DEFAULT, None) }
+        .context("SHGetKnownFolderPath(FOLDERID_ProgramData) failed")?;
+    // SAFETY: `path` is a valid NUL-terminated UTF-16 string allocated by
+    // the shell call above; it is copied out and freed with CoTaskMemFree
+    // immediately after.
+    let resolved = unsafe { path.to_string() }.context("ProgramData path is not valid UTF-16")?;
+    unsafe { CoTaskMemFree(Some(path.0 as *const c_void)) };
+    Ok(PathBuf::from(resolved))
+}
+
+/// Create the state directory with a SYSTEM + Administrators-only ACL. The
+/// SDDL string builds a protected DACL granting full access to SYSTEM and
+/// the Administrators group only, inherited by everything created below
+/// (including route_state.json); non-admin users get nothing.
+fn ensure_state_dir(dir: &Path) -> Result<()> {
+    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)"),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .context("failed to build security descriptor for the state directory")?;
+    // Frees the descriptor on every exit path below.
+    let _guard = LocalFreeGuard(descriptor.0);
+
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    let wide = wide_path(dir);
+    match unsafe { CreateDirectoryW(PCWSTR::from_raw(wide.as_ptr()), Some(&attributes)) } {
+        Ok(()) => return Ok(()),
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to create {}", dir.display()));
+        }
+    }
+    // The directory already existed: it must at least be a real directory,
+    // not a junction planted to redirect our writes somewhere else.
+    if get_file_attributes(dir)? & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        bail!(
+            "refusing to use {}: it is a reparse point/junction",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// A state file is trusted only if it is a plain file (no reparse point:
+/// junctions, symlinks or placeholder files could redirect the elevated
+/// process elsewhere) and is owned by SYSTEM or the Administrators group —
+/// matching the ACL the directory is created with.
+fn validate_state_file(path: &Path) -> Result<()> {
+    if get_file_attributes(path)? & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        bail!("file is a reparse point/junction");
+    }
+
+    let wide = wide_path(path);
+    let mut owner = PSID(std::ptr::null_mut());
+    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR::from_raw(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+    };
+    check(err, "GetNamedSecurityInfoW")?;
+    // Frees the security descriptor on every exit path below.
+    let _guard = LocalFreeGuard(descriptor.0);
+    if owner.0.is_null() {
+        bail!("file has no owner SID");
+    }
+
+    // EqualSid reports equality as Ok(()) and inequality as Err, which is
+    // all the comparison needs; the error carries no extra information.
+    let trusted = [WinLocalSystemSid, WinBuiltinAdministratorsSid]
+        .into_iter()
+        .filter_map(|kind| well_known_sid(kind).ok())
+        .any(|sid| unsafe { EqualSid(owner, PSID(sid.as_ptr() as *mut c_void)) }.is_ok());
+    if !trusted {
+        bail!("file owner is neither SYSTEM nor Administrators");
+    }
+    Ok(())
+}
+
+fn get_file_attributes(path: &Path) -> Result<u32> {
+    let wide = wide_path(path);
+    let attrs = unsafe { GetFileAttributesW(PCWSTR::from_raw(wide.as_ptr())) };
+    if attrs == INVALID_FILE_ATTRIBUTES {
+        return Err(windows::core::Error::from_win32())
+            .with_context(|| format!("GetFileAttributesW failed for {}", path.display()));
+    }
+    Ok(attrs)
+}
+
+/// Bytes of a well-known SID (e.g. SYSTEM, Administrators), sized via the
+/// required two-call CreateWellKnownSid pattern.
+fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> Result<Vec<u8>> {
+    let mut size = 0u32;
+    // Expected to fail with ERROR_INSUFFICIENT_BUFFER while filling `size`.
+    let _ = unsafe { CreateWellKnownSid(kind, None, None, &mut size) };
+    if size == 0 {
+        bail!(
+            "CreateWellKnownSid did not report a size for SID type {}",
+            kind.0
+        );
+    }
+    let mut sid = vec![0u8; size as usize];
+    unsafe {
+        CreateWellKnownSid(
+            kind,
+            None,
+            Some(PSID(sid.as_mut_ptr() as *mut c_void)),
+            &mut size,
+        )
+    }
+    .context("CreateWellKnownSid failed")?;
+    Ok(sid)
+}
+
+/// Frees a local allocation (security descriptors returned by
+/// GetNamedSecurityInfoW / ConvertStringSecurityDescriptorToSecurityDescriptorW)
+/// on every exit path.
+struct LocalFreeGuard(*mut c_void);
+
+impl Drop for LocalFreeGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0)));
+            }
+        }
+    }
+}
+
+/// NUL-terminated UTF-16 encoding of a path for the Win32 wide APIs.
+fn wide_path(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// Best-effort reversal of every recorded change, in reverse order of

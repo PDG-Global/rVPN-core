@@ -114,10 +114,13 @@ windows = { version = "0.61", features = [
     "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Rpc",
+    "Win32_UI_Shell",
 ] }
 
 [dev-dependencies]
