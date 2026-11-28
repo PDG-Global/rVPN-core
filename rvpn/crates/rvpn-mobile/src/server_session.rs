@@ -886,21 +886,28 @@ impl ServerSession {
                 let (shared_secret, _, ratchet_version) = initiator
                     .agree(&validated.bundle)
                     .context("X3DH key agreement failed")?;
-                validated.commit(&self.security);
 
                 // Third flight (S1): ClientAuth admission proof, then
-                // ServerAccept (or the pending_approval refusal).
+                // ServerAccept (or the pending_approval refusal). The
+                // transcript binds the WIRE keys; extract them before
+                // commit() consumes the validated bundle.
+                let wire_identity_x25519 = validated.bundle.identity_x25519_key;
+                let wire_signed_prekey = validated.bundle.signed_prekey;
+                let wire_prekey_signature = validated.bundle.prekey_signature;
+                let wire_caps = validated.bundle.capabilities;
+                validated.commit(&self.security);
+
                 let kc = rvpn_core::crypto::admission::derive_confirm_key(&shared_secret);
                 let transcript = rvpn_core::crypto::admission::transcript(
                     &identity_public,
                     &ephemeral_public,
                     &None,
                     rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
-                    &validated.bundle.identity_x25519_key,
+                    &wire_identity_x25519,
                     &[],
-                    &validated.bundle.signed_prekey,
-                    &validated.bundle.prekey_signature,
-                    validated.bundle.capabilities,
+                    &wire_signed_prekey,
+                    &wire_prekey_signature,
+                    wire_caps,
                 );
                 let mac = rvpn_core::crypto::admission::compute_mac(&kc, &transcript);
                 let client_auth = HandshakeMessage::ClientAuth {
