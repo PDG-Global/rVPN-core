@@ -1,11 +1,11 @@
 //! Server connection tests
 
-use std::time::Duration;
 use rvpn_core::crypto::RatchetVersion;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 
-use rvpn_core::protocol::{HandshakeMessage, ProtocolVersion, AuthMethod};
+use rvpn_core::protocol::{AuthMethod, HandshakeMessage, ProtocolVersion};
 
 /// Test basic server startup
 #[tokio::test]
@@ -13,7 +13,8 @@ async fn test_server_startup() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let mut config = crate::config::ServerConfig::default();
     crate::tests::fixtures::configure_test_keys(&mut config, directory.path());
-    let _handler = crate::handler::VpnHandler::new(config)?;
+    let _handler =
+        crate::handler::VpnHandler::new(config, crate::admission::Admission::disabled())?;
 
     // Just verify we can create the handler
     Ok(())
@@ -60,7 +61,9 @@ async fn test_handshake_message() -> anyhow::Result<()> {
         ephemeral_key: Some(vec![1, 2, 3]),
         identity_key: Some(vec![4, 5, 6]),
         session_token: None,
-        connection_nonce: Some(vec![7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]),
+        connection_nonce: Some(vec![
+            7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+        ]),
         capabilities: Some(rvpn_core::crypto::x3dh::CAP_RATCHET_V2),
     };
 
@@ -72,7 +75,12 @@ async fn test_handshake_message() -> anyhow::Result<()> {
 
     // Verify
     match parsed {
-        HandshakeMessage::Hello { version, auth_method, ephemeral_key, .. } => {
+        HandshakeMessage::Hello {
+            version,
+            auth_method,
+            ephemeral_key,
+            ..
+        } => {
             assert_eq!(version, ProtocolVersion::CURRENT);
             assert_eq!(auth_method, AuthMethod::X3DH);
             assert!(ephemeral_key.is_some());
@@ -116,7 +124,9 @@ type ClientWsStream =
 /// (pad to 1KB boundary, ratchet-encrypt with payload type 0x01).
 fn client_frame(ratchet: &mut rvpn_core::crypto::DoubleRatchet, data: &[u8]) -> Vec<u8> {
     let padded = rvpn_core::protocol::padding::pad_packet(data).expect("padding failed");
-    let message = ratchet.encrypt(&padded, &[0x01]).expect("encryption failed");
+    let message = ratchet
+        .encrypt(&padded, &[0x01])
+        .expect("encryption failed");
     message.to_bytes().expect("serialization failed")
 }
 
@@ -161,7 +171,7 @@ async fn relay_test_rig(
     let key_directory = tempfile::tempdir()?;
     let mut config = crate::config::ServerConfig::default();
     crate::tests::fixtures::configure_test_keys(&mut config, key_directory.path());
-    let handler = crate::handler::VpnHandler::new(config)?;
+    let handler = crate::handler::VpnHandler::new(config, crate::admission::Admission::disabled())?;
 
     // TCP origin the relay will target.
     let target_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -191,8 +201,7 @@ async fn relay_test_rig(
         tokio_tungstenite::accept_async(stream).await.unwrap()
     });
 
-    let (client_ws, _resp) =
-        tokio_tungstenite::connect_async(format!("ws://{}/", ws_addr)).await?;
+    let (client_ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{}/", ws_addr)).await?;
     let server_ws = accept_task.await?;
 
     let (ws_write, ws_read) = server_ws.split();
@@ -294,9 +303,9 @@ async fn test_relay_tcp_sends_close_when_target_closes() -> anyhow::Result<()> {
 #[test]
 fn test_append_tun_frame_roundtrip() {
     let packets: Vec<Vec<u8>> = vec![
-        vec![0x45, 0x00, 0x00, 0x14],          // tiny (ACK-like)
-        vec![0xAB; 1400],                       // full MTU
-        vec![0x01, 0x02, 0x03],                 // small
+        vec![0x45, 0x00, 0x00, 0x14], // tiny (ACK-like)
+        vec![0xAB; 1400],             // full MTU
+        vec![0x01, 0x02, 0x03],       // small
     ];
 
     let mut buf = Vec::new();
@@ -329,8 +338,7 @@ async fn test_tun_response_loop_batches_packets() -> anyhow::Result<()> {
         let (stream, _) = ws_listener.accept().await.unwrap();
         tokio_tungstenite::accept_async(stream).await.unwrap()
     });
-    let (client_ws, _resp) =
-        tokio_tungstenite::connect_async(format!("ws://{}/", ws_addr)).await?;
+    let (client_ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{}/", ws_addr)).await?;
     let server_ws = accept_task.await?;
 
     let (ws_write, _server_read) = server_ws.split();
@@ -338,7 +346,8 @@ async fn test_tun_response_loop_batches_packets() -> anyhow::Result<()> {
 
     // Paired ratchets: server encrypts as Bob, test decrypts as Alice.
     let secret = [99u8; 32];
-    let mut alice = rvpn_core::crypto::DoubleRatchet::init_alice(secret, [0u8; 32], RatchetVersion::V1);
+    let mut alice =
+        rvpn_core::crypto::DoubleRatchet::init_alice(secret, [0u8; 32], RatchetVersion::V1);
     let bob = rvpn_core::crypto::DoubleRatchet::init_bob(secret, RatchetVersion::V1);
     let bob = std::sync::Arc::new(tokio::sync::Mutex::new(bob));
 
@@ -385,7 +394,11 @@ async fn test_tun_response_loop_batches_packets() -> anyhow::Result<()> {
         let decrypted = alice.decrypt(&ratchet_msg, &[0x01])?;
         let unpadded = rvpn_core::protocol::padding::unpad_packet(&decrypted)?;
         let (frames, consumed) = rvpn_core::protocol::multiplex::parse_frames(&unpadded);
-        assert_eq!(consumed, unpadded.len(), "trailing bytes in batch plaintext");
+        assert_eq!(
+            consumed,
+            unpadded.len(),
+            "trailing bytes in batch plaintext"
+        );
         assert!(
             frames.len() <= 16,
             "batch exceeds TUN_BATCH_MAX_FRAMES: {}",
@@ -410,7 +423,7 @@ async fn test_tun_response_loop_batches_packets() -> anyhow::Result<()> {
 
 // ── Credit-based per-flow flow control ─────────────────────────────
 
-use crate::handler::{FlowMap, MuxMessage, MultiplexerSession, ServerFlow};
+use crate::handler::{FlowMap, MultiplexerSession, MuxMessage, ServerFlow};
 use bytes::Bytes;
 use rvpn_core::protocol::multiplex::{
     ControlMessage, FlowSendCredits, FLOW_CREDIT_STALL_TIMEOUT, INITIAL_FLOW_WINDOW,
@@ -609,9 +622,7 @@ async fn test_flow_relay_respects_send_credits() -> anyhow::Result<()> {
 
     // The target sends twice the window.
     let window = INITIAL_FLOW_WINDOW as usize;
-    let writer = tokio::spawn(async move {
-        peer.write_all(&vec![0xABu8; window * 2]).await
-    });
+    let writer = tokio::spawn(async move { peer.write_all(&vec![0xABu8; window * 2]).await });
 
     // Exactly one window's worth of data may arrive; then the relay stalls.
     let mut received = 0usize;
@@ -777,8 +788,7 @@ async fn test_ws_sender_prioritizes_control() -> anyhow::Result<()> {
         let (stream, _) = ws_listener.accept().await.unwrap();
         tokio_tungstenite::accept_async(stream).await.unwrap()
     });
-    let (client_ws, _resp) =
-        tokio_tungstenite::connect_async(format!("ws://{}/", ws_addr)).await?;
+    let (client_ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{}/", ws_addr)).await?;
     let server_ws = accept_task.await?;
 
     let (ws_write, _server_read) = server_ws.split();
@@ -786,7 +796,8 @@ async fn test_ws_sender_prioritizes_control() -> anyhow::Result<()> {
 
     // Paired ratchets: server encrypts as Bob, test decrypts as Alice.
     let secret = [7u8; 32];
-    let mut alice = rvpn_core::crypto::DoubleRatchet::init_alice(secret, [0u8; 32], RatchetVersion::V1);
+    let mut alice =
+        rvpn_core::crypto::DoubleRatchet::init_alice(secret, [0u8; 32], RatchetVersion::V1);
     let bob = std::sync::Arc::new(tokio::sync::Mutex::new(
         rvpn_core::crypto::DoubleRatchet::init_bob(secret, RatchetVersion::V1),
     ));
@@ -876,7 +887,10 @@ async fn dns_responses_preserve_wire_order_under_contention() -> anyhow::Result<
     // Server encrypts as Bob; the test decrypts as Alice in wire order.
     let secret = [9u8; 32];
     let mut alice = DoubleRatchet::init_alice(secret, [0u8; 32], RatchetVersion::V1);
-    let bob = Arc::new(tokio::sync::Mutex::new(DoubleRatchet::init_bob(secret, RatchetVersion::V1)));
+    let bob = Arc::new(tokio::sync::Mutex::new(DoubleRatchet::init_bob(
+        secret,
+        RatchetVersion::V1,
+    )));
     let send_lock = Arc::new(tokio::sync::Mutex::new(()));
     // Capacity 1 forces send awaits → maximal interleaving between tasks.
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(1);

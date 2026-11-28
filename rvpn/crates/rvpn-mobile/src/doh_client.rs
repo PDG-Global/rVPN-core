@@ -676,9 +676,71 @@ async fn perform_handshake(
             let (shared_secret, _, ratchet_version) = initiator
                 .agree(&validated.bundle)
                 .context("X3DH key agreement failed")?;
+
+            // Third flight (S1): ClientAuth admission proof, then
+            // ServerAccept (or the pending_approval refusal).
+            let wire_identity_ed25519 = validated.bundle.identity_key;
+            let wire_identity_x25519 = validated.bundle.identity_x25519_key;
+            let wire_signed_prekey = validated.bundle.signed_prekey;
+            let wire_prekey_signature = validated.bundle.prekey_signature;
+            let wire_caps = validated.bundle.capabilities;
             validated.commit(security);
 
-            Ok(DoubleRatchet::init_alice(shared_secret, [0u8; 32], ratchet_version))
+            let kc = rvpn_core::crypto::admission::derive_confirm_key(&shared_secret);
+            let transcript = rvpn_core::crypto::admission::transcript(
+                &identity_public,
+                &ephemeral_public,
+                &None,
+                rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                &wire_identity_ed25519,
+                &wire_identity_x25519,
+                &[],
+                &wire_signed_prekey,
+                &wire_prekey_signature,
+                wire_caps,
+            );
+            let mac = rvpn_core::crypto::admission::compute_mac(&kc, &transcript);
+            let client_auth = HandshakeMessage::ClientAuth {
+                encrypted_data: Vec::new(),
+                identity: None,
+                admission_mac: Some(mac.to_vec()),
+            };
+            ws_writer
+                .send(Message::Binary(
+                    serde_json::to_vec(&client_auth).context("Failed to serialize ClientAuth")?,
+                ))
+                .await
+                .context("Failed to send ClientAuth")?;
+
+            let accept = timeout(Duration::from_secs(5), ws_reader.next())
+                .await
+                .context("DNS ServerAccept timeout (5s)")?
+                .ok_or_else(|| anyhow::anyhow!("WebSocket closed before ServerAccept"))?
+                .context("WebSocket error waiting for ServerAccept")?;
+            match accept {
+                Message::Binary(data) => {
+                    match serde_json::from_slice::<HandshakeMessage>(&data)
+                        .context("Failed to parse ServerAccept")?
+                    {
+                        HandshakeMessage::ServerAccept { .. } => {}
+                        HandshakeMessage::Error { code, message }
+                            if code == rvpn_core::crypto::admission::REFUSAL_CODE =>
+                        {
+                            return Err(anyhow::anyhow!(
+                                "server refused this client key: {message}"
+                            ));
+                        }
+                        _ => return Err(anyhow::anyhow!("expected ServerAccept from server")),
+                    }
+                }
+                _ => return Err(anyhow::anyhow!("expected binary ServerAccept message")),
+            }
+
+            Ok(DoubleRatchet::init_alice(
+                shared_secret,
+                [0u8; 32],
+                ratchet_version,
+            ))
         }
         _ => Err(anyhow::anyhow!("Expected binary message during handshake")),
     }

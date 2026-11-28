@@ -27,6 +27,7 @@ http.workspace = true
 
 # Crypto
 sha2.workspace = true
+libc.workspace = true
 
 # TLS
 rustls.workspace = true

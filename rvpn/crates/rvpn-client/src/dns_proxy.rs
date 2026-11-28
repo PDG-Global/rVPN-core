@@ -295,7 +295,10 @@ impl DnsProxy {
                                     {
                                         Ok(wire) => wire,
                                         Err(e) => {
-                                            warn!("DNS proxy: local resolution failed for {} (type={}): {}", domain, qtype, e);
+                                            warn!(
+                                                "DNS proxy: local resolution failed for {} (type={}): {}",
+                                                domain, qtype, e
+                                            );
                                             build_dns_servfail(&data, dns_txid)
                                         }
                                     };
@@ -370,7 +373,10 @@ impl DnsProxy {
                                                 query_start.elapsed(),
                                             );
                                             if let Err(e) = socket_clone.send_to(&wire, src).await {
-                                                debug!("DNS proxy: failed to send cached response to {}: {}", src, e);
+                                                debug!(
+                                                    "DNS proxy: failed to send cached response to {}: {}",
+                                                    src, e
+                                                );
                                             }
                                             return;
                                         }
@@ -763,6 +769,62 @@ async fn dns_handshake(
                     let (shared_secret, _, ratchet_version) = initiator
                         .agree(&received_bundle)
                         .context("X3DH key agreement failed")?;
+
+                    // Third flight (S1): ClientAuth admission proof, then
+                    // ServerAccept (or the pending_approval refusal).
+                    let kc = rvpn_core::crypto::admission::derive_confirm_key(&shared_secret);
+                    let transcript = rvpn_core::crypto::admission::transcript(
+                        &identity_public,
+                        &ephemeral_public,
+                        &None,
+                        rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                        &received_bundle.identity_key,
+                        &received_bundle.identity_x25519_key,
+                        &[],
+                        &server_signed_prekey,
+                        &prekey_signature_bytes,
+                        server_capabilities.unwrap_or(0),
+                    );
+                    let mac = rvpn_core::crypto::admission::compute_mac(&kc, &transcript);
+                    let client_auth = HandshakeMessage::ClientAuth {
+                        encrypted_data: Vec::new(),
+                        identity: None,
+                        admission_mac: Some(mac.to_vec()),
+                    };
+                    writer
+                        .send(Message::Binary(
+                            serde_json::to_vec(&client_auth)
+                                .context("Failed to serialize ClientAuth")?,
+                        ))
+                        .await
+                        .context("Failed to send ClientAuth")?;
+
+                    let accept = tokio::time::timeout(Duration::from_secs(15), reader.recv())
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "DNS handshake: timed out waiting for ServerAccept (15s)"
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("DNS WebSocket closed before ServerAccept")
+                        })?;
+                    match accept {
+                        Message::Binary(data) => {
+                            match serde_json::from_slice::<HandshakeMessage>(&data)
+                                .context("Failed to parse ServerAccept")?
+                            {
+                                HandshakeMessage::ServerAccept { .. } => {}
+                                HandshakeMessage::Error { code, message }
+                                    if code == rvpn_core::crypto::admission::REFUSAL_CODE =>
+                                {
+                                    anyhow::bail!("server refused this client key: {message}");
+                                }
+                                _ => anyhow::bail!("expected ServerAccept from server"),
+                            }
+                        }
+                        _ => anyhow::bail!("expected binary ServerAccept message"),
+                    }
 
                     // In X3DH, the server (Bob) doesn't generate an ephemeral key.
                     // We pass zeros since init_alice doesn't use this parameter.

@@ -1,5 +1,6 @@
 //! R-VPN Server Library
 
+pub mod admission;
 pub mod config;
 pub mod decoy;
 pub mod egress;

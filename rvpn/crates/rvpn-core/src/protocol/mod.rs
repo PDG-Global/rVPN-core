@@ -135,7 +135,12 @@ pub enum HandshakeMessage {
         capabilities: Option<u32>,
     },
 
-    /// Client authentication proof
+    /// Client authentication proof. For v2-capable clients this carries the
+    /// admission key-confirmation MAC (see
+    /// `rvpn_core::crypto::admission`), sent as the third handshake flight
+    /// after ServerHello. The server allocates nothing and registers no
+    /// session until it verifies, and answers ServerAccept only after
+    /// admission passes.
     ClientAuth {
         /// Encrypted authentication data
         #[serde(with = "serde_bytes")]
@@ -143,6 +148,10 @@ pub enum HandshakeMessage {
         /// Client identity (if not anonymous)
         #[serde(with = "serde_bytes")]
         identity: Option<Vec<u8>>,
+        /// Admission key-confirmation MAC over the full handshake
+        /// transcript (Hello + ServerHello). Present in v2-capable clients.
+        #[serde(default, with = "serde_bytes")]
+        admission_mac: Option<Vec<u8>>,
     },
 
     /// Server authentication acceptance

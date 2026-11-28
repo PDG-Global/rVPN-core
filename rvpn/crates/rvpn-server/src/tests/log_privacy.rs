@@ -23,6 +23,7 @@
 /// Every non-test source file in `src/`; `every_server_source_is_scanned` fails
 /// when a new file is added without being listed here.
 const SOURCES: &[(&str, &str)] = &[
+    ("admission.rs", include_str!("../admission.rs")),
     ("config.rs", include_str!("../config.rs")),
     ("decoy.rs", include_str!("../decoy.rs")),
     ("egress.rs", include_str!("../egress.rs")),

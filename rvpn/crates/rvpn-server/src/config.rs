@@ -74,6 +74,12 @@ pub struct ServerConfig {
     #[serde(default)]
     pub prekey_bundle_file: Option<PathBuf>,
 
+    /// Client admission control (deny-by-default allow-list). Disabled by
+    /// default: pre-#32 behaviour, nothing changes until an operator turns
+    /// it on. See `admission.rs` for the model.
+    #[serde(default)]
+    pub admission: AdmissionConfig,
+
     /// Automatic TLS certificates via Let's Encrypt (ACME TLS-ALPN-01).
     /// When enabled, the server obtains and renews certs itself — no proxy needed.
     #[serde(default)]
@@ -98,6 +104,7 @@ impl Default for ServerConfig {
             network: NetworkConfig::default(),
             tun: TunNetworkConfig::default(),
             prekey_bundle_file: None,
+            admission: AdmissionConfig::default(),
             acme: AcmeConfig::default(),
         }
     }
@@ -367,4 +374,61 @@ fn default_tun_mtu() -> u16 {
 
 fn default_tun_name() -> String {
     "tun0".to_string()
+}
+
+/// Client admission configuration. `enabled=false` (default) admits every
+/// client key — the pre-#32 behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionConfig {
+    /// Turn deny-by-default admission on.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Starting mode: "learn" (admit + record, rollout phase 1) or
+    /// "enforce" (deny unknown keys). The allow-list file's own `mode`
+    /// field wins over this once set, so operators can flip without a
+    /// restart.
+    #[serde(default = "default_admission_mode")]
+    pub mode: String,
+
+    /// Allow-list file (root 0600, written atomically).
+    #[serde(default = "default_admission_allow_file")]
+    pub allow_file: PathBuf,
+
+    /// Pending-list file (refused keys: fingerprint + timestamps only).
+    #[serde(default = "default_admission_pending_file")]
+    pub pending_file: PathBuf,
+
+    /// Audit log (append-only, root 0600): every approve/revoke/mode change.
+    #[serde(default = "default_admission_audit_file")]
+    pub audit_file: PathBuf,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_admission_mode(),
+            allow_file: default_admission_allow_file(),
+            pending_file: default_admission_pending_file(),
+            audit_file: default_admission_audit_file(),
+        }
+    }
+}
+
+fn default_admission_mode() -> String {
+    "learn".to_string()
+}
+
+fn default_admission_allow_file() -> PathBuf {
+    PathBuf::from("/usr/local/etc/rvpn/clients.json")
+}
+
+fn default_admission_pending_file() -> PathBuf {
+    PathBuf::from("/usr/local/etc/rvpn/clients-pending.json")
+}
+
+fn default_admission_audit_file() -> PathBuf {
+    PathBuf::from("/usr/local/etc/rvpn/clients-audit.log")
 }

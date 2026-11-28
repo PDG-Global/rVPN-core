@@ -8,6 +8,7 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::SigningKey;
 use rand::SeedableRng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 
 use super::{hkdf_derive, EphemeralKey, IdentityKey, SharedSecret};
@@ -149,8 +150,7 @@ pub fn negotiate_version(
     }
     match side {
         NegotiationSide::Client => Err(crate::Error::HandshakeFailed(
-            "server does not speak ratchet v2; a v2-capable client refuses v1"
-                .to_string(),
+            "server does not speak ratchet v2; a v2-capable client refuses v1".to_string(),
         )),
         NegotiationSide::Server if now_unix < V1_SUNSET_UNIX => {
             Ok(super::ratchet::RatchetVersion::V1)
@@ -333,24 +333,25 @@ impl X3DHInitiator {
             X25519PublicKey::from(&X25519StaticSecret::from(ik_client_x25519_private));
 
         // DH1: IK_client * SPK_server
-        let dh1 = x25519_diffie_hellman(&ik_client_x25519_private, &server_bundle.signed_prekey);
+        let dh1 = x25519_diffie_hellman(&ik_client_x25519_private, &server_bundle.signed_prekey)?;
 
         // DH2: EK_client * IK_server (using the X25519 identity key from server)
         let dh2 = x25519_diffie_hellman(
             &self.ephemeral_key.private_key.to_bytes(),
             &server_bundle.identity_x25519_key,
-        );
+        )?;
 
         // DH3: EK_client * SPK_server
         let dh3 = x25519_diffie_hellman(
             &self.ephemeral_key.private_key.to_bytes(),
             &server_bundle.signed_prekey,
-        );
+        )?;
 
         // DH4: EK_client * OPK_server (if available)
         let dh4 = server_bundle
             .one_time_prekey
-            .map(|opk| x25519_diffie_hellman(&self.ephemeral_key.private_key.to_bytes(), &opk));
+            .map(|opk| x25519_diffie_hellman(&self.ephemeral_key.private_key.to_bytes(), &opk))
+            .transpose()?;
 
         // Concatenate DH results
         let mut dh_concat = Vec::with_capacity(32 * if dh4.is_some() { 4 } else { 3 });
@@ -370,8 +371,7 @@ impl X3DHInitiator {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let version =
-            negotiate_version(NegotiationSide::Client, client_caps, server_caps, now)?;
+        let version = negotiate_version(NegotiationSide::Client, client_caps, server_caps, now)?;
         let shared_secret = derive_session_secret(&dh_concat, client_caps, server_caps, version);
 
         let material = X3DHMaterial {
@@ -485,23 +485,28 @@ impl X3DHResponder {
         used_one_time_prekey: bool,
         client_caps: u32,
     ) -> crate::Result<(SharedSecret, super::ratchet::RatchetVersion)> {
+        // Contributory checks on the client-supplied keys: canonical, not
+        // low-order, and every DH output contributory (S1).
+        validate_x25519_public_key(client_identity_x25519)?;
+        validate_x25519_public_key(client_ephemeral)?;
+
         // DH1: SPK_server * IK_client
         let dh1 = x25519_diffie_hellman(
             &self.private_bundle.signed_prekey.to_bytes(),
             client_identity_x25519,
-        );
+        )?;
 
         // DH2: IK_server * EK_client
         let dh2 = x25519_diffie_hellman(
             &self.private_bundle.identity_x25519_key.to_bytes(),
             client_ephemeral,
-        );
+        )?;
 
         // DH3: SPK_server * EK_client
         let dh3 = x25519_diffie_hellman(
             &self.private_bundle.signed_prekey.to_bytes(),
             client_ephemeral,
-        );
+        )?;
 
         // DH4: OPK_server * EK_client (if client used an OTPK)
         let dh4 = if used_one_time_prekey {
@@ -509,6 +514,7 @@ impl X3DHResponder {
                 .one_time_prekey
                 .as_ref()
                 .map(|opk| x25519_diffie_hellman(&opk.to_bytes(), client_ephemeral))
+                .transpose()?
         } else {
             None
         };
@@ -527,8 +533,7 @@ impl X3DHResponder {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let version =
-            negotiate_version(NegotiationSide::Server, client_caps, server_caps, now)?;
+        let version = negotiate_version(NegotiationSide::Server, client_caps, server_caps, now)?;
         let shared_secret = derive_session_secret(&dh_concat, client_caps, server_caps, version);
 
         Ok((shared_secret, version))
@@ -572,7 +577,7 @@ impl X3DHResponder {
             // `rvpn_server::main::prekey_bundle`.
             identity_key_version: 1,
             rotation_signature: None,
-                   capabilities: CAP_RATCHET_V2,
+            capabilities: CAP_RATCHET_V2,
         }
     }
 
@@ -629,11 +634,94 @@ pub struct X3DHMaterial {
     pub capabilities: u32,
 }
 
-/// Perform X25519 Diffie-Hellman
-fn x25519_diffie_hellman(private_key: &[u8; 32], public_key: &[u8; 32]) -> [u8; 32] {
+/// The X25519 field prime p = 2^255 - 19, little-endian. Public keys MUST
+/// be canonical (< p); the top range is a non-canonical encoding of the
+/// same points.
+const X25519_P_LE: [u8; 32] = [
+    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+];
+
+/// Known low-order X25519 public keys (RFC 7748 / libsodium blocklist).
+/// Any of these as a peer key makes the DH output non-contributory.
+const X25519_LOW_ORDER: [[u8; 32]; 7] = [
+    [0u8; 32],
+    [
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+    ],
+    [
+        0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4,
+        0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49,
+        0xb8, 0x00,
+    ],
+    [
+        0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef,
+        0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f,
+        0x11, 0x57,
+    ],
+    [
+        0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    [
+        0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+    [
+        0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f,
+    ],
+];
+
+/// Validate a received X25519 public key: canonical (< p) and not a known
+/// low-order point. Both ends of an agree() run this on every wire key.
+fn validate_x25519_public_key(public_key: &[u8; 32]) -> crate::Result<()> {
+    // Canonical: LE integer must be < p. Compare from the top byte down.
+    let mut ge = false;
+    let mut eq = true;
+    for i in (0..32).rev() {
+        if eq {
+            if public_key[i] > X25519_P_LE[i] {
+                ge = true;
+                eq = false;
+            } else if public_key[i] < X25519_P_LE[i] {
+                eq = false;
+            }
+        }
+    }
+    if ge || eq {
+        return Err(crate::Error::HandshakeFailed(
+            "non-canonical X25519 public key".to_string(),
+        ));
+    }
+    for low in X25519_LOW_ORDER.iter() {
+        if bool::from(public_key.ct_eq(low)) {
+            return Err(crate::Error::HandshakeFailed(
+                "low-order X25519 public key".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Perform X25519 Diffie-Hellman with the contributory check: an all-zero
+/// output means the peer key was low-order, and the session must not be
+/// built on a non-contributory secret.
+fn x25519_diffie_hellman(private_key: &[u8; 32], public_key: &[u8; 32]) -> crate::Result<[u8; 32]> {
+    validate_x25519_public_key(public_key)?;
     let private = X25519StaticSecret::from(*private_key);
     let public = X25519PublicKey::from(*public_key);
-    *private.diffie_hellman(&public).as_bytes()
+    let out = *private.diffie_hellman(&public).as_bytes();
+    if bool::from(out.ct_eq(&[0u8; 32])) {
+        return Err(crate::Error::HandshakeFailed(
+            "non-contributory X25519 output".to_string(),
+        ));
+    }
+    Ok(out)
 }
 
 /// Derive shared secret from DH results
@@ -647,6 +735,77 @@ fn derive_shared_secret(dh_results: &[u8]) -> SharedSecret {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contributory pin (S1): a low-order or non-canonical client key must
+    /// fail the agreement, so a learned "identity" that is actually a
+    /// low-order point can never complete a session.
+    #[test]
+    fn low_order_and_noncanonical_keys_are_rejected() {
+        let responder = X3DHResponder::new();
+        // All-zero identity key (low-order).
+        assert!(
+            responder.agree(&[0u8; 32], &[9u8; 32], false, 0).is_err(),
+            "all-zero identity key must be rejected"
+        );
+        // Identity key = 1 (low-order).
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        assert!(
+            responder.agree(&one, &[9u8; 32], false, 0).is_err(),
+            "low-order identity key must be rejected"
+        );
+        // Non-canonical identity key (>= p): p itself.
+        let p_le = crate::crypto::x3dh::X25519_P_LE;
+        assert!(
+            responder.agree(&p_le, &[9u8; 32], false, 0).is_err(),
+            "non-canonical identity key must be rejected"
+        );
+        // Low-order ephemeral.
+        let valid_ik = X25519PublicKey::from(&X25519StaticSecret::from([42u8; 32])).to_bytes();
+        assert!(
+            responder.agree(&valid_ik, &[0u8; 32], false, 0).is_err(),
+            "low-order ephemeral key must be rejected"
+        );
+        // A valid key pair still agrees.
+        let valid_ek = X25519PublicKey::from(&X25519StaticSecret::from([43u8; 32])).to_bytes();
+        assert!(
+            responder.agree(&valid_ik, &valid_ek, false, 0).is_ok(),
+            "valid keys must still complete"
+        );
+    }
+
+    /// Blocklist self-validation: EVERY entry of X25519_LOW_ORDER must be
+    /// a genuine contributory point — X25519(11, entry) == 0 — so a typo'd
+    /// entry can never rot into dead weight (review nit: entry 3 once
+    /// wasn't a low-order point at all). And every entry must be rejected
+    /// by the validator.
+    #[test]
+    fn low_order_blocklist_is_self_validating() {
+        let scalar = X25519StaticSecret::from({
+            let mut s = [0u8; 32];
+            s[0] = 11;
+            s
+        });
+        for entry in X25519_LOW_ORDER.iter() {
+            let out = scalar.diffie_hellman(&X25519PublicKey::from(*entry));
+            assert!(
+                out.as_bytes().iter().all(|b| *b == 0),
+                "blocklist entry {:02x?}… is NOT a contributory point",
+                &entry[..4]
+            );
+            assert!(
+                validate_x25519_public_key(entry).is_err(),
+                "blocklist entry {:02x?}… must be rejected",
+                &entry[..4]
+            );
+        }
+        // Control: the basepoint is neither blocked nor contributory.
+        let mut nine = [0u8; 32];
+        nine[0] = 9;
+        let out = scalar.diffie_hellman(&X25519PublicKey::from(nine));
+        assert!(!out.as_bytes().iter().all(|b| *b == 0));
+        assert!(validate_x25519_public_key(&nine).is_ok());
+    }
 
     /// New bundles serialize both TOFU fields (version + optional rotation
     /// signature); a legacy bundle JSON that predates the format bump
@@ -797,32 +956,17 @@ mod tests {
         // Create initiator (client)
         let initiator = X3DHInitiator::new();
 
-        // Client performs X3DH with the broken bundle (missing identity_x25519_key)
-        let (client_secret, material, _version) = initiator.agree(&server_bundle_broken).unwrap();
-
-        // Server performs X3DH with its actual keys
-        let server_secret = responder
-            .agree(
-                &material.identity_x25519_public,
-                &material.ephemeral_public,
-                false, // no OTPK used
-                material.capabilities,
-            )
-            .unwrap();
-
-        // This will FAIL because the client used [0u8; 32] for IK_server
-        // but the server used its actual identity_x25519_key
-        println!("Client secret: {:?}", hex::encode(&client_secret[..8]));
-        println!("Server secret: {:?}", hex::encode(&server_secret.0[..8]));
-
-        // This assertion should fail, demonstrating the bug
-        if client_secret != server_secret.0 {
-            println!("BUG REPRODUCED: Client and server secrets don't match!");
-            println!("This happens when identity_x25519_key is missing from the prekey bundle");
-        }
-
-        // For the test, we expect them to be different (demonstrating the bug)
-        assert_ne!(client_secret, server_secret.0, "This demonstrates the bug - secrets should NOT match when identity_x25519_key is missing");
+        // With the contributory check (S1), the broken bundle is refused up
+        // front: identity_x25519_key = [0u8; 32] is a low-order point, so
+        // the initiator's agreement FAILS instead of deriving a secret that
+        // can never match the server's. That is strictly stronger than the
+        // old outcome (mismatched secrets discovered after the handshake).
+        let result = initiator.agree(&server_bundle_broken);
+        assert!(
+            result.is_err(),
+            "a missing (zeroed) identity_x25519_key must fail the handshake, not derive a dead secret"
+        );
+        let _ = responder; // server side unchanged
     }
 
     /// Test that shows the fix - when identity_x25519_key is properly included
@@ -970,8 +1114,7 @@ mod q1_negotiation_tests {
         let responder = X3DHResponder::new();
         let bundle = responder.get_public_bundle();
         let json = serde_json::to_string(&bundle).unwrap();
-        let stripped: serde_json::Value =
-            serde_json::from_str(&json).unwrap();
+        let stripped: serde_json::Value = serde_json::from_str(&json).unwrap();
         let mut obj = stripped.clone();
         obj.as_object_mut().unwrap().remove("capabilities");
         let legacy: X3DHPublicBundle = serde_json::from_value(obj).unwrap();

@@ -268,8 +268,10 @@ impl Socks5Tunnel {
                 }
                 // Mark tunnel as dead so callers will reconnect
                 tunnel.alive.store(false, Ordering::SeqCst);
-                error!("SOCKS5 multiplexed tunnel marked as DEAD (age {:.1}s) — next flow will trigger reconnect",
-                       tunnel.age().as_secs_f64());
+                error!(
+                    "SOCKS5 multiplexed tunnel marked as DEAD (age {:.1}s) — next flow will trigger reconnect",
+                    tunnel.age().as_secs_f64()
+                );
 
                 // Fail all pending FlowCreated oneshots so waiting open_flow calls
                 // return immediately instead of timing out after 10 seconds.
@@ -480,10 +482,13 @@ impl Socks5Tunnel {
                             if mismatch_is_fatal(&res, cfg.reject_mismatch) {
                                 anyhow::bail!(
                                     "Server identity mismatch! Expected {}, got {}. Connection rejected.",
-                                    expected, got
+                                    expected,
+                                    got
                                 );
                             } else {
-                                tracing::warn!("Server identity mismatch — continuing because reject_mismatch = false: identity pinning is OFF for this connection (explicit dev opt-in, not safe for production)");
+                                tracing::warn!(
+                                    "Server identity mismatch — continuing because reject_mismatch = false: identity pinning is OFF for this connection (explicit dev opt-in, not safe for production)"
+                                );
                             }
                         }
                     }
@@ -492,6 +497,57 @@ impl Socks5Tunnel {
                 let (shared, _, ratchet_version) = initiator
                     .agree(&bundle)
                     .context("X3DH key agreement failed")?;
+
+                // Third flight (S1): ClientAuth admission proof, then wait
+                // for ServerAccept (or the pending_approval refusal).
+                let kc = rvpn_core::crypto::admission::derive_confirm_key(&shared);
+                let transcript = rvpn_core::crypto::admission::transcript(
+                    &identity_public,
+                    &ephemeral_public,
+                    &None,
+                    rvpn_core::crypto::x3dh::CAP_RATCHET_V2,
+                    &bundle.identity_key,
+                    &bundle.identity_x25519_key,
+                    &[],
+                    &srv_sp,
+                    &sig,
+                    server_capabilities.unwrap_or(0),
+                );
+                let mac = rvpn_core::crypto::admission::compute_mac(&kc, &transcript);
+                let client_auth = HandshakeMessage::ClientAuth {
+                    encrypted_data: Vec::new(),
+                    identity: None,
+                    admission_mac: Some(mac.to_vec()),
+                };
+                ws_writer
+                    .send(Message::Binary(
+                        serde_json::to_vec(&client_auth)
+                            .context("Failed to serialize ClientAuth")?,
+                    ))
+                    .await
+                    .context("Failed to send ClientAuth")?;
+
+                let accept = ws_reader
+                    .recv()
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("WebSocket closed before ServerAccept"))?;
+                match accept {
+                    Message::Binary(data) => {
+                        match serde_json::from_slice::<HandshakeMessage>(&data)
+                            .context("Failed to parse ServerAccept")?
+                        {
+                            HandshakeMessage::ServerAccept { .. } => {}
+                            HandshakeMessage::Error { code, message }
+                                if code == rvpn_core::crypto::admission::REFUSAL_CODE =>
+                            {
+                                anyhow::bail!("server refused this client key: {message}");
+                            }
+                            _ => anyhow::bail!("expected ServerAccept from server"),
+                        }
+                    }
+                    _ => anyhow::bail!("expected binary ServerAccept message"),
+                }
+
                 let ratchet = DoubleRatchet::init_alice(shared, [0u8; 32], ratchet_version);
                 Ok(ratchet)
             }
@@ -1148,7 +1204,7 @@ pub async fn handle_multiplexed_connection(
 mod tests {
     use super::*;
     use rvpn_core::crypto::RatchetMessage;
-use rvpn_core::crypto::RatchetVersion;
+    use rvpn_core::crypto::RatchetVersion;
     use std::collections::HashSet;
 
     /// Regression test for the production "Message too old" stall (hk2):
