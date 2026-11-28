@@ -19,11 +19,11 @@ use anyhow::{Context, Result, bail};
 use tracing::debug;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_CONDITION_VALUE0, FWP_MATCH_EQUAL,
-    FWP_UINT32, FWP_UINT64, FWP_VALUE0, FWPM_ACTION0, FWPM_CONDITION_FLAGS, FWPM_DISPLAY_DATA0,
-    FWPM_FILTER_CONDITION0, FWPM_FILTER0, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, FWPM_SUBLAYER_UNIVERSAL, FwpmEngineClose0, FwpmEngineOpen0,
-    FwpmFilterAdd0,
+    FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_CONDITION_VALUE0,
+    FWP_MATCH_FLAGS_ALL_SET, FWP_UINT32, FWP_UINT64, FWP_VALUE0, FWPM_ACTION0, FWPM_CONDITION_FLAGS,
+    FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0, FWPM_FILTER0, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC,
+    FWPM_SUBLAYER_UNIVERSAL, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0,
 };
 use windows::Win32::System::Com::CoCreateGuid;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
@@ -41,9 +41,10 @@ const BLOCK_LAYERS: [GUID; 2] = [
     FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
 ];
 
-/// Guard holding the WFP engine handle. Dropping it closes the handle,
-/// which removes every non-persistent filter we added. Process death has
-/// the same effect, so no crash-state bookkeeping is required.
+/// Guard holding the WFP engine handle. The engine was opened with a
+/// `FWPM_SESSION_FLAG_DYNAMIC` session, so every filter we added is dynamic:
+/// dropping the guard closes the handle and process death has the same
+/// effect — the filters never outlive the client.
 pub struct Ipv6BlockGuard(HANDLE);
 
 impl Drop for Ipv6BlockGuard {
@@ -59,12 +60,26 @@ impl Drop for Ipv6BlockGuard {
 /// what the client already runs with (WFP filter add needs admin).
 pub fn block_ipv6() -> Result<Ipv6BlockGuard> {
     let mut engine = HANDLE::default();
+    // Dynamic session: all filters added through this handle are removed when
+    // the handle closes or the process dies. Without FWPM_SESSION_FLAG_DYNAMIC
+    // they would persist in the filter engine until explicitly deleted or
+    // rebooted.
+    let session_name = wide("rVPN IPv6 block");
+    let session_desc = wide("Dynamic session: IPv6 fail-fast filters die with the client process");
+    let session = FWPM_SESSION0 {
+        displayData: FWPM_DISPLAY_DATA0 {
+            name: windows::core::PWSTR(session_name.as_ptr() as *mut u16),
+            description: windows::core::PWSTR(session_desc.as_ptr() as *mut u16),
+        },
+        flags: FWPM_SESSION_FLAG_DYNAMIC,
+        ..Default::default()
+    };
     let err = unsafe {
         FwpmEngineOpen0(
             None::<&windows::core::PCWSTR>,
             RPC_C_AUTHN_WINNT,
             None,
-            None,
+            Some(&session),
             &mut engine,
         )
     };
@@ -87,7 +102,7 @@ fn install_filters(engine: HANDLE) -> Result<()> {
     for layer in BLOCK_LAYERS {
         let mut conditions = [FWPM_FILTER_CONDITION0 {
             fieldKey: FWPM_CONDITION_FLAGS,
-            matchType: FWP_MATCH_EQUAL,
+            matchType: FWP_MATCH_FLAGS_ALL_SET,
             conditionValue: {
                 let mut v = FWP_CONDITION_VALUE0 {
                     r#type: FWP_UINT32,
